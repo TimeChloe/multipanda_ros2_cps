@@ -27,18 +27,18 @@ def concatenate_ns(ns1, ns2, absolute=False):
     return ns1 + '/' + ns2
 
 def generate_launch_description():
-    franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots',
-                                     'panda_arm_mjros.urdf.xacro')
-    default_scene_xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', 'scene.xml')
+    garmi_xacro_file = os.path.join(get_package_share_directory('garmi_description'), 'robots',
+                                     'garmi_sim.urdf.xacro')
+    default_scene_xml_file = os.path.join(get_package_share_directory('garmi_description'), 'mujoco', 'garmi', 'assets', 'xml', 'garmi.xml')
     mjros_config_file = os.path.join(get_package_share_directory('franka_bringup'), 'config',
-                                     'mjros_controllers.yaml')
+                                     'garmi_mjros.yaml')
 
     mujoco_ros_path = get_package_share_directory('mujoco_ros')
     mjr2_control_path = get_package_share_directory('mujoco_ros2_control')
     # xml_path = os.path.join(mjr2_control_path, 'example', 'pendulum.xml')
     xml_path = default_scene_xml_file
     # xacro_file = os.path.join(mjr2_control_path, 'example', 'pendulum.urdf')
-    xacro_file = franka_xacro_file
+    xacro_file = garmi_xacro_file
     doc = xacro.parse(open(xacro_file))
     xacro.process_doc(doc)
     params = {'robot_description': doc.toxml()}
