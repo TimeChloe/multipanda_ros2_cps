@@ -32,9 +32,8 @@ mujoco_server:
 # if there is no namespace, then the root would just be controller_manager.
 
 controller_manager:
-  mujoco_server:
     ros__parameters:
-      update_rate: 10
+      update_rate: 1000
       joint_state_broadcaster:
         type: joint_state_broadcaster/JointStateBroadcaster
       franka_robot_state_broadcaster:
@@ -43,6 +42,8 @@ controller_manager:
         type: franka_robot_state_broadcaster/FrankaRobotModelBroadcaster
       joint_impedance_example_controller:
         type: franka_example_controllers/JointImpedanceExampleController
+      cartesian_impedance_example_controller:
+        type: franka_example_controllers/CartesianImpedanceExampleController
       
       # Seems like the node name bug persists for every single new node that is created downstream...
       # All the node-specific names become controller_manager/mujoco_server, and the mujoco_server part cannot be renamed
@@ -94,3 +95,7 @@ joint_impedance_example_controller:
       - 1.0
       - 1.0
       - 0.5
+
+joint_impedance_example_controller:
+  ros__parameters:
+    arm_id: panda

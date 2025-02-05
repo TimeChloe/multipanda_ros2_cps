@@ -60,7 +60,7 @@ def generate_launch_description():
             name='joint_state_publisher',
             namespace= ns,
             parameters=[
-                {'source_list': [ concatenate_ns(ns, 'controller_manager', True) + '/joint_states'],
+                {'source_list': [concatenate_ns(ns, 'joint_states', True)],
                  'rate': 10}],
     )
     return LaunchDescription([
@@ -70,6 +70,7 @@ def generate_launch_description():
                 'use_sim_time': "true",
                 'modelfile': xml_path,
                 'verbose': "true",
+                'ns': ns,
                 'mujoco_plugin_config': mjros_config_file
                 # 'mujoco_plugin_config': os.path.join(mjr2_control_path, 'example', 'ros2_control_plugins_example.yaml')
 
@@ -79,7 +80,7 @@ def generate_launch_description():
         Node( # RVIZ dependency; broken right now
             package='controller_manager',
             executable='spawner',
-            arguments=['joint_state_broadcaster', '-c', concatenate_ns(ns, 'controller_manager/mujoco_server', True)],
+            arguments=['joint_state_broadcaster', '-c', concatenate_ns(ns, 'controller_manager', True)],
             output='screen',
         ),
         node_joint_state_broadcaster
