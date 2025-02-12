@@ -15,12 +15,12 @@
 #pragma once
 
 #include <array>
-#include "franka_hardware/model_base.hpp"
+#include "franka_hardware/common/model_base.hpp"
 #include <franka/model.h>
 #include "mujoco/mujoco.h"
 #include <iostream> // for debugging
 namespace franka_hardware {
-  class FrankaMujocoHardwareInterface; // for friending
+  class FrankaMjHardwareSystem; // for friending
 // Mujoco is row-major format; Eigen is column-major.
 // so need to write a converter to change the order of that.
 /* ChatGPT impl:
@@ -48,8 +48,8 @@ std::vector<int> row_major_to_column_major(const std::vector<int>& arr, int rows
 class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type-member-init,
                // cppcoreguidelines-special-member-functions)
  public:
-  ModelSim(mjModel* &model, mjData* &data) : model_(model), data_(data) {}
-  mjModel* getMjModel(){return model_;};
+  ModelSim(const mjModel* &model, mjData* &data) : model_(model), data_(data) {}
+  const mjModel* getMjModel(){return model_;};
   mjData* getMjData(){return data_;};
   void setIndices(std::array<int, 9UL> link_indices,
                   std::array<int, 9UL> joint_site_indices,
@@ -228,7 +228,7 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
   }
 
  private:
-  mjModel* model_;
+  const mjModel* model_;
   mjData* data_;
   std::array<int, 9UL> link_indices_;
   std::array<int, 9UL> joint_site_indices_;
@@ -578,13 +578,8 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
     return result;
   }
 
-  friend class franka_hardware::FrankaMujocoHardwareInterface;
+  friend class franka_hardware::FrankaMjHardwareSystem;
 
-//  protected:
-//   ModelFranka() = default;
-
-//  private:
-//   franka::Model* model_;
 };
 
 }  // namespace franka_hardware

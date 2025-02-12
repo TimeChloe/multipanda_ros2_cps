@@ -17,7 +17,7 @@
 #include <memory>
 
 #include "franka/exception.h"
-#include "franka_hardware/robot.hpp"
+#include "franka_hardware/real/robot.hpp"
 
 #include "franka_msgs/srv/set_cartesian_stiffness.hpp"
 #include "franka_msgs/srv/set_force_torque_collision_behavior.hpp"

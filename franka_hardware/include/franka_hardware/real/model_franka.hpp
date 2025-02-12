@@ -15,7 +15,7 @@
 #pragma once
 
 #include <array>
-#include "franka_hardware/model_base.hpp"
+#include "franka_hardware/common/model_base.hpp"
 #include <franka/model.h>
 
 namespace franka_hardware {

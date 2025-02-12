@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <franka_hardware/robot.hpp>
+#include <franka_hardware/real/robot.hpp>
 
 #include <cassert>
 #include <mutex>

@@ -1,4 +1,4 @@
-#include <franka_hardware/franka_multi_hardware_interface.hpp>
+#include <franka_hardware/real/franka_multi_hardware_interface.hpp>
 
 #include <algorithm>
 #include <cmath>

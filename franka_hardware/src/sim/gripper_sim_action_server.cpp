@@ -28,7 +28,7 @@
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
-#include <franka_hardware/gripper_sim_action_server.hpp>
+#include <franka_hardware/sim/gripper_sim_action_server.hpp>
 
 namespace franka_gripper {
 GripperSimActionServer::GripperSimActionServer(const rclcpp::NodeOptions& options, std::string robot_name)

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "franka/exception.h"
-#include "franka_hardware/robot.hpp"
+#include "franka_hardware/real/robot.hpp"
 #include "franka_msgs/srv/error_recovery.hpp"
 
 #include <rclcpp/rclcpp.hpp>

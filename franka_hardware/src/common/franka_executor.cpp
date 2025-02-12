@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "franka_hardware/franka_executor.hpp"
+#include "franka_hardware/common/franka_executor.hpp"
 
 namespace franka_hardware {
 using namespace std::chrono_literals;

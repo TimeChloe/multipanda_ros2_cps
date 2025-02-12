@@ -21,7 +21,7 @@ bool Controller::desiredPoseCallbackImpl(Pose& p_d,
                                          const GoalMsg& msg) {
   p_d.q = Vector7d(msg.q.data());
   for (int i=0;i<7;++i) {
-    if (std::abs(p_d.q[i]+this->getOffset().q[i]-p.q[i]) > 0.1) {
+    if (std::abs(p_d.q[i]+this->getOffset().q[i]-p.q[i]) > 2) {
       auto& clk = *this->node_->get_clock();
       RCLCPP_WARN_THROTTLE(this->node_->get_logger(), clk, 1000, "panda_joint_impedance_controller: Discarding "
           "target pose that is too far away from current pose (%f rad, allowed "

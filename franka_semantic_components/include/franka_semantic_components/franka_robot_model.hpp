@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "franka_hardware/model_base.hpp"
+#include "franka_hardware/common/model_base.hpp"
 #include "franka_msgs/msg/franka_model.hpp"
 
 #include "semantic_components/semantic_component_interface.hpp"

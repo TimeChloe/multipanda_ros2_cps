@@ -1,11 +1,11 @@
-#include "franka_hardware/robot_sim.hpp"
+#include "franka_hardware/sim/robot_sim.hpp"
 #include <cstring>
 #include <Eigen/Dense>
 
 namespace franka_hardware{ 
 
 bool RobotSim::populateIndices(){
-  mjModel* m_ = franka_hardware_model_->getMjModel();
+  const mjModel* m_ = franka_hardware_model_->getMjModel();
   // body index loop
   for(int n = 0; n < kNumberOfJoints+2; n++){
     std::string link_name = robot_name_ + "_link" + std::to_string(n);

@@ -5,13 +5,11 @@
 #include <string>
 #include <array>
 #include <franka/robot_state.h>
-#include "franka_hardware/model_sim.hpp"
-#include "franka_hardware/control_mode.h"
+#include "franka_hardware/sim/model_sim.hpp"
+#include "franka_hardware/common/control_mode.h"
 
 namespace franka_hardware{
-  class FrankaMujocoHardwareInterface; // for friending
-  class FrankaMujocoMultiHardwareInterface; // for friending
-  class GarmiMujocoHardwareInterface; // for friending
+  class FrankaMjHardwareSystem; // for friending
 
 class RobotSim{
 public:
@@ -56,9 +54,7 @@ private:
     ControlMode control_mode_;
     bool has_gripper_;
 
-    friend class FrankaMujocoHardwareInterface;
-    friend class FrankaMujocoMultiHardwareInterface;
-    friend class GarmiMujocoHardwareInterface;
+    friend class FrankaMjHardwareSystem;
     
 };
 } // namespace franka_hardware

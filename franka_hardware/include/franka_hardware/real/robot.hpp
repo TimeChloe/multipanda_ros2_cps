@@ -28,9 +28,9 @@
 #include <franka/model.h>
 #include <franka/robot.h>
 #include <franka/exception.h>
-#include <franka_hardware/model_franka.hpp>
 #include <rclcpp/logger.hpp>
-#include "franka_hardware/control_mode.h"
+#include "franka_hardware/common/control_mode.h"
+#include <franka_hardware/real/model_franka.hpp>
 
 #include <franka_msgs/srv/set_cartesian_stiffness.hpp>
 #include <franka_msgs/srv/set_force_torque_collision_behavior.hpp>

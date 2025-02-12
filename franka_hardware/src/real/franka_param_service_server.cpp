@@ -1,5 +1,5 @@
 
-#include <franka_hardware/franka_param_service_server.hpp>
+#include <franka_hardware/real/franka_param_service_server.hpp>
 
 namespace franka_hardware {
 

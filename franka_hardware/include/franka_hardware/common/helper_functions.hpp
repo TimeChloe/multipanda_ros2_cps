@@ -6,10 +6,13 @@
 #include <vector>
 #include <algorithm>
 #include <iterator>
-#include <mujoco/mujoco.h>
+// #include <mujoco/mujoco.h>
 
 // A dump of functions that are used by both hardware and multi_hardware interfaces.
 namespace franka_hardware {
+
+  bool startsWith(const std::string& mainStr, const std::string& toMatch);
+  
   bool all_of_element_has_string(std::vector<std::string> vec, std::string content);
   
   /**
@@ -25,10 +28,5 @@ namespace franka_hardware {
 
   // Function for extracting joint number
   int get_joint_no(std::string const& s);
-  
-  void set_torque_control(const mjModel* m,int actuator_no,int flag);
-  
-  void set_position_servo(const mjModel* m,int actuator_no,double kp);
-  
-  void set_velocity_servo(const mjModel* m,int actuator_no,double kv);
+
 }

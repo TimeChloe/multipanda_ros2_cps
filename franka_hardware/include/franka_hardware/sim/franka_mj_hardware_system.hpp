@@ -28,21 +28,26 @@
 #include <rclcpp_lifecycle/state.hpp>
 
 #include <boost/thread.hpp>
-#include "mujoco/mujoco.h"
-#include "GLFW/glfw3.h"
+#include <mujoco/mujoco.h>
 
-#include "franka_hardware/franka_executor.hpp"
-#include "franka_hardware/control_mode.h"
-#include "franka_hardware/helper_functions.hpp"
-#include "franka_hardware/robot_sim.hpp"
-#include "franka_hardware/mujoco_visualizer.hpp"
-#include "franka_hardware/mujoco_pose_service.hpp"
-#include "franka_hardware/gripper_sim_action_server.hpp"
+
+#include "mujoco_ros2_control/mujoco_ros2_control_system_interface.hpp"
+#include "franka_hardware/common/franka_executor.hpp"
+#include "franka_hardware/common/control_mode.h"
+#include "franka_hardware/common/helper_functions.hpp"
+#include "franka_hardware/sim/robot_sim.hpp"
+#include "franka_hardware/sim/gripper_sim_action_server.hpp"
 #include "franka_msgs/msg/pose_stamped_array.hpp"
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
 namespace franka_hardware {
+  
+void set_torque_control(const mjModel* m,int actuator_no,int flag);
+
+void set_position_servo(const mjModel* m,int actuator_no,double kp);
+
+void set_velocity_servo(const mjModel* m,int actuator_no,double kv);
 
 struct ObjectContainer{
   std::string obj_name_;
@@ -73,7 +78,7 @@ struct ArmContainer {
 
 };
 
-class FrankaMujocoMultiHardwareInterface : public hardware_interface::SystemInterface {
+class FrankaMjHardwareSystem : public mujoco_ros2_control::MujocoRos2SystemInterface {
  public:
   hardware_interface::return_type prepare_command_mode_switch(
       const std::vector<std::string>& start_interfaces,
@@ -90,7 +95,15 @@ class FrankaMujocoMultiHardwareInterface : public hardware_interface::SystemInte
   hardware_interface::return_type write(const rclcpp::Time& time,
                                         const rclcpp::Duration& period) override;
   CallbackReturn on_init(const hardware_interface::HardwareInfo& info) override;
-  static const size_t kNumberOfJoints = 7;
+  
+  bool initSim(
+    rclcpp_lifecycle::LifecycleNode::SharedPtr & model_nh,
+    const hardware_interface::HardwareInfo & hardware_info,
+    const mjModel* m,
+    mjData* d,
+    unsigned int & update_rate) override;
+
+  const size_t kNumberOfJoints = 7;
   size_t robot_count_;
 
  private:
@@ -98,55 +111,30 @@ class FrankaMujocoMultiHardwareInterface : public hardware_interface::SystemInte
   rclcpp::TimerBase::SharedPtr pub_timer_;
   rclcpp::Node::SharedPtr pub_node_;
   
-  /* Mujoco variables */
-  std::shared_ptr<MujocoVisualizer> mj_visualizer_;
-  std::mutex mj_mutex_;
-  boost::thread mj_thread_;
-  mjModel* m_;
-  mjData* d_;
-  char error[1000] = {""};  
-  mjtNum last_visual_update_;
-
   std::map<std::string, ArmContainer> arms_;
   std::map<std::string, franka::RobotState*> state_pointers_;
   std::map<std::string, ModelBase*> model_pointers_;
   std::map<std::string, std::shared_ptr<franka_gripper::GripperSimActionServer>> gripper_nodes_;
   std::map<std::string, std::shared_ptr<std::array<double, 3>>> gripper_states_ptrs_; // cmd, width, force
-  std::map<std::string, ObjectContainer> mj_objs_;
-  rclcpp::Publisher<franka_msgs::msg::PoseStampedArray>::SharedPtr mj_objs_pose_publisher_;
-  std::shared_ptr<MujocoPoseServiceServer> mj_pose_service_node_;
-  /**
-   * Populates the ObjectContainer map mj_objs_ with body index name.
-   * No ObjectContainer is created if the object name does not match
-   * what is provided in the config file.
-  */
-  bool populateObjectContainers(std::vector<std::string> obj_names);
-  /**
-   * Updates all ObjectContainer pose values in the world frame.
-  */
-  bool updateObjectContainer(std::string obj_name);
+
+  /// \brief last time the write method was called.
+  rclcpp::Time last_update_sim_time_mj_;
+
+  /// \brief state interfaces that will be exported to the Resource Manager
+  std::vector<hardware_interface::StateInterface> state_interfaces_;
+
+  /// \brief command interfaces that will be exported to the Resource Manager
+  std::vector<hardware_interface::CommandInterface> command_interfaces_;
+
+  /// \brief Mujoco data pointer
+  mjData* d_;
+  const mjModel* m_;
+
+  /// \brief controller update rate
+  unsigned int * update_rate_;
+  
   std::array<double, 7> default_arm_qpos_ = {0.0011514965467923919, -0.7849355413286309, 0.0005351744148981226, -2.3558839733056853, -0.00042921391383617395, 1.571927056475186, 0.7850445419811712};
   
-  /**
-   * Changes the requested object's pose. Calls ...BodyPose or ...MocapPose depending on the object's type.
-   * It queries the mj_objs_ map for the given object.
-   * It needs to be specified in the mj_objects.yaml file to be updated.
-   * Does nothing if the object is not in mj_objs_.
-  */
-  void changeMjObjPose(std::string obj_name, double x, double y, double z, double qx, double qy, double qz, double qw);
-  /**
-   * Changes the requested object's pose by modifying its free joint.
-   * Does nothing if the requested object does not have a free joint.
-  */
-  void changeMjBodyPose(std::string obj_name, double x, double y, double z, double qx, double qy, double qz, double qw);
-  /**
-   * Changes the requested object's pose by modifying the mocap pos and quat.
-  */
-  void changeMjMocapPose(std::string obj_name, double x, double y, double z, double qx, double qy, double qz, double qw);
-  /**
-   * Function for publishing the objects in mj_objs_ as a topic.
-  */
-  void publishObjectContainers();
 
   rclcpp::Clock clock_;
   static rclcpp::Logger getLogger();

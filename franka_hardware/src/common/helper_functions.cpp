@@ -1,6 +1,14 @@
-#include <franka_hardware/helper_functions.hpp>
+#include <franka_hardware/common/helper_functions.hpp>
 // A dump of functions that are used by both hardware and multi_hardware interfaces.
 namespace franka_hardware {
+
+  bool startsWith(const std::string& mainStr, const std::string& toMatch) {
+    if (mainStr.size() < toMatch.size()) {
+        return false;
+    }
+    return mainStr.compare(0, toMatch.size(), toMatch) == 0;
+  };
+  
 bool all_of_element_has_string(std::vector<std::string> vec, std::string content){
   if(vec.size() == 0){
     return false;
@@ -47,24 +55,5 @@ int get_joint_no(std::string const& s){
   int no = s.back() - '0' - 1;
   return no;
 }
-void set_torque_control(const mjModel* m,int actuator_no,int flag)
-{
-  if (flag==0)
-    m->actuator_gainprm[10*actuator_no+0]=0;
-  else
-    m->actuator_gainprm[10*actuator_no+0]=1;
-}
-void set_position_servo(const mjModel* m,int actuator_no,double kp)
-  {
-    m->actuator_gainprm[10*actuator_no+0]=kp;
-    m->actuator_biasprm[10*actuator_no+1]=-kp;
-  }
-  /******************************/
 
-  /******************************/
-  void set_velocity_servo(const mjModel* m,int actuator_no,double kv)
-  {
-    m->actuator_gainprm[10*actuator_no+0]=kv;
-    m->actuator_biasprm[10*actuator_no+2]=-kv;
-  }
 }

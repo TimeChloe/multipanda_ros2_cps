@@ -1,4 +1,4 @@
-#include <franka_hardware/franka_error_recovery_service_server.hpp>
+#include <franka_hardware/real/franka_error_recovery_service_server.hpp>
 
 namespace franka_hardware{
 
