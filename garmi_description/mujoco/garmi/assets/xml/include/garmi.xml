@@ -124,13 +124,13 @@
         <site name="mobile_base" pos="0 0 0.08" size=".01 .01 .01" type="ellipsoid" rgba=".8 .2 .1 0"/>
         <geom type="mesh" mass="20" group="1" mesh="garmi_base" material="garmi_white" />
         <body name="left_wheel" pos="0 .375 .08" euler="1.57 0 0">
-          <joint name="garmi_base_joint_left" axis="0 0 -1" />
+          <joint name="garmi_base_joint_left" axis="0 0 -1" frictionloss="10"/>
           <geom type="cylinder" size=".08 .025" rgba="0 0 0 0" />
           <geom type="mesh" contype="0" conaffinity="0" group="1" pos="0 0 0" euler="-1.57 0 3.14" mesh="garmi_wheel" material="garmi_metal" />
           <geom type="mesh" contype="0" conaffinity="0" group="1" pos="0 0 0" euler="-1.57 0 3.14" mesh="garmi_tire" material="garmi_tire" />
         </body>
         <body name="right_wheel" pos="0 -.375 .08" euler="1.57 0 0">
-          <joint name="garmi_base_joint_right" axis="0 0 -1" />
+          <joint name="garmi_base_joint_right" axis="0 0 -1" frictionloss="10"/>
           <geom type="cylinder" size=".08 .025" rgba="0 0 0 0" />
           <geom type="mesh" contype="0" conaffinity="0" group="1" pos="0 0 0" euler="-1.57 0 0" mesh="garmi_wheel" material="garmi_metal" />
           <geom type="mesh" contype="0" conaffinity="0" group="1" pos="0 0 0" euler="-1.57 0 0" mesh="garmi_tire" material="garmi_tire" />
