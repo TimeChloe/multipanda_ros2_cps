@@ -2,7 +2,7 @@
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
   <xacro:macro name="garmi_head_mjros_ros2_control">
-    <ros2_control name="MujocoRos2System" type="system">
+    <ros2_control name="garmi_head" type="system">
       <hardware>
         <plugin>mujoco_ros2_control_system/MujocoRos2System</plugin>
       </hardware>
