@@ -17,6 +17,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.launch_description_sources import FrontendLaunchDescriptionSource
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Shutdown
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -31,30 +32,27 @@ def generate_launch_description():
     load_gripper_1_parameter_name = 'load_gripper_1'
     load_gripper_2_parameter_name = 'load_gripper_2'
     use_rviz_parameter_name = 'use_rviz'
-    scene_xml_parameter_name = 'scene_xml'
-    mj_yaml_parameter_name = 'mj_yaml'
 
     arm_id_1 = LaunchConfiguration(arm_id_1_parameter_name)
     arm_id_2 = LaunchConfiguration(arm_id_2_parameter_name)
     load_gripper_1 = LaunchConfiguration(load_gripper_1_parameter_name)
     load_gripper_2 = LaunchConfiguration(load_gripper_2_parameter_name)
     use_rviz = LaunchConfiguration(use_rviz_parameter_name)
-    scene_xml = LaunchConfiguration(scene_xml_parameter_name)
-    mj_yaml = LaunchConfiguration(mj_yaml_parameter_name)
-
-    franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots',
+    ns=""
+    franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots', 'sim',
                                      'dual_panda_arm_sim.urdf.xacro')
+    mjros_config_file = os.path.join(get_package_share_directory('franka_bringup'), 'config', 'sim',
+                                     'dual_sim_controllers.yaml')
+    franka_bringup_path = get_package_share_directory('franka_bringup')
     default_scene_xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', 'dual_scene.xml')
-    default_mj_yaml_file = os.path.join(get_package_share_directory('franka_bringup'), 'config', 'mujoco', 'mj_objects.yaml')
+    xml_path = default_scene_xml_file
 
     robot_description = Command(
         [FindExecutable(name='xacro'), ' ', franka_xacro_file, 
             ' arm_id_1:=', arm_id_1, 
             ' arm_id_2:=', arm_id_2,
             ' hand_1:=', load_gripper_1,
-            ' hand_2:=', load_gripper_2,
-            ' scene_xml:=', scene_xml,
-            ' mj_yaml:=', mj_yaml])
+            ' hand_2:=', load_gripper_2])
 
     rviz_file = os.path.join(get_package_share_directory('franka_description'), 'rviz',
                              'visualize_dual_franka.rviz')
@@ -62,7 +60,7 @@ def generate_launch_description():
     franka_controllers = PathJoinSubstitution(
         [
             FindPackageShare('franka_bringup'),
-            'config',
+            'config', 'sim',
             'dual_sim_controllers.yaml',
         ]
     )
@@ -90,15 +88,17 @@ def generate_launch_description():
             load_gripper_2_parameter_name,
             default_value='true',
             description='Load robot 2 with franka gripper.'),
-        DeclareLaunchArgument(
-            scene_xml_parameter_name,
-            default_value=default_scene_xml_file,
-            description='The path to the mujoco xml file that you want to load.'
-        ),
-        DeclareLaunchArgument(
-            mj_yaml_parameter_name,
-            default_value=default_mj_yaml_file,
-            description='The path to the mujoco object yaml file that you want to load.'
+        IncludeLaunchDescription(
+            FrontendLaunchDescriptionSource(franka_bringup_path + '/launch/sim/launch_mujoco_ros_server.launch'),
+            launch_arguments={
+                'use_sim_time': "true",
+                'modelfile': xml_path,
+                'verbose': "true",
+                'ns': ns,
+                'mujoco_plugin_config': mjros_config_file
+                # 'mujoco_plugin_config': os.path.join(mjr2_control_path, 'example', 'ros2_control_plugins_example.yaml')
+
+            }.items()
         ),
         Node( # RVIZ dependency
             package='robot_state_publisher',
@@ -116,35 +116,6 @@ def generate_launch_description():
                                 '/mj_left_gripper_sim_node/joint_states',
                                 '/mj_right_gripper_sim_node/joint_states'],
                  'rate': 30}],
-        ),
-        Node(
-            package='franka_control2',
-            executable='franka_control2_node',
-            parameters=[{'robot_description': robot_description}, franka_controllers],
-            remappings=[('joint_states', 'franka/joint_states')],
-            output={
-                'stdout': 'screen',
-                'stderr': 'screen',
-            },
-            on_exit=Shutdown(),
-        ),
-        Node( # RVIZ dependency
-            package='controller_manager',
-            executable='spawner',
-            arguments=['joint_state_broadcaster'],
-            output='screen',
-        ),
-        Node(
-            package='controller_manager',
-            executable='spawner',
-            arguments=['franka_left_robot_state_broadcaster'],
-            output='screen',
-        ),
-        Node(
-            package='controller_manager',
-            executable='spawner',
-            arguments=['franka_right_robot_state_broadcaster'],
-            output='screen',
         ),
         Node(package='rviz2',
              executable='rviz2',
