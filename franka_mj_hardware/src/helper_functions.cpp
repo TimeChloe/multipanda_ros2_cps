@@ -1,6 +1,14 @@
 #include <franka_mj_hardware/helper_functions.hpp>
 // A dump of functions that are used by both hardware and multi_hardware interfaces.
 namespace franka_hardware {
+
+bool startsWith(const std::string& mainStr, const std::string& toMatch) {
+    if (mainStr.size() < toMatch.size()) {
+        return false;
+    }
+    return mainStr.compare(0, toMatch.size(), toMatch) == 0;
+  };
+  
 bool all_of_element_has_string(std::vector<std::string> vec, std::string content){
   if(vec.size() == 0){
     return false;

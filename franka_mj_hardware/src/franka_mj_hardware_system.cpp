@@ -36,11 +36,12 @@ namespace franka_hardware {
 using StateInterface = hardware_interface::StateInterface;
 using CommandInterface = hardware_interface::CommandInterface;
 
-bool FrankaMjHardwareSystem::initSim(rclcpp::Node::SharedPtr & model_nh,
+bool FrankaMjHardwareSystem::initSim(
+    rclcpp_lifecycle::LifecycleNode::SharedPtr & model_nh,
     const hardware_interface::HardwareInfo & hardware_info,
     const mjModel* m,
     mjData* d,
-    int & update_rate){
+    unsigned int & update_rate){
     
     info_ = hardware_info;
     this->nh_ = model_nh;
@@ -304,15 +305,47 @@ hardware_interface::return_type FrankaMjHardwareSystem::prepare_command_mode_swi
   bool is_duplicate;
   
   // //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++//
+  // //    Check if the incoming interfaces are relevant or not    //
+  // //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++//
+
+
+  // //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++//
   // //              Handle the stop case first                    //
   // //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++//
+
+  /* copilot answer
+  #include <iostream>
+#include <string>
+
+bool startsWith(const std::string& mainStr, const std::string& toMatch) {
+    if (mainStr.size() < toMatch.size()) {
+        return false;
+    }
+    return mainStr.compare(0, toMatch.size(), toMatch) == 0;
+}
+
+int main() {
+    std::string str1 = "garmi_left_base/velocity";
+    std::string str2 = "left/";
+
+    if (startsWith(str1, str2)) {
+        std::cout << "The string \"" << str1 << "\" starts with \"" << str2 << "\"." << std::endl;
+    } else {
+        std::cout << "The string \"" << str1 << "\" does not start with \"" << str2 << "\"." << std::endl;
+    }
+
+    return 0;
+}
+
+  
+  */
   // selective control mode handling
   for(auto& arm : arms_){
     std::vector<std::string> arm_stop_interfaces;
-
+    const std::string arm_ns = arm.first + "_joint";
     // query what is the requested stop interface's arm
     for(auto& stop : stop_interfaces){
-      if(stop.find(arm.first) != std::string::npos){
+      if(startsWith(stop, arm_ns)){ // this basically has to check if the interface's first part is basically "robot_name/", else ignore
         arm_stop_interfaces.push_back(stop);
       }
     }
@@ -383,10 +416,10 @@ hardware_interface::return_type FrankaMjHardwareSystem::prepare_command_mode_swi
   
   for(auto& arm : arms_){
     std::vector<std::string> arm_start_interfaces;
-
+    const std::string arm_ns = arm.first + "_joint";
     // query what is the requested stop interface's arm
     for(auto& start : start_interfaces){
-      if(start.find(arm.first) != std::string::npos){
+      if(startsWith(start, arm_ns)){
         arm_start_interfaces.push_back(start);
       }
     }
