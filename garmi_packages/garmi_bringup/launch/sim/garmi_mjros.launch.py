@@ -30,22 +30,16 @@ def generate_launch_description():
     garmi_xacro_file = os.path.join(get_package_share_directory('garmi_description'), 'robots',
                                      'garmi_sim.urdf.xacro')
     default_scene_xml_file = os.path.join(get_package_share_directory('garmi_description'), 'mujoco', 'garmi', 'assets', 'xml', 'garmi.xml')
-    mjros_config_file = os.path.join(get_package_share_directory('franka_bringup'), 'config',
-                                     'garmi_mjros.yaml')
+    mjros_config_file = os.path.join(get_package_share_directory('garmi_bringup'), 'config', 'sim',
+                                     'sim_garmi.yaml')
 
-    mujoco_ros_path = get_package_share_directory('mujoco_ros')
-    mjr2_control_path = get_package_share_directory('mujoco_ros2_control')
-    # xml_path = os.path.join(mjr2_control_path, 'example', 'pendulum.xml')
     xml_path = default_scene_xml_file
-    # xacro_file = os.path.join(mjr2_control_path, 'example', 'pendulum.urdf')
     xacro_file = garmi_xacro_file
     doc = xacro.parse(open(xacro_file))
     xacro.process_doc(doc)
     params = {'robot_description': doc.toxml()}
     ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
                 # See the ros2_control_plugins_example_with_ns.yaml file for more details.
-
-    # pendulum_config = os.path.join(get_package_share_directory('mujoco_ros2_base'), 'config','pendulum.yaml')
 
     node_robot_state_publisher = Node(
         package='robot_state_publisher',
@@ -60,27 +54,27 @@ def generate_launch_description():
             name='joint_state_publisher',
             namespace= ns,
             parameters=[
-                {'source_list': [ concatenate_ns(ns, 'controller_manager', True) + '/joint_states'],
+                {'source_list': [concatenate_ns(ns, 'joint_states', True)],
                  'rate': 10}],
     )
     return LaunchDescription([
         IncludeLaunchDescription(
-            FrontendLaunchDescriptionSource(mujoco_ros_path + '/launch/launch_server.launch'),
+            FrontendLaunchDescriptionSource(get_package_share_directory('garmi_bringup') + '/launch/sim/launch_mujoco_ros_server.launch'),
             launch_arguments={
                 'use_sim_time': "true",
                 'modelfile': xml_path,
                 'verbose': "true",
+                'ns': ns,
                 'mujoco_plugin_config': mjros_config_file
-                # 'mujoco_plugin_config': os.path.join(mjr2_control_path, 'example', 'ros2_control_plugins_example.yaml')
 
             }.items()
         ),
         node_robot_state_publisher,
-        Node( # RVIZ dependency; broken right now
-            package='controller_manager',
-            executable='spawner',
-            arguments=['joint_state_broadcaster', '-c', concatenate_ns(ns, 'controller_manager/mujoco_server', True)],
-            output='screen',
-        ),
+        # Node( # RVIZ dependency; broken right now
+        #     package='controller_manager',
+        #     executable='spawner',
+        #     arguments=['joint_state_broadcaster', '-c', concatenate_ns(ns, 'controller_manager', True)],
+        #     output='screen',
+        # ),
         node_joint_state_broadcaster
     ])
