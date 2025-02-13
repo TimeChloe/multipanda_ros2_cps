@@ -11,8 +11,8 @@ controller_manager:
     franka_robot_model_broadcaster:
       type: franka_robot_state_broadcaster/FrankaRobotModelBroadcaster
 
-    single_multi_mode_controller:
-      type: multi_mode_controller/SingleMultiModeController
+    multi_mode_controller:
+      type: multi_mode_controller/MultiModeController
 
 franka_robot_state_broadcaster:
   ros__parameters:
@@ -22,7 +22,7 @@ franka_robot_model_broadcaster:
   ros__parameters:
     arm_id: panda
     
-single_multi_mode_controller:
+multi_mode_controller:
   ros__parameters:
     arm_count: 1
     arm_1:

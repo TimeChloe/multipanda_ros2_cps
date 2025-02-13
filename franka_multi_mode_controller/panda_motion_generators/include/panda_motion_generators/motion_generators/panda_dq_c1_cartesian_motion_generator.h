@@ -17,7 +17,7 @@ class PandaDqC1CartesianMotionGenerator :
    * Initializes the DqC1CartesianMotionGenerator which it inherits from.
    * @param[in] action_name Name of the action server.
    * @param[in] robot_state_srv_name Fully qualified name of the getRobotState service server, e.g. /panda/get_robot_states
-   * @param[in] controller_name Name of the multi-mode controller, e.g. single_multi_mode_controller
+   * @param[in] controller_name Name of the multi-mode controller, e.g. multi_mode_controller
    * @param[in] desired_pose_name Fully qualified name of the topic that subscribes to the desired pose. 
    */
   PandaDqC1CartesianMotionGenerator(const std::string& action_name,

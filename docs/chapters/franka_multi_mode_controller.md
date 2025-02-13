@@ -165,7 +165,7 @@ Make the adjustment, and run `colcon build` in your workspace root.
 
 Now for the good bit: to load the controller, you simply need to adjust the corresponding `.yaml` file under the MMC instantiation in `franka_bringup`, just like a typical `ros2-control` scenario. The name you give here needs to match the one you provided for the registration step.
 ``` yaml
-single_multi_mode_controller:
+multi_mode_controller:
   ros__parameters:
     arm_count: 1
     arm_1:
@@ -281,7 +281,7 @@ where the return argument `controllers` contain the information.
 ### Configuring the launch yaml
 To use the MMC, you need to first add it in the corresponding `.yaml` file that is loaded up by the launch file in `franka_bringup`. A simple example can be found in `multimode.yaml`. The MMC is listed like any other `ros2-control` controller, with additional parameters to define which controllets you want to load up, the resources they need, and what controllet you want the MMC to run by default when it is activated:
 ``` yaml
-single_multi_mode_controller:
+multi_mode_controller:
   ros__parameters:
     arm_count: 1
     arm_1:

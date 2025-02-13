@@ -128,7 +128,7 @@ def generate_launch_description():
         Node(
             package='controller_manager',
             executable='spawner',
-            arguments=['single_multi_mode_controller'],
+            arguments=['multi_mode_controller'],
             output='screen',
             condition=UnlessCondition(use_fake_hardware),
         ),

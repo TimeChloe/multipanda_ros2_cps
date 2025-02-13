@@ -18,7 +18,7 @@ controller_manager:
       type: franka_robot_state_broadcaster/FrankaRobotModelBroadcaster
 
     real_multi_mode_controller:
-      type: multi_mode_controller/SingleMultiModeController
+      type: multi_mode_controller/MultiModeController
 
 rl_left_state_broadcaster:
   ros__parameters:

@@ -30,7 +30,7 @@ controller_manager:
     garmi_base_controller:
       type: garmi_controllers/MobileBaseController
     sim_multi_mode_controller:
-      type: multi_mode_controller/SingleMultiModeController
+      type: multi_mode_controller/MultiModeController
     left_state_broadcaster:
       type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
     left_model_broadcaster:

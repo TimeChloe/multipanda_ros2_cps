@@ -10,7 +10,7 @@ Mainly to make multi-arm control easier to manage.
 */
 
 namespace multi_mode_controller {
-  class SingleMultiModeController;
+  class MultiModeController;
 }
 
 namespace switch_engine {

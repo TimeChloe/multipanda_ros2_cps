@@ -29,7 +29,7 @@ find_package(multi_mode_control_msgs REQUIRED)
 add_library(
         ${PROJECT_NAME}
         SHARED
-        src/single_multi_mode_controller.cpp
+        src/multi_mode_controller.cpp
 )
 
 target_include_directories(

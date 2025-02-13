@@ -46,7 +46,7 @@ namespace multi_mode_controller {
 /**
  * The joint impedance example controller moves joint 4 and 5 in a very compliant periodic movement.
  */
-class SingleMultiModeController : public controller_interface::ControllerInterface {
+class MultiModeController : public controller_interface::ControllerInterface {
  public:
   using Vector7d = Eigen::Matrix<double, 7, 1>;
   controller_interface::InterfaceConfiguration command_interface_configuration() const override;
@@ -110,7 +110,6 @@ class SingleMultiModeController : public controller_interface::ControllerInterfa
   rclcpp::Service<multi_mode_control_msgs::srv::GetControllers>::SharedPtr get_ctrl_srv_;
 
   // loop functions
-  void updateJointStates();
   void updateFrankaState();
   
   // custom initializers
@@ -148,4 +147,4 @@ class SingleMultiModeController : public controller_interface::ControllerInterfa
 
 };
 
-}  // namespace franka_example_controllers
+}  // namespace multi_mode_controller

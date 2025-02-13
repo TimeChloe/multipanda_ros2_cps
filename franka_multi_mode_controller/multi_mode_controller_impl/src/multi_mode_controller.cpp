@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <multi_mode_controller_impl/single_multi_mode_controller.h>
+#include <multi_mode_controller_impl/multi_mode_controller.h>
 
 #include <cassert>
 #include <cmath>
@@ -32,12 +32,12 @@ using GetControllers = multi_mode_control_msgs::srv::GetControllers;
 
 //*************** ros2_control overrides *************//
 controller_interface::InterfaceConfiguration
-SingleMultiModeController::command_interface_configuration() const {
+MultiModeController::command_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
   for(auto& arm : arms_){
     
-    for (int i = 1; i <= num_joints; ++i) {
+    for (size_t i = 1; i <= num_joints; ++i) {
       config.names.push_back(arm.arm_id_ + "_joint" + std::to_string(i) + "/effort");
     }
   }
@@ -45,7 +45,7 @@ SingleMultiModeController::command_interface_configuration() const {
 }
 
 controller_interface::InterfaceConfiguration
-SingleMultiModeController::state_interface_configuration() const {
+MultiModeController::state_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
   // so actually, the entire joint position and velocity interface is unnecessary...
@@ -60,7 +60,7 @@ SingleMultiModeController::state_interface_configuration() const {
   return config;
 }
 
-controller_interface::return_type SingleMultiModeController::update(
+controller_interface::return_type MultiModeController::update(
     const rclcpp::Time& /*time*/,
     const rclcpp::Duration& /*period*/) {
   updateFrankaState();
@@ -80,7 +80,7 @@ controller_interface::return_type SingleMultiModeController::update(
   return controller_interface::return_type::OK;
 }
 
-CallbackReturn SingleMultiModeController::on_init() {
+CallbackReturn MultiModeController::on_init() {
   // declare all the shit
   // doesn't do jack shit
   // try{
@@ -110,7 +110,7 @@ CallbackReturn SingleMultiModeController::on_init() {
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn SingleMultiModeController::on_configure(
+CallbackReturn MultiModeController::on_configure(
     const rclcpp_lifecycle::State& /*previous_state*/) {
       
   
@@ -146,28 +146,23 @@ CallbackReturn SingleMultiModeController::on_configure(
 //*************** ros2_control overrides *************//
 
 //*************** Custom init functions *************//
-bool SingleMultiModeController::initServices(){
+bool MultiModeController::initServices(){
   set_ctrl_srv_ = this->get_node()->create_service<SetControllers>("~/set_controllers", 
-                                                  std::bind(&SingleMultiModeController::setControllersCallback, 
+                                                  std::bind(&MultiModeController::setControllersCallback, 
                                                             this, 
                                                             std::placeholders::_1, 
                                                             std::placeholders::_2));
 
   get_ctrl_srv_ = this->get_node()->create_service<GetControllers>("~/get_controllers",
-                                                  std::bind(&SingleMultiModeController::getControllersCallback, 
+                                                  std::bind(&MultiModeController::getControllersCallback, 
                                                             this, 
                                                             std::placeholders::_1, 
                                                             std::placeholders::_2));
   return true;
 }
 
-bool SingleMultiModeController::initControllers(){
-  // Need to figure out how the resource mapping crap works
-  // Can I summarize them somehow and put them into a single arm container? 
-  // Get rid of some of the map-vector bloat in the header file?
-
-  // TODO: Print out the stuff first and see where that goes
-  // Need to get the joint handle stuff sorted out
+bool MultiModeController::initControllers(){
+  
   std::vector<std::string> controllers;
   // bool switcher = false; 
 
@@ -293,10 +288,10 @@ bool SingleMultiModeController::initControllers(){
 //*************** Custom init functions *************//
 
 //*************** Utility functions *************//
-std::unique_ptr<std::vector<SingleMultiModeController::Controller>> 
-  SingleMultiModeController::getControlSetFromInfo(const std::vector<ControllerInfo>& info){
+std::unique_ptr<std::vector<MultiModeController::Controller>> 
+  MultiModeController::getControlSetFromInfo(const std::vector<ControllerInfo>& info){
   
-  std::vector<SingleMultiModeController::Controller> control_set;
+  std::vector<MultiModeController::Controller> control_set;
   
   for (const auto& i : info) {
     Controller tmp;
@@ -320,10 +315,10 @@ std::unique_ptr<std::vector<SingleMultiModeController::Controller>>
     }
   }
   
-  return std::make_unique<std::vector<SingleMultiModeController::Controller>>(std::move(control_set));
+  return std::make_unique<std::vector<MultiModeController::Controller>>(std::move(control_set));
 };
 
-void SingleMultiModeController::printControlSet(){
+void MultiModeController::printControlSet(){
   std::stringstream ss;
   ss << "MultiPandaMultiModeController: New active control set:";
   for (const auto& controller : active_control_set_) {
@@ -332,8 +327,8 @@ void SingleMultiModeController::printControlSet(){
   RCLCPP_INFO(get_node()->get_logger(),"%s", ss.str().c_str());
 };
 
-std::unique_ptr<std::vector<SingleMultiModeController::Controller>> 
-  SingleMultiModeController::setupControlSet(const std::vector<ControllerInfo>& info){
+std::unique_ptr<std::vector<MultiModeController::Controller>> 
+  MultiModeController::setupControlSet(const std::vector<ControllerInfo>& info){
     
   std::unique_ptr<std::vector<Controller>> out = getControlSetFromInfo(info);
   if (!out) {
@@ -380,7 +375,7 @@ std::unique_ptr<std::vector<SingleMultiModeController::Controller>>
 
 
 // the const decorator was causing all that ugly errors?? 
-bool SingleMultiModeController::setControllersCallback(const SetControllers::Request::SharedPtr req, 
+bool MultiModeController::setControllersCallback(const SetControllers::Request::SharedPtr req, 
                                                        __attribute_maybe_unused__ const SetControllers::Response::SharedPtr res){
   std::vector<ControllerInfo> new_control;
   for (const auto& controller : req->controllers) {
@@ -410,7 +405,7 @@ bool SingleMultiModeController::setControllersCallback(const SetControllers::Req
   return true;
 }
 
-bool SingleMultiModeController::getControllersCallback(__attribute_maybe_unused__ GetControllers::Request::SharedPtr req, 
+bool MultiModeController::getControllersCallback(__attribute_maybe_unused__ GetControllers::Request::SharedPtr req, 
                                                        const GetControllers::Response::SharedPtr res){
   //Skeleton
   for (const auto& controller : active_control_set_) {
@@ -422,7 +417,7 @@ bool SingleMultiModeController::getControllersCallback(__attribute_maybe_unused_
   return true;
 }
 
-CallbackReturn SingleMultiModeController::on_activate(
+CallbackReturn MultiModeController::on_activate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   
   for(auto& state_interface : state_interfaces_){
@@ -439,7 +434,7 @@ CallbackReturn SingleMultiModeController::on_activate(
 }
 
 
-controller_interface::CallbackReturn SingleMultiModeController::on_deactivate(
+controller_interface::CallbackReturn MultiModeController::on_deactivate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   for(auto& rd : robot_data_){
     rd.deactivate_model();
@@ -447,34 +442,7 @@ controller_interface::CallbackReturn SingleMultiModeController::on_deactivate(
   return CallbackReturn::SUCCESS;
 }
 
-void SingleMultiModeController::updateJointStates() {
-  // for(auto& arm_container_pair : arms_){ // the code does not rely on getting joint updates from ros control
-  //   auto &arm = arm_container_pair.second;
-  //   size_t k = 0;
-  //   for (size_t i = 0; i < state_interfaces_.size(); i++) {
-  //     const auto& position_interface = state_interfaces_.at(2 * i);
-  //     const auto& velocity_interface = state_interfaces_.at(2 * i + 1);
-  //     if(position_interface.get_prefix_name().find(arm_container_pair.first) == std::string::npos || 
-  //        velocity_interface.get_prefix_name().find(arm_container_pair.first) == std::string::npos ){
-  //         // if either position or velocity interface does not contain the ID of the arm, skip
-  //         continue;
-  //     };
-
-  //     assert(position_interface.get_interface_name() == "position");
-  //     assert(velocity_interface.get_interface_name() == "velocity");
-
-  //     arm.q_(k) = position_interface.get_value();
-  //     arm.dq_(k) = velocity_interface.get_value();
-
-  //     k++;
-  //     if(k == 7){
-  //       break;
-  //     }
-  //   }
-  // }
-}
-
-void SingleMultiModeController::updateFrankaState(){
+void MultiModeController::updateFrankaState(){
   // for(auto& rd_ : robot_data_){ // and this is also useless, since getState/getMass is called in the controller itself by the rd pointer.
   //   rd_.getState();
   //   rd_.getMass();
@@ -484,8 +452,8 @@ void SingleMultiModeController::updateFrankaState(){
   }
 }
 
-}  // namespace franka_example_controllers
+}  // namespace multi_mode_controller
 #include "pluginlib/class_list_macros.hpp"
 // NOLINTNEXTLINE
-PLUGINLIB_EXPORT_CLASS(multi_mode_controller::SingleMultiModeController,
+PLUGINLIB_EXPORT_CLASS(multi_mode_controller::MultiModeController,
                        controller_interface::ControllerInterface)
