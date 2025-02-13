@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "franka_example_controllers/joint_velocity_example_controller.hpp"
+#include "franka_example_controllers/comless/joint_position_example_controller.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -24,18 +24,18 @@
 namespace franka_example_controllers {
 
 controller_interface::InterfaceConfiguration
-JointVelocityExampleController::command_interface_configuration() const {
+JointPositionExampleController::command_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
 
   for (int i = 1; i <= num_joints; ++i) {
-    config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/velocity");
+    config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/position");
   }
   return config;
 }
 
 controller_interface::InterfaceConfiguration
-JointVelocityExampleController::state_interface_configuration() const {
+JointPositionExampleController::state_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
   for (int i = 1; i <= num_joints; ++i) {
@@ -45,19 +45,19 @@ JointVelocityExampleController::state_interface_configuration() const {
   return config;
 }
 
-controller_interface::return_type JointVelocityExampleController::update(
+controller_interface::return_type JointPositionExampleController::update(
     const rclcpp::Time& /*time*/,
     const rclcpp::Duration& period) {
-//   updateJointStates();
   init_time_ = init_time_ + period;
-  double omega = 0.1 * std::sin(init_time_.seconds());
-  for(int i = 3; i < 7; i++){
-    command_interfaces_[i].set_value(omega);
+
+  double delta_angle = M_PI / 16 * (1 - std::cos(M_PI / 5.0 * init_time_.seconds())) * 0.5;
+  for (int i = 0; i < num_joints; ++i) {
+        command_interfaces_[i].set_value(initial_q_(i) + delta_angle);
   }
   return controller_interface::return_type::OK;
 }
 
-CallbackReturn JointVelocityExampleController::on_init() {
+CallbackReturn JointPositionExampleController::on_init() {
   try {
     auto_declare<std::string>("arm_id", "panda");
   } catch (const std::exception& e) {
@@ -67,13 +67,13 @@ CallbackReturn JointVelocityExampleController::on_init() {
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn JointVelocityExampleController::on_configure(
+CallbackReturn JointPositionExampleController::on_configure(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   arm_id_ = get_node()->get_parameter("arm_id").as_string();
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn JointVelocityExampleController::on_activate(
+CallbackReturn JointPositionExampleController::on_activate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   updateJointStates();
   initial_q_ = q_;
@@ -82,13 +82,7 @@ CallbackReturn JointVelocityExampleController::on_activate(
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn JointVelocityExampleController::on_error(
-  const rclcpp_lifecycle::State& /*previous_state*/){
-    RCLCPP_ERROR(this->get_node()->get_logger(), "error encountered!");
-    return CallbackReturn::ERROR;
-  }
-
-void JointVelocityExampleController::updateJointStates() {
+void JointPositionExampleController::updateJointStates() {
   for (auto i = 0; i < num_joints; ++i) {
     const auto& position_interface = state_interfaces_.at(2 * i);
     const auto& velocity_interface = state_interfaces_.at(2 * i + 1);
@@ -104,5 +98,5 @@ void JointVelocityExampleController::updateJointStates() {
 }  // namespace franka_example_controllers
 #include "pluginlib/class_list_macros.hpp"
 // NOLINTNEXTLINE
-PLUGINLIB_EXPORT_CLASS(franka_example_controllers::JointVelocityExampleController,
+PLUGINLIB_EXPORT_CLASS(franka_example_controllers::JointPositionExampleController,
                        controller_interface::ControllerInterface)

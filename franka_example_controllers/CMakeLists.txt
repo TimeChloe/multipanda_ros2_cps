@@ -22,22 +22,29 @@ find_package(hardware_interface REQUIRED)
 find_package(franka_semantic_components REQUIRED)
 find_package(generate_parameter_library)
 find_package(franka_msgs REQUIRED)
+find_package(multi_mode_control_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 add_library(
         ${PROJECT_NAME}
         SHARED
-        src/gravity_compensation_example_controller.cpp
-        src/joint_impedance_example_controller.cpp
-        src/cartesian_impedance_example_controller.cpp
-        src/move_to_start_example_controller.cpp
-        src/joint_position_example_controller.cpp
-        src/joint_velocity_example_controller.cpp
-        src/cartesian_velocity_example_controller.cpp
-        src/motion_generator.cpp
-        src/model_example_controller.cpp
-        src/multi_joint_impedance_example_controller.cpp
-        src/dual_joint_velocity_example_controller.cpp)
+        src/comless/gravity_compensation_example_controller.cpp
+        src/comless/joint_impedance_example_controller.cpp
+        src/comless/cartesian_impedance_example_controller.cpp
+        src/comless/move_to_start_example_controller.cpp
+        src/comless/joint_position_example_controller.cpp
+        src/comless/joint_velocity_example_controller.cpp
+        src/comless/cartesian_velocity_example_controller.cpp
+        src/comless/motion_generator.cpp
+        src/comless/model_example_controller.cpp
+        src/comless/multi_joint_impedance_example_controller.cpp
+        src/comless/dual_joint_velocity_example_controller.cpp
+        
+        src/subscriber/cartesian_impedance_controller.cpp
+        src/subscriber/joint_impedance_controller.cpp
+        )
+        
+
 target_include_directories(
         ${PROJECT_NAME}
         PUBLIC
@@ -52,9 +59,10 @@ ament_target_dependencies(
         rclcpp
         rclcpp_lifecycle
         franka_semantic_components
+        multi_mode_control_msgs
 )
 
-generate_parameter_library(franka_example_controllers_parameters src/model_example_controller_parameters.yaml)
+generate_parameter_library(franka_example_controllers_parameters src/comless/model_example_controller_parameters.yaml)
 
 pluginlib_export_plugin_description_file(
        controller_interface franka_example_controllers.xml)
@@ -108,5 +116,7 @@ ament_export_dependencies(
         rclcpp
         rclcpp_lifecycle
         hardware_interface
+        franka_hardware
+        multi_mode_control_msgs
 )
 ament_package()

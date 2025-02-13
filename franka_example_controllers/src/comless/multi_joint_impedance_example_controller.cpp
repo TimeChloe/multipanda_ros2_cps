@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <franka_example_controllers/multi_joint_impedance_example_controller.hpp>
+#include <franka_example_controllers/comless/multi_joint_impedance_example_controller.hpp>
 
 #include <cassert>
 #include <cmath>

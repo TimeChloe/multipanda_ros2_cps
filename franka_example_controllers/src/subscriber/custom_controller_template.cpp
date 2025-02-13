@@ -1,7 +1,7 @@
 /**
  * TODO: include the header file
  */
-#include <franka_controllers/custom_controller_template.hpp>
+#include <franka_example_controllers/subscriber/custom_controller_template.hpp>
 
 #include <cassert>
 #include <cmath>
@@ -10,7 +10,7 @@
 
 #include <Eigen/Eigen>
 
-namespace franka_controllers {
+namespace franka_example_controllers {
 
 controller_interface::InterfaceConfiguration
 CustomController::command_interface_configuration() const {
@@ -143,11 +143,11 @@ void CustomController::updateJointStates() {
 //     */ 
 // }
 
-}  // namespace franka_controllers
+}  // namespace franka_example_controllers
 #include "pluginlib/class_list_macros.hpp"
 // NOLINTNEXTLINE
 /**
   * TODO: Export the controller (use your controller name here)
   */ 
-PLUGINLIB_EXPORT_CLASS(franka_controllers::CustomController,
+PLUGINLIB_EXPORT_CLASS(franka_example_controllers::CustomController,
                        controller_interface::ControllerInterface)

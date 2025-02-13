@@ -1,4 +1,18 @@
-#include <franka_controllers/cartesian_impedance_controller.hpp>
+// Copyright (c) 2021 Franka Emika GmbH
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <franka_example_controllers/comless/cartesian_impedance_example_controller.hpp>
 
 #include <cassert>
 #include <cmath>
@@ -21,10 +35,10 @@ inline void pseudoInverse(const Eigen::MatrixXd& M_, Eigen::MatrixXd& M_pinv_, b
 }
 
 
-namespace franka_controllers {
+namespace franka_example_controllers {
 
 controller_interface::InterfaceConfiguration
-CartesianImpedanceController::command_interface_configuration() const {
+CartesianImpedanceExampleController::command_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
 
@@ -35,7 +49,7 @@ CartesianImpedanceController::command_interface_configuration() const {
 }
 
 controller_interface::InterfaceConfiguration
-CartesianImpedanceController::state_interface_configuration() const {
+CartesianImpedanceExampleController::state_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
   // should be model interface
@@ -45,7 +59,7 @@ CartesianImpedanceController::state_interface_configuration() const {
   return config;
 }
 
-controller_interface::return_type CartesianImpedanceController::update(
+controller_interface::return_type CartesianImpedanceExampleController::update(
     const rclcpp::Time& /*time*/,
     const rclcpp::Duration& /*period*/) {
   Eigen::Map<const Matrix4d> current(franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector).data());
@@ -59,7 +73,11 @@ controller_interface::return_type CartesianImpedanceController::update(
   Eigen::Map<const Vector7d> q(franka_robot_model_->getRobotState()->q.data());
   Vector6d error;
 
+  auto time = this->get_node()->now() - start_time_;
   auto desired_position_cur = desired_position;
+  desired_position_cur[0] += 0.1*sin(time.seconds());
+  desired_position_cur[1] += 0.1*sin(time.seconds());
+
   error.head(3) << current_position - desired_position_cur;
   if (desired_orientation.coeffs().dot(current_orientation.coeffs()) < 0.0) {
     current_orientation.coeffs() << -current_orientation.coeffs();
@@ -72,8 +90,9 @@ controller_interface::return_type CartesianImpedanceController::update(
   tau_task.setZero();
   tau_nullspace.setZero();
   tau_d.setZero();
+  
   tau_task << jacobian.transpose() * (-stiffness*error - damping*(jacobian*qD));
-
+  
   Eigen::MatrixXd jacobian_transpose_pinv;
     pseudoInverse(jacobian.transpose(), jacobian_transpose_pinv);
   tau_nullspace << (Eigen::MatrixXd::Identity(7, 7) -
@@ -88,15 +107,9 @@ controller_interface::return_type CartesianImpedanceController::update(
   return controller_interface::return_type::OK;
 }
 
-CallbackReturn CartesianImpedanceController::on_init() {
+CallbackReturn CartesianImpedanceExampleController::on_init() {
   try {
     auto_declare<std::string>("arm_id", "panda");
-    auto_declare<double>("pos_stiff", 100);
-    auto_declare<double>("rot_stiff", 10);
-    sub_desired_cartesian_ = get_node()->create_subscription<std_msgs::msg::Float64MultiArray>(
-      "/cartesian_impedance/pose_desired", 1,
-      std::bind(&CartesianImpedanceController::desiredCartesianCallback, this, std::placeholders::_1)
-    );
   } catch (const std::exception& e) {
     fprintf(stderr, "Exception thrown during init stage with message: %s \n", e.what());
     return CallbackReturn::ERROR;
@@ -104,26 +117,27 @@ CallbackReturn CartesianImpedanceController::on_init() {
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn CartesianImpedanceController::on_configure(
+CallbackReturn CartesianImpedanceExampleController::on_configure(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   arm_id_ = get_node()->get_parameter("arm_id").as_string();
-  pos_stiff = get_node()->get_parameter("pos_stiff").as_double();
-  rot_stiff = get_node()->get_parameter("rot_stiff").as_double();
   franka_robot_model_ = std::make_unique<franka_semantic_components::FrankaRobotModel>(
       franka_semantic_components::FrankaRobotModel(arm_id_ + "/robot_model",
                                                    arm_id_));
-  auto parameters = get_node()->list_parameters({}, 10);
+        
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn CartesianImpedanceController::on_activate(
+CallbackReturn CartesianImpedanceExampleController::on_activate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   franka_robot_model_->assign_loaned_state_interfaces(state_interfaces_);
+  start_time_ = this->get_node()->now();
   desired = Matrix4d(franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector).data());
   desired_position = Vector3d(desired.block<3,1>(0,3));
   desired_orientation = Quaterniond(desired.block<3,3>(0,0));
   desired_qn = Vector7d(franka_robot_model_->getRobotState()->q.data());
 
+  double pos_stiff = 400.0;
+  double rot_stiff = 20.0;
   stiffness.setIdentity();
   stiffness.topLeftCorner(3, 3) << pos_stiff * Matrix3d::Identity();
   stiffness.bottomRightCorner(3, 3) << rot_stiff * Matrix3d::Identity();
@@ -136,33 +150,14 @@ CallbackReturn CartesianImpedanceController::on_activate(
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn CartesianImpedanceController::on_deactivate(
+CallbackReturn CartesianImpedanceExampleController::on_deactivate(
     const rclcpp_lifecycle::State& /*previous_state*/){
   franka_robot_model_->release_interfaces();
   return CallbackReturn::SUCCESS;
 }
 
-void CartesianImpedanceController::desiredCartesianCallback(
-  const std_msgs::msg::Float64MultiArray& msg) {
-  if (msg.data[0]){
-    for (auto i = 0; i < 3; ++i) {
-      desired_position[i] = msg.data[i];
-    }
-    if (msg.data[11]){ // for orientation matrix
-      Matrix3d desired_orientation_mat;
-      for (auto i = 0; i < 3; ++i) {
-        for (auto j = 0; j < 3; ++j) {
-          desired_orientation_mat(i, j) = msg.data[3+3*i+j];
-        }
-      }
-      desired_orientation = Eigen::Quaterniond(desired_orientation_mat);
-    }
-
-  }
-}
-
-}  // namespace franka_controllers
+}  // namespace franka_example_controllers
 #include "pluginlib/class_list_macros.hpp"
 // NOLINTNEXTLINE
-PLUGINLIB_EXPORT_CLASS(franka_controllers::CartesianImpedanceController,
+PLUGINLIB_EXPORT_CLASS(franka_example_controllers::CartesianImpedanceExampleController,
                        controller_interface::ControllerInterface)

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "franka_example_controllers/cartesian_velocity_example_controller.hpp"
+#include "franka_example_controllers/comless/joint_velocity_example_controller.hpp"
 
 #include <cassert>
 #include <cmath>
@@ -24,54 +24,40 @@
 namespace franka_example_controllers {
 
 controller_interface::InterfaceConfiguration
-CartesianVelocityExampleController::command_interface_configuration() const {
+JointVelocityExampleController::command_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
-  config.names.push_back("ee_cartesian_velocity/tx");
-  config.names.push_back("ee_cartesian_velocity/ty");
-  config.names.push_back("ee_cartesian_velocity/tz");
-  config.names.push_back("ee_cartesian_velocity/omega_x");
-  config.names.push_back("ee_cartesian_velocity/omega_y");
-  config.names.push_back("ee_cartesian_velocity/omega_z");
 
+  for (int i = 1; i <= num_joints; ++i) {
+    config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/velocity");
+  }
   return config;
 }
 
 controller_interface::InterfaceConfiguration
-CartesianVelocityExampleController::state_interface_configuration() const {
+JointVelocityExampleController::state_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
-  for (int i = 1; i < 10; ++i) {
-    config.names.push_back("ee_cartesian_velocity/0" + std::to_string(i));
+  for (int i = 1; i <= num_joints; ++i) {
+    config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/position");
+    config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/velocity");
   }
-  for (int i = 10; i < 16; ++i) {
-    config.names.push_back("ee_cartesian_velocity/" + std::to_string(i));
-  }
-  
   return config;
 }
 
-controller_interface::return_type CartesianVelocityExampleController::update(
+controller_interface::return_type JointVelocityExampleController::update(
     const rclcpp::Time& /*time*/,
     const rclcpp::Duration& period) {
-  // updateJointStates();
+//   updateJointStates();
   init_time_ = init_time_ + period;
-  double time_max = 4.0;
-  double v_max = 0.05;
-  double angle = M_PI / 4.0;
-  double cycle = std::floor(
-      pow(-1.0, (init_time_.seconds() - std::fmod(init_time_.seconds(), time_max)) / time_max));
-  double v = cycle * v_max / 2.0 * (1.0 - std::cos(2.0 * M_PI / time_max * init_time_.seconds()));
-  double v_x = std::cos(angle) * v;
-  double v_z = -std::sin(angle) * v;
-  std::array<double, 6> command = {{v_x, 0.0, v_z, 0.0, 0.0, 0.0}};
-  for(int i = 0; i < 6; i++){
-    command_interfaces_[i].set_value(command[i]);
+  double omega = 0.1 * std::sin(init_time_.seconds());
+  for(int i = 3; i < 7; i++){
+    command_interfaces_[i].set_value(omega);
   }
   return controller_interface::return_type::OK;
 }
 
-CallbackReturn CartesianVelocityExampleController::on_init() {
+CallbackReturn JointVelocityExampleController::on_init() {
   try {
     auto_declare<std::string>("arm_id", "panda");
   } catch (const std::exception& e) {
@@ -81,29 +67,42 @@ CallbackReturn CartesianVelocityExampleController::on_init() {
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn CartesianVelocityExampleController::on_configure(
+CallbackReturn JointVelocityExampleController::on_configure(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   arm_id_ = get_node()->get_parameter("arm_id").as_string();
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn CartesianVelocityExampleController::on_activate(
+CallbackReturn JointVelocityExampleController::on_activate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
-  // updateJointStates();
+  updateJointStates();
   initial_q_ = q_;
   start_time_ = this->get_node()->now();
   init_time_ = rclcpp::Duration(0, 0);
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn CartesianVelocityExampleController::on_error(
+CallbackReturn JointVelocityExampleController::on_error(
   const rclcpp_lifecycle::State& /*previous_state*/){
     RCLCPP_ERROR(this->get_node()->get_logger(), "error encountered!");
     return CallbackReturn::ERROR;
   }
 
+void JointVelocityExampleController::updateJointStates() {
+  for (auto i = 0; i < num_joints; ++i) {
+    const auto& position_interface = state_interfaces_.at(2 * i);
+    const auto& velocity_interface = state_interfaces_.at(2 * i + 1);
+
+    assert(position_interface.get_interface_name() == "position");
+    assert(velocity_interface.get_interface_name() == "velocity");
+
+    q_(i) = position_interface.get_value();
+    dq_(i) = velocity_interface.get_value();
+  }
+}
+
 }  // namespace franka_example_controllers
 #include "pluginlib/class_list_macros.hpp"
 // NOLINTNEXTLINE
-PLUGINLIB_EXPORT_CLASS(franka_example_controllers::CartesianVelocityExampleController,
+PLUGINLIB_EXPORT_CLASS(franka_example_controllers::JointVelocityExampleController,
                        controller_interface::ControllerInterface)

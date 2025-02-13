@@ -15,7 +15,7 @@
 
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
-namespace franka_controllers {
+namespace franka_example_controllers {
 
 /**
  * <Description of your controller>
@@ -51,4 +51,4 @@ class CustomController : public controller_interface::ControllerInterface {
  */
 };
 
-}  // namespace franka_controllers
+}  // namespace franka_example_controllers
