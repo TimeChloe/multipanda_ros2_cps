@@ -31,46 +31,35 @@ controller_interface::InterfaceConfiguration
 
 controller_interface::return_type HeadController::update(const rclcpp::Time& time,
                                                                const rclcpp::Duration& period){
-  current_time_ = this->get_node()->now();
+  current_time_ = time;
   // RCLCPP_INFO_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000, "\nLeft vel:  %f\nRight vel: %f", state_interfaces_.at(0).get_value(), state_interfaces_.at(2).get_value());
   
-  head_state_.set_theta(0, state_interfaces_.at(0).get_value()); // left-right
-  head_state_.set_theta(1, state_interfaces_.at(3).get_value()); // down-up
-
+  theta_curr_[0] = state_interfaces_.at(0).get_value(); // left-right
+  theta_curr_[1] = state_interfaces_.at(3).get_value(); // down-up
   // PD control 
   double time_diff = 0;
   for (size_t joint_number = 0; joint_number < 2; joint_number++) {
     
     // Time difference between two commands
-    time_diff = (this->get_node()->now() - last_time_).seconds();
+    time_diff = (current_time_ - last_time_).seconds();
     
     // Get current and previous theta values
-    double theta = head_state_.get_theta(joint_number);
-    double theta_previous = head_state_.get_theta_previous(joint_number);
-
+    double theta = theta_curr_[joint_number];
+    double theta_previous = theta_prev_[joint_number];
+    
     // Obtain velocities
     double dtheta_d = 0;
     double dtheta = (theta - theta_previous) / time_diff;
-    head_state_.set_dtheta(joint_number, dtheta);
+    theta_d_[joint_number] = theta_d_[joint_number] * (1.0 - pt1_filter_) + pt1_filter_ * theta_goal_[joint_number];
+        // Calculate the approapriate torque value - PD control    
 
-    theta_d_[joint_number] = theta_d_[joint_number] * (1.0 - pt1_filter_) + pt1_filter_ * head_state_.get_theta_target(
-                         joint_number);
-
-    // Calculate the approapriate torque value - PD control    
     double tau_j = std::min(15.0, std::max(-15.0, (theta_d_[joint_number] - theta) * k_p_ + 
                                           (dtheta_d - dtheta) * k_d_));
     
-    // Set the values to the head_state_
-    head_state_.set_dtheta(joint_number, dtheta);
-    head_state_.set_theta(joint_number, theta);
-    head_state_.set_tau_j(joint_number, tau_j);
- 
-    head_state_.set_theta_previous(joint_number, theta);
+    // Set command and previous theta
+    command_interfaces_[joint_number].set_value(tau_j);
+    theta_prev_[joint_number] = theta;
   }
-
-  // Command the calculated torque values
-  command_interfaces_[0].set_value(head_state_.get_tau_j(0));
-  command_interfaces_[1].set_value(head_state_.get_tau_j(1));
 
   last_time_ = current_time_;
   return controller_interface::return_type::OK;
@@ -84,7 +73,7 @@ CallbackReturn HeadController::on_init(){
   try {
     auto_declare<std::string>("robot_id", "garmi_head");
   } catch (const std::exception& e) {
-    fprintf(stderr, "Exception thrown during init stage with message: %s \n", e.what());
+    RCLCPP_ERROR(get_node()->get_logger(), "Exception thrown during init stage with message: %s \n", e.what());
     return CallbackReturn::ERROR;
   }
   return CallbackReturn::SUCCESS;
@@ -101,6 +90,7 @@ CallbackReturn HeadController::on_configure(const rclcpp_lifecycle::State& previ
 CallbackReturn HeadController::on_activate(const rclcpp_lifecycle::State& previous_state){
   current_time_ = this->get_node()->now();
   last_time_ = this->get_node()->now();
+  RCLCPP_INFO(get_node()->get_logger(), "on_activate");
   return CallbackReturn::SUCCESS;
 } ;
 
