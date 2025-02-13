@@ -29,6 +29,8 @@ controller_manager:
       type: joint_state_broadcaster/JointStateBroadcaster
     garmi_base_controller:
       type: garmi_controllers/MobileBaseController
+    garmi_head_controller:
+      type: garmi_controllers/HeadController
     sim_multi_mode_controller:
       type: multi_mode_controller/MultiModeController
     left_state_broadcaster:
@@ -68,6 +70,11 @@ garmi_base_controller:
   ros__parameters:
     sim: true
     robot_id: garmi_base
+
+garmi_head_controller:
+  ros__parameters:
+    sim: true
+    robot_id: garmi_head
   
 sim_multi_mode_controller:
   ros__parameters:

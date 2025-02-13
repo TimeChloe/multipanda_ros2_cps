@@ -20,12 +20,15 @@ find_package(hardware_interface REQUIRED)
 find_package(generate_parameter_library)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 add_library(
         ${PROJECT_NAME}
         SHARED
         src/mobile_base_controller.cpp
+        src/head_controller.cpp
 )
 target_include_directories(
         ${PROJECT_NAME}
@@ -42,6 +45,8 @@ ament_target_dependencies(
         rclcpp_lifecycle
         geometry_msgs
         nav_msgs
+        sensor_msgs
+        std_msgs
 )
 
 pluginlib_export_plugin_description_file(
