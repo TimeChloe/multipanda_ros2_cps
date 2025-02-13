@@ -26,7 +26,8 @@ controller_manager:
         type: franka_example_controllers/JointImpedanceExampleController
       cartesian_impedance_example_controller:
         type: franka_example_controllers/CartesianImpedanceExampleController
-
+      multi_mode_controller:
+        type: multi_mode_controller/MultiModeController
 franka_robot_state_broadcaster:
   ros__parameters:
     arm_id: panda
@@ -60,3 +61,17 @@ joint_impedance_example_controller:
 cartesian_impedance_example_controller:
   ros__parameters:
     arm_id: panda
+  
+multi_mode_controller:
+  ros__parameters:
+    arm_count: 1
+    arm_1:
+      arm_id: panda
+    controllers: ["panda_joint_impedance_controller", "panda_cartesian_impedance_controller"]
+    resources:
+        panda_joint_impedance_controller: ["panda"]
+        panda_cartesian_impedance_controller: ["panda"]
+    start_controllers:
+        names: ["panda_joint_impedance_controller"]
+        resources:
+            panda_joint_impedance_controller: ["panda"]
