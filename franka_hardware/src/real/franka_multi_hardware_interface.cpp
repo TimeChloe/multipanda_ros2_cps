@@ -143,7 +143,7 @@ CallbackReturn FrankaMultiHardwareInterface::on_init(const hardware_interface::H
 
 std::vector<StateInterface> FrankaMultiHardwareInterface::export_state_interfaces() {
   std::vector<StateInterface> state_interfaces;
-  for (auto i = 0U; i < info_.joints.size(); i++) {
+  for(auto i = 0U; i < info_.joints.size(); i++) {
     
     // std::cout << get_ns(info_.joints[i].name) << std::endl;
     state_interfaces.emplace_back(StateInterface(
@@ -315,10 +315,10 @@ hardware_interface::return_type FrankaMultiHardwareInterface::prepare_command_mo
     const std::vector<std::string>& stop_interfaces) {
   RCLCPP_INFO(this->getLogger(),"Preparing command mode switch");
 
-  bool is_effort;
-  bool is_position;
-  bool is_velocity;
-  bool is_duplicate;
+  bool is_effort = false;
+  bool is_position = false;
+  bool is_velocity = false;
+  bool is_duplicate = false;
   
   //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++//
   //              Handle the stop case first                    //
@@ -386,13 +386,13 @@ hardware_interface::return_type FrankaMultiHardwareInterface::prepare_command_mo
       case 2:
         if(is_position){
           if(stop_interfaces.size() != 16U){
-            RCLCPP_ERROR(this->getLogger(), "Requested Cartesian position stop interface's size is not %ld (got %ld)", 16, stop_interfaces.size());
+            RCLCPP_ERROR(this->getLogger(), "Requested Cartesian position stop interface's size is not %d (got %ld)", 16, stop_interfaces.size());
             return hardware_interface::return_type::ERROR;
           }
         }
         if(is_velocity){
           if(stop_interfaces.size() != 6U){
-            RCLCPP_ERROR(this->getLogger(), "Requested Cartesian velocity stop interface's size is not %ld (got %ld)", 6, arm_stop_interfaces.size());
+            RCLCPP_ERROR(this->getLogger(), "Requested Cartesian velocity stop interface's size is not %d (got %ld)", 6, arm_stop_interfaces.size());
             return hardware_interface::return_type::ERROR;
 
           }
@@ -480,7 +480,7 @@ hardware_interface::return_type FrankaMultiHardwareInterface::prepare_command_mo
       case 2:
         RCLCPP_INFO(this->getLogger(), "case 2 start type: %d", start_type);
         if(arm_start_interfaces.size() != 16U && arm_start_interfaces.size() != 6U){
-          RCLCPP_ERROR(this->getLogger(), "Requested Cartesian start interface's size is not %ld nor %ld (got %ld)", 16U, 6U, arm_start_interfaces.size());
+          RCLCPP_ERROR(this->getLogger(), "Requested Cartesian start interface's size is not %d nor %d (got %ld)", 16, 6, arm_start_interfaces.size());
           return hardware_interface::return_type::ERROR;
         }
         if(is_position){

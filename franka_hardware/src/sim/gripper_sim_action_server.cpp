@@ -221,8 +221,8 @@ void GripperSimActionServer::executeGrasp(const std::shared_ptr<GoalHandleGrasp>
   };
   executeCommand(goal_handle, Task::kGrasp, command);
 }
-bool GripperSimActionServer::simGripperGrasp(double width, double speed, double force, 
-                                              double epsilon_inner, double epsilon_outer){
+bool GripperSimActionServer::simGripperGrasp(double width, double speed, double /*force*/, 
+                                              double /*epsilon_inner*/, double /*epsilon_outer*/){
   // same as move, except max_count+50 to ensure "proper" grasping.
   // epsilon_inner and epsilon_outer are not used, since they are just confusing.
   // force is not really implemented either, since the real franka doesn't implement that...
