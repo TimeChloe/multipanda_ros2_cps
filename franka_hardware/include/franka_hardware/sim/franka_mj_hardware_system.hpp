@@ -133,8 +133,6 @@ class FrankaMjHardwareSystem : public mujoco_ros2_control::MujocoRos2SystemInter
   /// \brief controller update rate
   unsigned int * update_rate_;
   
-  std::array<double, 7> default_arm_qpos_ = {0.0011514965467923919, -0.7849355413286309, 0.0005351744148981226, -2.3558839733056853, -0.00042921391383617395, 1.571927056475186, 0.7850445419811712};
-  
 
   rclcpp::Clock clock_;
   static rclcpp::Logger getLogger();

@@ -142,6 +142,14 @@ bool FrankaMjHardwareSystem::initSim(
         }
         arm.hw_commands_joint_effort_.fill(0);
         arm.hw_commands_joint_velocity_.fill(0);
+
+        // Check if there is a desired initial pose for this arm's joints
+        for(size_t j = 7*(i-1); j < i*7; j++){
+          // arm.default_arm_qpos_.push_back(std::stod(info_.joints[j].parameters.at("initial_position")));
+          d_->qpos[arm.robot_->joint_qpos_indices_[j - (7*(i-1))]] = std::stod(info_.joints[j].parameters.at("initial_position"));
+          RCLCPP_INFO(getLogger(), "Joint %ld (name %s) initial position: %f", j, info_.joints[j].name.c_str(), std::stod(info_.joints[j].parameters.at("initial_position")));
+        }
+        
     }
     
     return true;
