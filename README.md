@@ -1,22 +1,24 @@
 # multipanda_ros2
 ## A sim- and real Panda robot integration based on the `ros2_control` framework
+<img src="docs/images/single_sim.png" alt="Alt text" height="300">
+<img src="docs/images/dual_sim.png" alt="Alt text"   height="300">
+<img src="docs/images/garmi_sim.png" alt="Alt text"  height="300">
 
 This project implements most features from the original `franka_ros` repository in ROS2 Humble, specifically for the Franka Emika Robot (Panda).
 This project significantly expands upon the original `franka_ros2` from the company, who dropped the support for the Pandas.
 
 Additionally, multi-arm mujoco simulation has been integrated, meaning you can now run the same controller on both simulated and real robots. 
+The simulation is designed as a plugin to the [`mujoco_ros_pkg`](https://github.com/ubi-agni/mujoco_ros_pkgs/). 
+
+**The current version relies on a [fork of the repository](https://github.com/tenfoldpaper/mujoco_ros_pkgs)**, which implements the `ros2_control` plugin as well as a generic `SystemInterface` for simple robot setups (e.g. a Panda arm mounted on a mobile base). This means, you should install the fork, not the original repo, until the two have been merged.
 
 Work is ongoing to integrate FR3 into the architecture.
-
-As of 15.07.24, both the real and simulation robot interfaces are complete. GARMI (a robot platform with 2 panda arms and a non-holonomic base) is also available.
-
-**This repository is a copy of an internal repo, that we try to keep up to date. Unfortunately, it means it doesn't get nearly as much attention as it should. We plan to migrate fully over to this public repo in the near future.**
 
 ## Documentation
 
 Documentation for this project is available [here](./docs/main.md).
 
-## Working (not thoroughly tested) features
+## Working features
 More thorough information is available in the documentation.
 
 * Real robot:
@@ -35,6 +37,8 @@ More thorough information is available in the documentation.
     * Model provides all the existing functions: `pose`, `zeroJacobian`, `bodyJacobian`, `mass`, `gravity`, `coriolis`.
         * Gravity for now just returns the corresponding `qfrc_gravcomp` force from mujoco.
         * Coriolis = `qfrc_bias - qfrc_gravcomp`
+    * Camera is available as part of `mujoco_ros_pkg`'s features. You can simply add a `<camera>` object in your mujoco XML file, and the package will handle them.
+    * With the forked repository's `mujoco_ros2_control_system` package, you can easily add components with additional degrees of freedom to your robot. Take a look at `garmi_packages/garmi_description/robots/*.ros2_control.xacro` for an example on how to do this.
 
 ## Known issues
 * Joint position controller might cause some bad motor behaviors. Suggest using torque or velocity for now.
@@ -75,23 +79,23 @@ More thorough information is available in the documentation.
         - `~/Libraries/libfranka/bin/communication_test <robot-ip>`
 
 ## Installation guide
-(Tested on Ubuntu 22.04, ROS2 Humble, Panda 4.2.2 & 4.2.1, `libfranka` 0.9.2 and MuJoCo 3.1.6)
+(Tested on Ubuntu 22.04, ROS2 Humble, Panda 4.2.2 & 4.2.1, `libfranka` 0.9.2 and MuJoCo 3.2.0)
 On a computer running Ubuntu 22.04 and real-time kernel (if you wish to use it with a real robot), do the following:
-1. Build `libfranka` 0.9.2 from source by following the [instructions][libfranka-instructions].
-2. Build MuJoCo from source by following the [instructions][mujoco-instructions] (tested with 3.1.3).
-3. Install library dependencies:
-    - Install GLFW with `sudo apt-get install libglfw3;sudo apt-get install libglfw3-dev`
+1. Install ROS2 Humble by following their [instructions][humble-instructions] and create a workspace.
+2. Build `libfranka` 0.9.2 from source by following the [instructions][libfranka-instructions].
+3. Build MuJoCo **3.2.0** MuJoCo from source by following the [instructions][mujoco-instructions].
+4. Install `mujoco_ros_pkg`, specifically this fork(https://github.com/tenfoldpaper/mujoco_ros_pkgs).
+5. Install library dependencies:
     - Install [Eigen **3.3.9**](https://gitlab.com/libeigen/eigen/-/releases/3.3.9). Remove Eigen 3.4.0 if that was installed from following the `libfranka` steps.
         - Some functions will break if you use Eigen 3.4.0, and will fail to compile.
     - Install [`dq-robotics`](https://dqrobotics.github.io/) C++ version
-4. Install ROS2 Humble by following their [instructions][humble-instructions] and create a workspace.
-5. Clone this repository (i.e. the multipanda) into your workspace's `src` folder.
-6. Install the dependencies by running this rosdep command from the workspace root: `rosdep install --from-paths src -y --ignore-src`
+6. Clone this repository (i.e. the multipanda) into your workspace's `src` folder.
+7. Install the dependencies by running this rosdep command from the workspace root: `rosdep install --from-paths src -y --ignore-src`
 7. Export the `{mujoco/libfranka}/lib/cmake` directories as a `CMAKE_PREFIX_PATH` in your environment, i.e.
-    - in `~/.bashrc`, `export CMAKE_PREFIX_PATH={path to mujoco installation}/lib/cmake}:{path to libfranka installation}/lib/cmake`
-8. Source the workspace, then in your workspace root, call: `colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release`
+    - in `~/.bashrc`, `export CMAKE_PREFIX_PATH={path to mujoco installation}/lib/cmake:{path to libfranka installation}/lib/cmake`
+8. Add the build path to your `LD_LIBRARY_PATH` by adding the following line to your `~/.bashrc`: `export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:{path to libfranka install}/lib:{path to mujoco's install}/lib`
+9. Source the workspace, then in your workspace root, call: `colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release`
     - The paths to mujoco and libfranka are added to `CMAKE_PREFIX_PATH`, so no separate args are needed.
-9. Add the build path to your `LD_LIBRARY_PATH` by adding the following line to your `~/.bashrc`: `export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:{path to libfranka install}/lib:{path to mujoco's install}/lib`
     - The MuJoCo path is the INSTALLED folder's directory. The `lib` folder should only have the two `.so` files, and a folder called `cmake`.
     - Likewise, the `libfranka` path should contain the `cmake` folder and the `.so` files.
 10. To run:
@@ -117,7 +121,7 @@ On a computer running Ubuntu 22.04 and real-time kernel (if you wish to use it w
             - `arm_id_1=mj_left` and `arm_id_2=mj_right` by default.
     - Garmi:
         1. with sim robot, source the workspace, and run:
-            - `ros2 launch franka_bringup sim_garmi.launch.py`
+            - `ros2 launch garmi_bringup sim_garmi.launch.py`
             
 ## Credits
 The original version is forked from mcbed's port of franka_ros2 for [humble][mcbed-humble].
