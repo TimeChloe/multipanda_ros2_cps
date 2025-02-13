@@ -19,7 +19,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    add_compile_options(-Wall -Wextra -Wpedantic)
+    add_compile_options(-Wall -Wextra -Wpedantic -Werror=unused-variable)
 endif()
 
 option(CHECK_TIDY "Adds clang-tidy tests" OFF)
