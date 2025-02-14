@@ -1,8 +1,8 @@
 # multipanda_ros2
 ## A sim- and real Panda robot integration based on the `ros2_control` framework
-<img src="docs/images/single_sim.png" alt="Alt text" height="300">
-<img src="docs/images/dual_sim.png" alt="Alt text"   height="300">
-<img src="docs/images/garmi_sim.png" alt="Alt text"  height="300">
+<img src="docs/images/single_sim.png" alt="" height="250">
+<img src="docs/images/dual_sim.png" alt=""   height="250">
+<img src="docs/images/garmi_sim.png" alt=""  height="250">
 
 This project implements most features from the original `franka_ros` repository in ROS2 Humble, specifically for the Franka Emika Robot (Panda).
 This project significantly expands upon the original `franka_ros2` from the company, who dropped the support for the Pandas.
@@ -44,6 +44,57 @@ More thorough information is available in the documentation.
 * Joint position controller might cause some bad motor behaviors. Suggest using torque or velocity for now.
 * The default `franka_moveit_config` package depends on `warehouse_ros_mongo`, which has been deprecated. It has been changed to `warehouse_ros_sqlite` for now to ensure that `rosdep install` works properly. For now, please refer to this discussion [here](https://discourse.ros.org/t/fixing-moveit2-humble-moveit-ros-benchmarks-package/32048) for a potential solution; once a proper solution has been identified, it will be added.
 
+## Installation guide
+(Tested on Ubuntu 22.04, ROS2 Humble, Panda 4.2.2 & 4.2.1, `libfranka` 0.9.2 and MuJoCo 3.2.0)
+On a computer running Ubuntu 22.04 and real-time kernel (if you wish to use it with a real robot), do the following:
+1. Install ROS2 Humble by following their [instructions][humble-instructions] and create a workspace.
+2. Build `libfranka` 0.9.2 from source by following the [instructions][libfranka-instructions].
+3. Build MuJoCo **3.2.0** (required by `mujoco_ros_pkg`) from source by following the [instructions][mujoco-instructions].
+4. Install `mujoco_ros_pkg`, specifically [this fork](https://github.com/tenfoldpaper/mujoco_ros_pkgs).
+5. Install library dependencies:
+    - Install [Eigen **3.3.9**](https://gitlab.com/libeigen/eigen/-/releases/3.3.9). Remove Eigen 3.4.0 if that was installed from following the `libfranka` steps.
+        - Some functions will break if you use Eigen 3.4.0, and will fail to compile.
+    - Install [`dq-robotics`](https://dqrobotics.github.io/) C++ version
+6. Clone this repository (i.e. the multipanda) into your workspace's `src` folder.
+7. Install the dependencies by running this rosdep command from the workspace root: 
+    
+    `rosdep install --from-paths src -y --ignore-src`
+7. Export the `{mujoco/libfranka}/lib/cmake` directories as a `CMAKE_PREFIX_PATH` in your environment, i.e.
+    - in `~/.bashrc`, `export CMAKE_PREFIX_PATH={path to mujoco installation}/lib/cmake:{path to libfranka installation}/lib/cmake`
+8. Add the build path to your `LD_LIBRARY_PATH` by adding the following line to your `~/.bashrc`: 
+    
+    `export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:{path to libfranka install}/lib:{path to mujoco's install}/lib`
+9. Source the workspace, then in your workspace root, call: 
+    
+    `colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release`
+    - The paths to mujoco and libfranka are added to `CMAKE_PREFIX_PATH`, so no separate args are needed.
+    - The MuJoCo path is the INSTALLED folder's directory. The `lib` folder should only have the two `.so` files, and a folder called `cmake`.
+    - Likewise, the `libfranka` path should contain the `cmake` folder and the `.so` files.
+10. To run:
+    - Single arm:
+        1. with real robot, source the workspace, and run:
+            - Default: `ros2 launch franka_bringup franka.launch.py robot_ip:=<fci-ip>`.
+            - Multi-mode: `ros2 launch franka_bringup multimode_franka.launch.py robot_ip:=<fci-ip>`.
+            - `arm_id` is fixed to `panda`.
+        2. for simulated robot, source the workspace, and run:
+            - Default: `ros2 launch franka_bringup franka_sim.launch.py`.
+            - Multi-mode: `ros2 launch franka_bringup multimode_sim.launch.py`.
+            - `arm_id` is fixed to `panda`.
+            - Currently, only the robot with gripper attachment is available.
+    - Dual arm:
+        1. with real robot, source the workspace, and run:
+            - Default: `ros2 launch franka_bringup dual_franka.launch.py robot_ip_1:=<robot-1-fci-ip> robot_ip_2:=<robot-2-fci-ip> arm_id_1=<robot-1-name> arm_id_2=<robot-2-name>`.
+            - Multi-mode: `ros2 launch franka_bringup dual_multimode_franka.launch.py robot_ip_1:=<robot-1-fci-ip> robot_ip_2:=<robot-2-fci-ip> arm_id_1=<robot-1-name> arm_id_2=<robot-2-name>`.
+            - There is no default `arm_id`.
+            - Grippers are set to true by default; add `hand_n=false` to disable this.
+        2. for simulated robot, source the workspace, and run:
+            - Default: `ros2 launch franka_bringup dual_franka_sim.launch.py`.
+            - Multi-mode: `ros2 launch franka_bringup dual_multimode_sim.launch.py`
+            - `arm_id_1=mj_left` and `arm_id_2=mj_right` by default.
+    - Garmi (mobile manipulator with two Panda arms):
+        1. for simulated robot, source the workspace, and run:
+            - `ros2 launch garmi_bringup sim_garmi.launch.py`
+
 ## Using with Docker
 1. Build the docker image:
     1. at the root of the repository (where `Dockerfile` is located), run 
@@ -78,50 +129,6 @@ More thorough information is available in the documentation.
     - For RT kernel and robot connection, run
         - `~/Libraries/libfranka/bin/communication_test <robot-ip>`
 
-## Installation guide
-(Tested on Ubuntu 22.04, ROS2 Humble, Panda 4.2.2 & 4.2.1, `libfranka` 0.9.2 and MuJoCo 3.2.0)
-On a computer running Ubuntu 22.04 and real-time kernel (if you wish to use it with a real robot), do the following:
-1. Install ROS2 Humble by following their [instructions][humble-instructions] and create a workspace.
-2. Build `libfranka` 0.9.2 from source by following the [instructions][libfranka-instructions].
-3. Build MuJoCo **3.2.0** MuJoCo from source by following the [instructions][mujoco-instructions].
-4. Install `mujoco_ros_pkg`, specifically this fork(https://github.com/tenfoldpaper/mujoco_ros_pkgs).
-5. Install library dependencies:
-    - Install [Eigen **3.3.9**](https://gitlab.com/libeigen/eigen/-/releases/3.3.9). Remove Eigen 3.4.0 if that was installed from following the `libfranka` steps.
-        - Some functions will break if you use Eigen 3.4.0, and will fail to compile.
-    - Install [`dq-robotics`](https://dqrobotics.github.io/) C++ version
-6. Clone this repository (i.e. the multipanda) into your workspace's `src` folder.
-7. Install the dependencies by running this rosdep command from the workspace root: `rosdep install --from-paths src -y --ignore-src`
-7. Export the `{mujoco/libfranka}/lib/cmake` directories as a `CMAKE_PREFIX_PATH` in your environment, i.e.
-    - in `~/.bashrc`, `export CMAKE_PREFIX_PATH={path to mujoco installation}/lib/cmake:{path to libfranka installation}/lib/cmake`
-8. Add the build path to your `LD_LIBRARY_PATH` by adding the following line to your `~/.bashrc`: `export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:{path to libfranka install}/lib:{path to mujoco's install}/lib`
-9. Source the workspace, then in your workspace root, call: `colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release`
-    - The paths to mujoco and libfranka are added to `CMAKE_PREFIX_PATH`, so no separate args are needed.
-    - The MuJoCo path is the INSTALLED folder's directory. The `lib` folder should only have the two `.so` files, and a folder called `cmake`.
-    - Likewise, the `libfranka` path should contain the `cmake` folder and the `.so` files.
-10. To run:
-    - Single arm:
-        1. with real robot, source the workspace, and run:
-            - Default: `ros2 launch franka_bringup franka.launch.py robot_ip:=<fci-ip>`.
-            - Multi-mode: `ros2 launch franka_bringup multimode_franka.launch.py robot_ip:=<fci-ip>`.
-            - `arm_id` is fixed to `panda`.
-        2. with sim robot, source the workspace, and run:
-            - Default: `ros2 launch franka_bringup franka_sim.launch.py`.
-            - Multi-mode: `ros2 launch franka_bringup multimode_sim.launch.py`.
-            - `arm_id` is fixed to `panda`.
-            - Currently, only the robot with gripper attachment is available.
-    - Dual arm:
-        1. with real robot, source the workspace, and run:
-            - Default: `ros2 launch franka_bringup dual_franka.launch.py robot_ip_1:=<robot-1-fci-ip> robot_ip_2:=<robot-2-fci-ip> arm_id_1=<robot-1-name> arm_id_2=<robot-2-name>`.
-            - Multi-mode: `ros2 launch franka_bringup dual_multimode_franka.launch.py robot_ip_1:=<robot-1-fci-ip> robot_ip_2:=<robot-2-fci-ip> arm_id_1=<robot-1-name> arm_id_2=<robot-2-name>`.
-            - There is no default `arm_id`.
-            - Grippers are set to true by default; add `hand_n=false` to disable this.
-        2. with sim robot, source the workspace, and run:
-            - Default: `ros2 launch franka_bringup dual_franka_sim.launch.py`.
-            - Multi-mode: `ros2 launch franka_bringup dual_multimode_sim.launch.py`
-            - `arm_id_1=mj_left` and `arm_id_2=mj_right` by default.
-    - Garmi:
-        1. with sim robot, source the workspace, and run:
-            - `ros2 launch garmi_bringup sim_garmi.launch.py`
             
 ## Credits
 The original version is forked from mcbed's port of franka_ros2 for [humble][mcbed-humble].
