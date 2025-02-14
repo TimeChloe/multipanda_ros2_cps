@@ -60,7 +60,7 @@ class HeadController : public controller_interface::ControllerInterface {
     double k_d_ = 5.0;
     double k_d_target_ = 5.0;
     double pt1_filter_ = 0.001;
-    double pt1_filter_target_ = 0;
+    double pt1_filter_target_ = 0.001;
     std::vector<double> theta_goal_{0.0,0.0};
     std::vector<double> theta_d_{0.0,0.0};
     std::vector<double> theta_curr_{0.0,0.0};

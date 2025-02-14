@@ -31,17 +31,12 @@ controller_interface::InterfaceConfiguration
 
 controller_interface::return_type HeadController::update(const rclcpp::Time& time,
                                                                const rclcpp::Duration& period){
-  current_time_ = time;
-  // RCLCPP_INFO_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000, "\nLeft vel:  %f\nRight vel: %f", state_interfaces_.at(0).get_value(), state_interfaces_.at(2).get_value());
-  
+  // Get current theta values                                                                
   theta_curr_[0] = state_interfaces_.at(0).get_value(); // left-right
   theta_curr_[1] = state_interfaces_.at(3).get_value(); // down-up
+  
   // PD control 
-  double time_diff = 0;
   for (size_t joint_number = 0; joint_number < 2; joint_number++) {
-    
-    // Time difference between two commands
-    time_diff = (current_time_ - last_time_).seconds();
     
     // Get current and previous theta values
     double theta = theta_curr_[joint_number];
@@ -49,24 +44,25 @@ controller_interface::return_type HeadController::update(const rclcpp::Time& tim
     
     // Obtain velocities
     double dtheta_d = 0;
-    double dtheta = (theta - theta_previous) / time_diff;
+    double dtheta = (theta - theta_previous) / period.seconds();
     theta_d_[joint_number] = theta_d_[joint_number] * (1.0 - pt1_filter_) + pt1_filter_ * theta_goal_[joint_number];
-        // Calculate the approapriate torque value - PD control    
-
+    
+    // Calculate the approapriate torque value - PD control    
     double tau_j = std::min(15.0, std::max(-15.0, (theta_d_[joint_number] - theta) * k_p_ + 
                                           (dtheta_d - dtheta) * k_d_));
     
     // Set command and previous theta
     command_interfaces_[joint_number].set_value(tau_j);
     theta_prev_[joint_number] = theta;
+
+    // Set gains & filter values
+    // Currently no effect - potentially target gains could be dynamically set at runtime
+    k_p_ = k_p_ * (1.0 - 0.001) + k_p_target_ * 0.001;
+    k_d_ = k_d_ * (1.0 - 0.001) + k_d_target_ * 0.001;
+    pt1_filter_ = pt1_filter_ * (1.0 - 0.001) + pt1_filter_target_ * 0.001;
   }
-
-  last_time_ = current_time_;
   return controller_interface::return_type::OK;
-  };
-
-
-  
+};
 
 CallbackReturn HeadController::on_init(){
   // nothing for now
