@@ -4,13 +4,13 @@
 The multi-mode controller (MMC) is a meta-package that consists of 5 packages, each with a specific role:
 - `_msg` packages provide the message definitions,
 - `multi_mode_controller` is where the core logic of the multi-mode controller (MMC) is implemented,
-- `multi_mode_controller_impl` is the `ros2-control`-controller instantiation of MMC,
+- `multi_mode_controller_impl` is the `ros2_control`-controller instantiation of MMC,
 - `panda_motion_generators` implement two example motion generators to be used with the MMC.
 
 We will first begin with the `multi_mode_controller` package, and go through the code structure and how you can implement a new controller in this framework.
 
 ## multi_mode_controller
-MMC provides its own structure for implementing new controllers, dubbed _controllets_ to distinguish it from the typical `ros2-control` controllers. 
+MMC provides its own structure for implementing new controllers, dubbed _controllets_ to distinguish it from the typical `ros2_control` controllers. 
 
 ### How to implement a new controllet
 
@@ -152,7 +152,7 @@ static auto registration = ControllerFactory::registerClass<Controller>(
 
 See the example code for the full implementation, including headers.
 
-Once you've saved the code, you can now compile it by adding it to the MMC's `CMakeLists.txt`. Unlike other `ros2-control` controllers, there's no additional `xml` file that you need to add a description of.
+Once you've saved the code, you can now compile it by adding it to the MMC's `CMakeLists.txt`. Unlike other `ros2_control` controllers, there's no additional `xml` file that you need to add a description of.
 ``` cmake
 add_library(multi_mode_controller SHARED 
   src/robot_data.cpp # This is required!
@@ -163,7 +163,7 @@ add_library(multi_mode_controller SHARED
 ```
 Make the adjustment, and run `colcon build` in your workspace root.
 
-Now for the good bit: to load the controller, you simply need to adjust the corresponding `.yaml` file under the MMC instantiation in `franka_bringup`, just like a typical `ros2-control` scenario. The name you give here needs to match the one you provided for the registration step.
+Now for the good bit: to load the controller, you simply need to adjust the corresponding `.yaml` file under the MMC instantiation in `franka_bringup`, just like a typical `ros2_control` scenario. The name you give here needs to match the one you provided for the registration step.
 ``` yaml
 multi_mode_controller:
   ros__parameters:
@@ -279,7 +279,7 @@ Controller[] controllers
 where the return argument `controllers` contain the information.
 
 ### Configuring the launch yaml
-To use the MMC, you need to first add it in the corresponding `.yaml` file that is loaded up by the launch file in `franka_bringup`. A simple example can be found in `multimode.yaml`. The MMC is listed like any other `ros2-control` controller, with additional parameters to define which controllets you want to load up, the resources they need, and what controllet you want the MMC to run by default when it is activated:
+To use the MMC, you need to first add it in the corresponding `.yaml` file that is loaded up by the launch file in `franka_bringup`. A simple example can be found in `multimode.yaml`. The MMC is listed like any other `ros2_control` controller, with additional parameters to define which controllets you want to load up, the resources they need, and what controllet you want the MMC to run by default when it is activated:
 ``` yaml
 multi_mode_controller:
   ros__parameters:
@@ -304,8 +304,9 @@ For a multi-arm example, please look at `dual_multimode.yaml`.
 An example python script that makes use of the MMC can be found in `mmc_demo_script.py`. It simply sleeps for 20 seconds between each controllet, and then activates the next controllet.
 
 ## Other chapters
-[Back to main](../main.md)
-[franka_bringup](./franka_bringup.md)
-[franka_description](./franka_description.md)
-[franka_hardware](./franka_hardware.md)
-[franka_multi_mode_controller](./franka_multi_mode_controller.md)
+- [Back to main](../main.md)
+- [franka_bringup](./franka_bringup.md)
+- [franka_description](./franka_description.md)
+- [franka_hardware](./franka_hardware.md)
+- [franka_multi_mode_controller](./franka_multi_mode_controller.md)
+- [garmi_packages](./garmi.md)
