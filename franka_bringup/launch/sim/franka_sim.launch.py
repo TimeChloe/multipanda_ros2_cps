@@ -1,128 +1,87 @@
-#  Copyright (c) 2021 Franka Emika GmbH
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-
-
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
+from launch.launch_description_sources import FrontendLaunchDescriptionSource
+from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
 import os
 
-from ament_index_python.packages import get_package_share_directory
-from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Shutdown
-from launch.conditions import IfCondition, UnlessCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
-
+import xacro
+def concatenate_ns(ns1, ns2, absolute=False):
+    
+    if(len(ns1) == 0):
+        return ns2
+    if(len(ns2) == 0):
+        return ns1
+    
+    # check for /s at the end and start
+    if(ns1[0] == '/'):
+        ns1 = ns1[1:]
+    if(ns1[-1] == '/'):
+        ns1 = ns1[:-1]
+    if(ns2[0] == '/'):
+        ns2 = ns2[1:]
+    if(ns2[-1] == '/'):
+        ns2 = ns2[:-1]
+    if(absolute):
+        ns1 = '/' + ns1
+    return ns1 + '/' + ns2
 
 def generate_launch_description():
-    load_gripper_parameter_name = 'load_gripper'
-    use_rviz_parameter_name = 'use_rviz'
-    scene_xml_parameter_name = 'scene_xml'
-    mj_yaml_parameter_name = 'mj_yaml'
-
-    load_gripper = LaunchConfiguration(load_gripper_parameter_name)
-    use_rviz = LaunchConfiguration(use_rviz_parameter_name)
-    scene_xml = LaunchConfiguration(scene_xml_parameter_name)
-    mj_yaml = LaunchConfiguration(mj_yaml_parameter_name)
-
-    franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots',
+    franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots', 'sim',
                                      'panda_arm_sim.urdf.xacro')
     default_scene_xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', 'scene.xml')
-    default_mj_yaml_file = os.path.join(get_package_share_directory('franka_bringup'), 'config', 'mujoco', 'mj_objects.yaml')
+    mjros_config_file = os.path.join(get_package_share_directory('franka_bringup'), 'config', 'sim',
+                                     'single_sim_controllers.yaml')
+    franka_bringup_path = get_package_share_directory('franka_bringup')
+    mujoco_ros_path = get_package_share_directory('mujoco_ros')
+    mjr2_control_path = get_package_share_directory('mujoco_ros2_control')
+    # xml_path = os.path.join(mjr2_control_path, 'example', 'pendulum.xml')
+    xml_path = default_scene_xml_file
+    # xacro_file = os.path.join(mjr2_control_path, 'example', 'pendulum.urdf')
+    xacro_file = franka_xacro_file
+    doc = xacro.parse(open(xacro_file))
+    xacro.process_doc(doc)
+    params = {'robot_description': doc.toxml()}
+    ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
+                # See the ros2_control_plugins_example_with_ns.yaml file for more details.
 
-    robot_description = Command(
-        [FindExecutable(name='xacro'), ' ', franka_xacro_file, 
-            ' arm_id:=panda', 
-            ' hand:=', load_gripper,
-            ' scene_xml:=', scene_xml,
-            ' mj_yaml:=', mj_yaml])
+    # pendulum_config = os.path.join(get_package_share_directory('mujoco_ros2_base'), 'config','pendulum.yaml')
 
-    rviz_file = os.path.join(get_package_share_directory('franka_description'), 'rviz',
-                             'visualize_franka.rviz')
-
-    franka_controllers = PathJoinSubstitution(
-        [
-            FindPackageShare('franka_bringup'),
-            'config',
-            'sim_controllers.yaml',
-        ]
+    node_robot_state_publisher = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        output='screen',
+        namespace= ns,
+        parameters=[params]
     )
-
-    return LaunchDescription([
-        DeclareLaunchArgument(
-            use_rviz_parameter_name,
-            default_value='false',
-            description='Visualize the robot in Rviz'),
-        DeclareLaunchArgument(
-            load_gripper_parameter_name,
-            default_value='true',
-            description='Use Franka Gripper as an end-effector, otherwise, the robot is loaded '
-                        'without an end-effector.'),
-        DeclareLaunchArgument(
-            scene_xml_parameter_name,
-            default_value=default_scene_xml_file,
-            description='The path to the mujoco xml file that you want to load.'
-        ),
-        DeclareLaunchArgument(
-            mj_yaml_parameter_name,
-            default_value=default_mj_yaml_file,
-            description='The path to the mujoco object yaml file that you want to load.'
-        ),
-        Node( # RVIZ dependency
-            package='robot_state_publisher',
-            executable='robot_state_publisher',
-            name='robot_state_publisher',
-            output='screen',
-            parameters=[{'robot_description': robot_description}],
-        ),
-        Node( # RVIZ dependency
+    node_joint_state_broadcaster = Node( # RVIZ dependency
             package='joint_state_publisher',
             executable='joint_state_publisher',
             name='joint_state_publisher',
+            namespace= ns,
             parameters=[
-                {'source_list': ['franka/joint_states', '/panda_gripper_sim_node/joint_states'],
-                 'rate': 30}],
+                {'source_list': [concatenate_ns(ns, 'joint_states', True)],
+                 'rate': 10}],
+    )
+    return LaunchDescription([
+        IncludeLaunchDescription(
+            FrontendLaunchDescriptionSource(franka_bringup_path + '/launch/sim/launch_mujoco_ros_server.launch'),
+            launch_arguments={
+                'use_sim_time': "true",
+                'modelfile': xml_path,
+                'verbose': "true",
+                'ns': ns,
+                'mujoco_plugin_config': mjros_config_file
+                # 'mujoco_plugin_config': os.path.join(mjr2_control_path, 'example', 'ros2_control_plugins_example.yaml')
+
+            }.items()
         ),
-        Node(
-            package='franka_control2',
-            executable='franka_control2_node',
-            parameters=[{'robot_description': robot_description}, franka_controllers],
-            remappings=[('joint_states', 'franka/joint_states')],
-            output={
-                'stdout': 'screen',
-                'stderr': 'screen',
-            },
-            on_exit=Shutdown(),
-        ),
-        Node( # RVIZ dependency
+        node_robot_state_publisher,
+        Node( # RVIZ dependency; broken right now
             package='controller_manager',
             executable='spawner',
-            arguments=['joint_state_broadcaster'],
+            arguments=['joint_state_broadcaster', '-c', concatenate_ns(ns, 'controller_manager', True)],
             output='screen',
         ),
-        # Node(
-        #     package='controller_manager',
-        #     executable='spawner',
-        #     arguments=['franka_robot_state_broadcaster'],
-        #     output='screen',
-        #     condition=UnlessCondition(use_fake_hardware),
-        # ),
-        Node(package='rviz2',
-             executable='rviz2',
-             name='rviz2',
-             arguments=['--display-config', rviz_file],
-             condition=IfCondition(use_rviz)
-             )
-
+        node_joint_state_broadcaster
     ])

@@ -27,7 +27,7 @@ class SwitchEngine : public SwitchEngineInterface {
   // or you get an operator = error 
   // and making them just references don't work either.
   bool getRobotStatesCallback(
-        const std::shared_ptr<rmw_request_id_t> request_header,
+        const std::shared_ptr<rmw_request_id_t> /*request_header*/,
         const GetRobotStates::Request::SharedPtr& /*req*/,
         const GetRobotStates::Response::SharedPtr& res) {
     for (const auto& rd : robot_data_) {
@@ -37,7 +37,7 @@ class SwitchEngine : public SwitchEngineInterface {
   }
   virtual bool initImpl(
       const std::vector<panda_controllers::RobotData*>& robot_data,
-      rclcpp_lifecycle::LifecycleNode::SharedPtr& node, std::string name, std::string resource) override {
+      rclcpp_lifecycle::LifecycleNode::SharedPtr& node, std::string /*name*/, std::string resource) override {
     robot_data_ = robot_data;
     std::string topic_prefix = resource;
     std::size_t pos = topic_prefix.find("&");

@@ -19,7 +19,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    add_compile_options(-Wall -Wextra -Wpedantic)
+    add_compile_options(-Wall -Wextra -Wpedantic -Werror=unused-variable)
 endif()
 
 option(CHECK_TIDY "Adds clang-tidy tests" OFF)
@@ -29,6 +29,8 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
+find_package(mujoco_ros2_control REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(franka_msgs REQUIRED)
 find_package(hardware_interface REQUIRED)
@@ -37,26 +39,22 @@ find_package(Franka REQUIRED) # Franka_DIR will provide the path to the libfrank
 find_package(Boost COMPONENTS thread chrono REQUIRED)
 
 # Mujoco dependencies
-set(OpenGL_GL_PREFERENCE GLVND)
-find_package(glfw3 3.3 REQUIRED)     # GLFW3 here,
-find_package(mujoco REQUIRED)
+# set(OpenGL_GL_PREFERENCE GLVND)
+# find_package(glfw3 3.3 REQUIRED)     # GLFW3 here,
+# find_package(mujoco REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(Eigen3 REQUIRED)
+
+###### Real robot ###############
 add_library(franka_hardware
         SHARED
-        src/franka_multi_hardware_interface.cpp
-        src/franka_mujoco_multi_hardware_interface.cpp
-        src/garmi_mujoco_hardware_interface.cpp
-        src/robot.cpp
-        src/robot_sim.cpp
-        src/mobile_base_sim.cpp
-        src/garmi_head_sim.cpp
-        src/franka_param_service_server.cpp
-        src/franka_error_recovery_service_server.cpp
-        src/gripper_sim_action_server.cpp
-        src/franka_executor.cpp
-        src/control_mode.cpp
-        src/helper_functions.cpp
+        src/real/franka_multi_hardware_interface.cpp
+        src/real/robot.cpp
+        src/real/franka_param_service_server.cpp
+        src/real/franka_error_recovery_service_server.cpp
+        src/common/franka_executor.cpp
+        src/common/control_mode.cpp
+        src/common/helper_functions.cpp
 )
 
 target_include_directories(
@@ -81,8 +79,6 @@ ament_target_dependencies(
 
 target_link_libraries(
         franka_hardware
-        mujoco::mujoco
-        glfw
         Boost::thread
         Boost::chrono
         ${YAML_CPP_LIBRARIES}
@@ -90,8 +86,51 @@ target_link_libraries(
 
 pluginlib_export_plugin_description_file(hardware_interface franka_hardware.xml)
 
+########## Mujoco simulation robot ##########
+add_library(franka_mj_hardware 
+  SHARED
+  src/sim/franka_mj_hardware_system.cpp
+  src/sim/robot_sim.cpp
+  src/sim/gripper_sim_action_server.cpp
+  src/common/franka_executor.cpp
+  src/common/control_mode.cpp
+  src/common/helper_functions.cpp
+  )
+
+target_compile_features(franka_mj_hardware PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
+target_include_directories(franka_mj_hardware PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${EIGEN3_INCLUDE_DIRS}
+  ${YAML_CPP_INCLUDE_DIRS}
+  )
+
+ament_target_dependencies(
+  franka_mj_hardware
+  "mujoco_ros2_control"
+  "hardware_interface"
+  "rclcpp"
+  "rclcpp_components"
+  "rclcpp_lifecycle"
+  "rclcpp_action"
+  "pluginlib"
+  Franka
+  franka_msgs
+  std_srvs
+)
+
+target_link_libraries(
+  franka_mj_hardware
+  Boost::thread
+  Boost::chrono
+  ${YAML_CPP_LIBRARIES}
+)
+
+pluginlib_export_plugin_description_file(mujoco_ros2_control franka_mj_hardware.xml)
+
+# Install scripts
 install(
-        TARGETS franka_hardware
+        TARGETS franka_hardware franka_mj_hardware
         DESTINATION lib
 )
 install(
@@ -128,10 +167,13 @@ ament_export_include_directories(
 )
 ament_export_libraries(
         franka_hardware
+        franka_mj_hardware
 )
 ament_export_dependencies(
         hardware_interface
         pluginlib
         rclcpp
+        mujoco_ros2_control
 )
+
 ament_package()

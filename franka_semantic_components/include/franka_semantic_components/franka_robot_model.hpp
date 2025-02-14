@@ -7,12 +7,12 @@
 #include <string>
 #include <vector>
 
-#include "franka_hardware/model_base.hpp"
+#include "franka_hardware/common/model_base.hpp"
 #include "franka_msgs/msg/franka_model.hpp"
 
 #include "semantic_components/semantic_component_interface.hpp"
 namespace multi_mode_controller {
-class SingleMultiModeController;
+class MultiModeController;
 }
 namespace panda_controllers {
   class RobotData;
@@ -212,7 +212,7 @@ class FrankaRobotModel
   std::string arm_id_{"panda"};
   const std::string robot_state_interface_name_{"robot_state"};
   const std::string robot_model_interface_name_{"robot_model"};
-  friend class multi_mode_controller::SingleMultiModeController;
+  friend class multi_mode_controller::MultiModeController;
   friend class panda_controllers::RobotData;
 };
 }  // namespace franka_semantic_components

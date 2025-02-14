@@ -29,7 +29,7 @@ class PolyC2JointMotionGenerator :
    * The min/max args are usually grabbed from multi_mode_controller/utils/panda_limits.h .
    * @param[in] action_name (MGRI) To Name of the action server.
    * @param[in] robot_state_srv_name (MGRI) Fully qualified name of the getRobotState service server, e.g. /panda/get_robot_states
-   * @param[in] controller_name (MGRI) Name of the multi-mode controller, e.g. single_multi_mode_controller
+   * @param[in] controller_name (MGRI) Name of the multi-mode controller, e.g. multi_mode_controller
    * @param[in] desired_pose_name (MGRI) Fully qualified name of the topic that subscribes to the desired pose. 
    * @param[in] q_min The minimum joint position.
    * @param[in] q_max The maximum joint position.

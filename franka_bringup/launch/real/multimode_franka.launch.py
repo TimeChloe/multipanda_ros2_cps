@@ -45,7 +45,7 @@ def generate_launch_description():
     fake_sensor_commands = LaunchConfiguration(fake_sensor_commands_parameter_name)
     use_rviz = LaunchConfiguration(use_rviz_parameter_name)
 
-    franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots',
+    franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots', 'real',
                                      'panda_arm.urdf.xacro')
     robot_description = Command(
         [FindExecutable(name='xacro'), ' ', franka_xacro_file, 
@@ -128,7 +128,7 @@ def generate_launch_description():
         Node(
             package='controller_manager',
             executable='spawner',
-            arguments=['single_multi_mode_controller'],
+            arguments=['multi_mode_controller'],
             output='screen',
             condition=UnlessCondition(use_fake_hardware),
         ),

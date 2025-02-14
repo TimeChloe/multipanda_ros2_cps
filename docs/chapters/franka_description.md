@@ -4,7 +4,7 @@
 ### panda_arm.xacro and hand.xacro
 The `panda_arm.xacro` file provides kinematic description of the robot. In most cases, you should not have to change anything in this file, unless you make some heavy modification to the robot.
 
-Similarly, the `hand.xacro` provides kinematic description of the default Franka Hand. If you change the fingertips of the gripper with some custom component, this file is what you need to change. Since the hand does not have any joints that are directly controlled by `ros2-control`, you can leave the `hand.urdf.xacro` alone.
+Similarly, the `hand.xacro` provides kinematic description of the default Franka Hand. If you change the fingertips of the gripper with some custom component, this file is what you need to change. Since the hand does not have any joints that are directly controlled by `ros2_control`, you can leave the `hand.urdf.xacro` alone.
 
 ### arm.urdf.xacro and arm.ros2_control.xacro
 When you want to customize the placement of your robot, e.g. in a multi-arm setup, you would make the change by modifying the corresponding `arm.urdf.xacro` file. For example, in the case of the dual-arm setup (`dual_panda_arm.urdf.xacro`), this is described by:
@@ -30,7 +30,7 @@ Another important part is the `arm.ros2_control.xacro` file, which is usually in
 <param name="ns_2">${ns_2}</param>
 </hardware>
 ``` 
-Additionally, the `<param>` tag allows you to add parameters that can be accessed by `ros2-control`. As a comparison, here is the sim version of the dual-arm (`dual_panda_arm_sim.ros2_control.xacro`):
+Additionally, the `<param>` tag allows you to add parameters that can be accessed by `ros2_control`. As a comparison, here is the sim version of the dual-arm (`dual_panda_arm_sim.ros2_control.xacro`):
 ``` xml
 <hardware>
     <param name="robot_count">2</param>
@@ -39,8 +39,6 @@ Additionally, the `<param>` tag allows you to add parameters that can be accesse
     <param name="ns_2">${ns_2}</param>
     <param name="hand_1">${hand_1}</param>
     <param name="hand_2">${hand_2}</param>
-    <param name="scene_xml">${scene_xml}</param>
-    <param name="mj_yaml">${mj_yaml}</param>
 </hardware>
 ```
 Notice that there are 4 additional parameters here: the `hand_1/2`, `scene_xml`, and `mj_yaml`. The `hand_n` parameter indicates whether there is a hand attached to the robot; for now, the model is loaded with it by default, and all this does is to control the creation of the gripper action servers. The `scene_xml` param tells the sim `franka_hardware` about the location of the `scene.xml` at runtime so that it can initialize the MuJoCo simulation. Finally, the `mj_yaml` param tells the `HardwareInterface` about where the file containing list of objects whose poses must be published, so that they can be processed accordingly.
@@ -67,8 +65,9 @@ All the robot name-dependent part of the `xml` file is marked with `{YOUR_NAME}`
 For multi-arm simulation, you would then create a new version of the robot description `xml` file, and copy-paste the parts of your custom `TEMPLATE_panda.xml` to the corresponding part; please see `mj_dual.xml` for an example.
 
 ## Other chapters
-[Back to main](../main.md)
-[franka_bringup](./franka_bringup.md)
-[franka_description](./franka_description.md)
-[franka_hardware](./franka_hardware.md)
-[franka_multi_mode_controller](./franka_multi_mode_controller.md)
+- [Back to main](../main.md)
+- [franka_bringup](./franka_bringup.md)
+- [franka_description](./franka_description.md)
+- [franka_hardware](./franka_hardware.md)
+- [franka_multi_mode_controller](./franka_multi_mode_controller.md)
+- [garmi_packages](./garmi.md)

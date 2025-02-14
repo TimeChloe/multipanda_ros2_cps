@@ -18,7 +18,7 @@ int main(int argc, char** argv) {
   }
   std::string action_name = argv[1];//"joint_via_motion";
   std::string robot_state_srv_name = argv[2];//"/left_and_right/get_robot_states";
-  std::string controller_name = argv[3];//"single_multi_mode_controller";
+  std::string controller_name = argv[3];//"multi_mode_controller";
   std::string controllet_name = argv[4];//"panda_joint_impedance_controller";
   std::string desired_pose_name = argv[5];//"/left_and_right/des  _coupled_dual_cartesian_impedance_controller/desired_pose";
   printf("Starting joint via motion generator with the following parameters:\n%s\n%s\n%s\n%s\n%s\n############\n",
