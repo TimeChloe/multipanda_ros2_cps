@@ -1,6 +1,7 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
 from launch.launch_description_sources import FrontendLaunchDescriptionSource
+from launch.conditions import IfCondition
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
@@ -42,10 +43,12 @@ def generate_launch_description():
     load_gripper_param = 'load_gripper'
     arm_id_param = 'arm_id'
     initial_positions_param = 'initial_positions'
+    use_rviz_param = 'use_rviz'
     
     load_gripper = LaunchConfiguration(load_gripper_param)
     arm_id = LaunchConfiguration(arm_id_param)
     initial_positions = LaunchConfiguration(initial_positions_param)
+    use_rviz = LaunchConfiguration(use_rviz_param)
 
     robot_description = Command(
         [FindExecutable(name='xacro'), ' ', franka_xacro_file, 
@@ -54,6 +57,8 @@ def generate_launch_description():
             ' initial_positions:=', initial_positions])
     
     params = {'robot_description': robot_description}
+    rviz_file = os.path.join(get_package_share_directory('franka_description'), 'rviz',
+                             'visualize_franka.rviz')
     ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
                 # See the ros2_control_plugins_example_with_ns.yaml file for more details.
 
@@ -75,6 +80,10 @@ def generate_launch_description():
     )
     return LaunchDescription([
         # Launch args
+        DeclareLaunchArgument(
+            use_rviz_param,
+            default_value='false',
+            description='Visualize the robot in Rviz'),
         DeclareLaunchArgument(
             load_gripper_param,
             default_value='true',
@@ -114,4 +123,10 @@ def generate_launch_description():
             arguments=['joint_state_broadcaster', '-c', concatenate_ns(ns, 'controller_manager', True)],
             output='screen',
         ),
+        Node(package='rviz2',
+             executable='rviz2',
+             name='rviz2',
+             arguments=['--display-config', rviz_file],
+             condition=IfCondition(use_rviz)
+             )
     ])
