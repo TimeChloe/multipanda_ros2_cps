@@ -50,7 +50,7 @@ def generate_launch_description():
     else:
         scene_file = 'dual_scene_ng.xml'
     franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots', 'sim',
-                                     'dual_panda_arm_sim.urdf.xacro')
+                                     scene_file)
     xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', 'dual_scene.xml')
     mjros_config_file = os.path.join(get_package_share_directory('franka_bringup'), 'config', 'sim',
                                      'dual_sim_controllers.yaml')
@@ -122,7 +122,7 @@ def generate_launch_description():
             package='joint_state_publisher',
             executable='joint_state_publisher',
             name='joint_state_publisher',
-            parameters=[
+            parameters=[ # TODO: Review source list
                 {'source_list': ['franka/joint_states', 
                                 '/mj_left_gripper_sim_node/joint_states',
                                 '/mj_right_gripper_sim_node/joint_states'],
