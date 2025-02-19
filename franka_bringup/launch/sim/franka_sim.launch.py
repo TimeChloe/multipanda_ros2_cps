@@ -33,7 +33,7 @@ def generate_launch_description():
 
     # Fixed variables
     
-    load_gripper = False # We make gripper a fixed variable, mainly because parsing the argument 
+    load_gripper = True # We make gripper a fixed variable, mainly because parsing the argument 
                         # within generate_launch_description is a fairly unintuitive process, 
                         # and it's not worth doing just for a single boolean.
     
