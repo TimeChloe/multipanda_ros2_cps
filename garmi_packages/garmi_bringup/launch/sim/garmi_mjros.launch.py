@@ -39,9 +39,17 @@ def generate_launch_description():
     use_rviz = LaunchConfiguration(use_rviz_param)
 
     # Fixed values
+    load_gripper = True # We make gripper a fixed variable, mainly because parsing the argument 
+                        # within generate_launch_description is a fairly unintuitive process, 
+                        # and it's not worth doing just for a single boolean.
+                        
+    if(load_gripper): # mujoco scene file must be manually adjusted since there's no way to pass parameters
+        scene_file = 'garmi.xml'
+    else:
+        scene_file = 'garmi_ng.xml'
     garmi_xacro_file = os.path.join(get_package_share_directory('garmi_description'), 'robots',
                                      'garmi_sim.urdf.xacro')
-    xml_path = os.path.join(get_package_share_directory('garmi_description'), 'mujoco', 'garmi', 'assets', 'xml', 'garmi.xml')
+    xml_path = os.path.join(get_package_share_directory('garmi_description'), 'mujoco', 'garmi', 'assets', 'xml', scene_file)
     mjros_config_file = os.path.join(get_package_share_directory('garmi_bringup'), 'config', 'sim',
                                      'sim_garmi.yaml')
 
@@ -49,8 +57,8 @@ def generate_launch_description():
         [FindExecutable(name='xacro'), ' ', garmi_xacro_file, 
             ' arm_id_1:=left', 
             ' arm_id_2:=right',
-            ' hand_1:=true',
-            ' hand_2:=true',
+            ' hand_1:=', str(load_gripper).lower(),
+            ' hand_2:=', str(load_gripper).lower(),
             ' initial_positions_1:=', initial_positions_1,
             ' initial_positions_2:=', initial_positions_2])
     ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
