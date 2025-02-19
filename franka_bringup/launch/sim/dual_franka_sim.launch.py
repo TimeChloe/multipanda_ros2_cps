@@ -27,72 +27,85 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    arm_id_1_parameter_name = "arm_id_1"
-    arm_id_2_parameter_name = "arm_id_2"
-    load_gripper_1_parameter_name = 'load_gripper_1'
-    load_gripper_2_parameter_name = 'load_gripper_2'
-    use_rviz_parameter_name = 'use_rviz'
+    arm_id_1_param = "arm_id_1"
+    arm_id_2_param = "arm_id_2"
+    load_gripper_1_param = 'load_gripper_1'
+    load_gripper_2_param = 'load_gripper_2'
+    initial_positions_1_param = 'initial_positions_1'
+    initial_positions_2_param = 'initial_positions_2'
+    use_rviz_param = 'use_rviz'
 
-    arm_id_1 = LaunchConfiguration(arm_id_1_parameter_name)
-    arm_id_2 = LaunchConfiguration(arm_id_2_parameter_name)
-    load_gripper_1 = LaunchConfiguration(load_gripper_1_parameter_name)
-    load_gripper_2 = LaunchConfiguration(load_gripper_2_parameter_name)
-    use_rviz = LaunchConfiguration(use_rviz_parameter_name)
+    arm_id_1 = LaunchConfiguration(arm_id_1_param)
+    arm_id_2 = LaunchConfiguration(arm_id_2_param)
+    load_gripper_1 = LaunchConfiguration(load_gripper_1_param)
+    load_gripper_2 = LaunchConfiguration(load_gripper_2_param)
+    initial_positions_1 = LaunchConfiguration(initial_positions_1_param)
+    initial_positions_2 = LaunchConfiguration(initial_positions_2_param)
+    use_rviz = LaunchConfiguration(use_rviz_param)
     ns=""
+
+    # Fixed variables
     franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots', 'sim',
                                      'dual_panda_arm_sim.urdf.xacro')
+    xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', 'dual_scene.xml')
     mjros_config_file = os.path.join(get_package_share_directory('franka_bringup'), 'config', 'sim',
                                      'dual_sim_controllers.yaml')
     franka_bringup_path = get_package_share_directory('franka_bringup')
-    default_scene_xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', 'dual_scene.xml')
-    xml_path = default_scene_xml_file
 
     robot_description = Command(
         [FindExecutable(name='xacro'), ' ', franka_xacro_file, 
             ' arm_id_1:=', arm_id_1, 
             ' arm_id_2:=', arm_id_2,
             ' hand_1:=', load_gripper_1,
-            ' hand_2:=', load_gripper_2])
+            ' hand_2:=', load_gripper_2,
+            ' initial_positions_1:=', initial_positions_1,
+            ' initial_positions_2:=', initial_positions_2])
 
     rviz_file = os.path.join(get_package_share_directory('franka_description'), 'rviz',
                              'visualize_dual_franka.rviz')
 
-    franka_controllers = PathJoinSubstitution(
-        [
-            FindPackageShare('franka_bringup'),
-            'config', 'sim',
-            'dual_sim_controllers.yaml',
-        ]
-    )
 
     return LaunchDescription([
+        # Launch args
         DeclareLaunchArgument(
-            use_rviz_parameter_name,
+            use_rviz_param,
             default_value='false',
             description='Visualize the robot in Rviz'),
         DeclareLaunchArgument(
-            arm_id_1_parameter_name,
+            arm_id_1_param,
             default_value='mj_left',
             description='Unique name of robot 1.'
         ),
         DeclareLaunchArgument(
-            arm_id_2_parameter_name,
+            arm_id_2_param,
             default_value='mj_right',
             description='Unique name of robot 2.'
         ),
         DeclareLaunchArgument(
-            load_gripper_1_parameter_name,
+            load_gripper_1_param,
             default_value='true',
             description='Load robot 1 with franka gripper.'),
         DeclareLaunchArgument(
-            load_gripper_2_parameter_name,
+            load_gripper_2_param,
             default_value='true',
             description='Load robot 2 with franka gripper.'),
+        DeclareLaunchArgument(
+            initial_positions_1_param,
+            default_value='"0.0 -0.785 0.0 -2.356 0.0 1.571 0.785"',
+            description='Initial joint positions of robot 1. Must be enclosed in quotes, and in pure number.'
+                        'Defaults to the "communication_test" pose.'),
+        DeclareLaunchArgument(
+            initial_positions_2_param,
+            default_value='"0.0 -0.785 0.0 -2.356 0.0 1.571 0.785"',
+            description='Initial joint positions of robot 2. Must be enclosed in quotes, and in pure number.'
+                        'Defaults to the "communication_test" pose.'),
+
+        # Mujoco ros2 server launch
         IncludeLaunchDescription(
             FrontendLaunchDescriptionSource(franka_bringup_path + '/launch/sim/launch_mujoco_ros_server.launch'),
             launch_arguments={
                 'use_sim_time': "true",
-                'modelfile': xml_path,
+                'modelfile': xml_file,
                 'verbose': "true",
                 'ns': ns,
                 'mujoco_plugin_config': mjros_config_file
@@ -100,6 +113,8 @@ def generate_launch_description():
 
             }.items()
         ),
+
+        # Miscellaneous
         Node( # RVIZ dependency
             package='robot_state_publisher',
             executable='robot_state_publisher',

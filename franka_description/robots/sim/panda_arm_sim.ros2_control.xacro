@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
-  <xacro:macro name="panda_arm_sim_ros2_control" params="ns hand">
+  <xacro:macro name="panda_arm_sim_ros2_control" params="ns hand initial_positions">
     <ros2_control name="FrankaMjHardwareSystem" type="system">
       <hardware>
         <param name="robot_count">1</param>
@@ -22,13 +22,15 @@
         </joint>
       </xacro:macro>
 
-      <xacro:configure_joint joint_name="${ns}_joint1" initial_position="0.0"/>
-      <xacro:configure_joint joint_name="${ns}_joint2" initial_position="${-pi/4}"/>
-      <xacro:configure_joint joint_name="${ns}_joint3" initial_position="0.0"/>
-      <xacro:configure_joint joint_name="${ns}_joint4" initial_position="${-3*pi/4}"/>
-      <xacro:configure_joint joint_name="${ns}_joint5" initial_position="0.0"/>
-      <xacro:configure_joint joint_name="${ns}_joint6" initial_position="${pi/2}"/>
-      <xacro:configure_joint joint_name="${ns}_joint7" initial_position="${pi/4}"/>
+      <xacro:property name="initial_positions_list" value="${initial_positions.split(' ')}"/>
+
+      <xacro:configure_joint joint_name="${ns}_joint1" initial_position="${initial_positions_list[0]}"/>
+      <xacro:configure_joint joint_name="${ns}_joint2" initial_position="${initial_positions_list[1]}"/>
+      <xacro:configure_joint joint_name="${ns}_joint3" initial_position="${initial_positions_list[2]}"/>
+      <xacro:configure_joint joint_name="${ns}_joint4" initial_position="${initial_positions_list[3]}"/>
+      <xacro:configure_joint joint_name="${ns}_joint5" initial_position="${initial_positions_list[4]}"/>
+      <xacro:configure_joint joint_name="${ns}_joint6" initial_position="${initial_positions_list[5]}"/>
+      <xacro:configure_joint joint_name="${ns}_joint7" initial_position="${initial_positions_list[6]}"/>
 
     </ros2_control>
   </xacro:macro>
