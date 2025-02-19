@@ -32,20 +32,28 @@ def concatenate_ns(ns1, ns2, absolute=False):
 def generate_launch_description():
 
     # Fixed variables
+    
+    load_gripper = False # We make gripper a fixed variable, mainly because parsing the argument 
+                        # within generate_launch_description is a fairly unintuitive process, 
+                        # and it's not worth doing just for a single boolean.
+    
+    if(load_gripper): # mujoco scene file must be manually adjusted since there's no way to pass parameters
+        scene_file = 'scene.xml'
+    else:
+        scene_file = 'scene_ng.xml'
     franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots', 'sim',
                                      'panda_arm_sim.urdf.xacro')
-    xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', 'scene.xml')
+    xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', scene_file)
     mjros_config_file = os.path.join(get_package_share_directory('franka_bringup'), 'config', 'sim',
                                      'single_sim_controllers.yaml')
     franka_bringup_path = get_package_share_directory('franka_bringup')
 
     # Parameters as launch arguments
-    load_gripper_param = 'load_gripper'
     arm_id_param = 'arm_id'
     initial_positions_param = 'initial_positions'
     use_rviz_param = 'use_rviz'
     
-    load_gripper = LaunchConfiguration(load_gripper_param)
+    
     arm_id = LaunchConfiguration(arm_id_param)
     initial_positions = LaunchConfiguration(initial_positions_param)
     use_rviz = LaunchConfiguration(use_rviz_param)
@@ -53,7 +61,7 @@ def generate_launch_description():
     robot_description = Command(
         [FindExecutable(name='xacro'), ' ', franka_xacro_file, 
             ' arm_id:=', arm_id, 
-            ' hand:=', load_gripper,
+            ' hand:=', str(load_gripper).lower(),
             ' initial_positions:=', initial_positions])
     
     params = {'robot_description': robot_description}
@@ -84,11 +92,6 @@ def generate_launch_description():
             use_rviz_param,
             default_value='false',
             description='Visualize the robot in Rviz'),
-        DeclareLaunchArgument(
-            load_gripper_param,
-            default_value='true',
-            description='Use Franka Gripper as an end-effector, otherwise, the robot is loaded '
-                        'without an end-effector. Defaults to true.'),
         DeclareLaunchArgument(
             arm_id_param,
             default_value='panda',

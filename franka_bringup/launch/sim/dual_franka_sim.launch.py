@@ -29,22 +29,26 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     arm_id_1_param = "arm_id_1"
     arm_id_2_param = "arm_id_2"
-    load_gripper_1_param = 'load_gripper_1'
-    load_gripper_2_param = 'load_gripper_2'
     initial_positions_1_param = 'initial_positions_1'
     initial_positions_2_param = 'initial_positions_2'
     use_rviz_param = 'use_rviz'
 
     arm_id_1 = LaunchConfiguration(arm_id_1_param)
     arm_id_2 = LaunchConfiguration(arm_id_2_param)
-    load_gripper_1 = LaunchConfiguration(load_gripper_1_param)
-    load_gripper_2 = LaunchConfiguration(load_gripper_2_param)
     initial_positions_1 = LaunchConfiguration(initial_positions_1_param)
     initial_positions_2 = LaunchConfiguration(initial_positions_2_param)
     use_rviz = LaunchConfiguration(use_rviz_param)
     ns=""
 
     # Fixed variables
+    load_gripper = True # We make gripper a fixed variable, mainly because parsing the argument 
+                        # within generate_launch_description is a fairly unintuitive process, 
+                        # and it's not worth doing just for a single boolean.
+                        
+    if(load_gripper): # mujoco scene file must be manually adjusted since there's no way to pass parameters
+        scene_file = 'dual_scene.xml'
+    else:
+        scene_file = 'dual_scene_ng.xml'
     franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots', 'sim',
                                      'dual_panda_arm_sim.urdf.xacro')
     xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', 'dual_scene.xml')
@@ -56,8 +60,8 @@ def generate_launch_description():
         [FindExecutable(name='xacro'), ' ', franka_xacro_file, 
             ' arm_id_1:=', arm_id_1, 
             ' arm_id_2:=', arm_id_2,
-            ' hand_1:=', load_gripper_1,
-            ' hand_2:=', load_gripper_2,
+            ' hand_1:=', str(load_gripper).lower(),
+            ' hand_2:=', str(load_gripper).lower(),
             ' initial_positions_1:=', initial_positions_1,
             ' initial_positions_2:=', initial_positions_2])
 
@@ -81,14 +85,6 @@ def generate_launch_description():
             default_value='mj_right',
             description='Unique name of robot 2.'
         ),
-        DeclareLaunchArgument(
-            load_gripper_1_param,
-            default_value='true',
-            description='Load robot 1 with franka gripper.'),
-        DeclareLaunchArgument(
-            load_gripper_2_param,
-            default_value='true',
-            description='Load robot 2 with franka gripper.'),
         DeclareLaunchArgument(
             initial_positions_1_param,
             default_value='"0.0 -0.785 0.0 -2.356 0.0 1.571 0.785"',
