@@ -1,8 +1,11 @@
-from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
-from launch.launch_description_sources import FrontendLaunchDescriptionSource
-from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.launch_description_sources import FrontendLaunchDescriptionSource
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Shutdown
+from launch.conditions import IfCondition, UnlessCondition
+from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 import os
 
 import xacro
@@ -27,26 +30,40 @@ def concatenate_ns(ns1, ns2, absolute=False):
     return ns1 + '/' + ns2
 
 def generate_launch_description():
+    initial_positions_1_param = 'initial_positions_1'
+    initial_positions_2_param = 'initial_positions_2'
+    use_rviz_param = 'use_rviz'
+
+    initial_positions_1 = LaunchConfiguration(initial_positions_1_param)
+    initial_positions_2 = LaunchConfiguration(initial_positions_2_param)
+    use_rviz = LaunchConfiguration(use_rviz_param)
+
+    # Fixed values
     garmi_xacro_file = os.path.join(get_package_share_directory('garmi_description'), 'robots',
                                      'garmi_sim.urdf.xacro')
-    default_scene_xml_file = os.path.join(get_package_share_directory('garmi_description'), 'mujoco', 'garmi', 'assets', 'xml', 'garmi.xml')
+    xml_path = os.path.join(get_package_share_directory('garmi_description'), 'mujoco', 'garmi', 'assets', 'xml', 'garmi.xml')
     mjros_config_file = os.path.join(get_package_share_directory('garmi_bringup'), 'config', 'sim',
                                      'sim_garmi.yaml')
 
-    xml_path = default_scene_xml_file
-    xacro_file = garmi_xacro_file
-    doc = xacro.parse(open(xacro_file))
-    xacro.process_doc(doc)
-    params = {'robot_description': doc.toxml()}
+    robot_description = Command(
+        [FindExecutable(name='xacro'), ' ', garmi_xacro_file, 
+            ' arm_id_1:=left', 
+            ' arm_id_2:=right',
+            ' hand_1:=true',
+            ' hand_2:=true',
+            ' initial_positions_1:=', initial_positions_1,
+            ' initial_positions_2:=', initial_positions_2])
     ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
                 # See the ros2_control_plugins_example_with_ns.yaml file for more details.
 
+    rviz_file = os.path.join(get_package_share_directory('garmi_description'), 'rviz',
+                             'visualize_garmi.rviz')
     node_robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
         output='screen',
         namespace= ns,
-        parameters=[params]
+        parameters=[{'robot_description': robot_description}]
     )
     node_joint_state_broadcaster = Node( # RVIZ dependency
             package='joint_state_publisher',
@@ -58,6 +75,21 @@ def generate_launch_description():
                  'rate': 10}],
     )
     return LaunchDescription([
+        # Launch args
+        DeclareLaunchArgument(
+            use_rviz_param,
+            default_value='false',
+            description='Visualize the robot in Rviz'),
+        DeclareLaunchArgument(
+            initial_positions_1_param,
+            default_value='"-1.571 -0.785 0.0 -2.356 0.0 1.571 0.785"',
+            description='Initial joint positions of robot 1. Must be enclosed in quotes, and in pure number.'
+                        'Defaults to the "communication_test" pose.'),
+        DeclareLaunchArgument(
+            initial_positions_2_param,
+            default_value='"1.571 -0.785 0.0 -2.356 0.0 1.571 0.785"',
+            description='Initial joint positions of robot 2. Must be enclosed in quotes, and in pure number.'
+                        'Defaults to the "communication_test" pose.'),
         IncludeLaunchDescription(
             FrontendLaunchDescriptionSource(get_package_share_directory('garmi_bringup') + '/launch/sim/launch_mujoco_ros_server.launch'),
             launch_arguments={
@@ -76,5 +108,11 @@ def generate_launch_description():
         #     arguments=['joint_state_broadcaster', '-c', concatenate_ns(ns, 'controller_manager', True)],
         #     output='screen',
         # ),
-        node_joint_state_broadcaster
+        node_joint_state_broadcaster,
+        Node(package='rviz2',
+             executable='rviz2',
+             name='rviz2',
+             arguments=['--display-config', rviz_file],
+             condition=IfCondition(use_rviz)
+             )
     ])
