@@ -1,6 +1,6 @@
 <mujoco model="panda scene">
 
-  <include file="mj_right.xml"/>
+  <include file="panda_ng.xml"/>
   
 
   <statistic center="0.3 0 0.4" extent="1"/>
