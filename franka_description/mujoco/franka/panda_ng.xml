@@ -118,7 +118,6 @@
 
   <worldbody>
     <light name="top" pos="0 0 2" mode="trackcom"/>
-    <!-- <body name="panda_link0" childclass="panda" pos="0 0 1.1" quat="-0.7071068 0.7071068 0 0" gravcomp="1"> -->
       <body name="panda_link0" childclass="panda" pos="0 0 0" quat="0 0 0 1" gravcomp="1">
       <inertial mass="0.629769" pos="-0.041018 -0.00014 0.049974"
           fullinertia="0.00315 0.00388 0.004285 8.2904e-7 0.00015 8.2299e-6"/>
@@ -219,8 +218,8 @@
                     <body name="panda_link8" pos="0 0 0.107" gravcomp="1">
                       <site name="panda_flange_site" pos="0 0.0 0.0" size=".01 .01 .01" type="ellipsoid" rgba=".8 .2 .1 0"/>
                       <site name="panda_ee_site" pos="0 0.0 0.0" size=".01 .01 .01" type="ellipsoid" rgba=".8 .2 .1 0"/>
-                      <!-- Gripper section, replace it with whatever new end-effector you would like to have -->
-                      <!-- Example: standarad Panda gripper
+                      <!-- TODO: Gripper section, replace it with whatever new end-effector you would like to have -->
+                      <!-- Example: standard Panda gripper
                       <body name="panda_hand" quat="0.9238795 0 0 -0.3826834" gravcomp="1">
                         <inertial mass="0.73" pos="-0.01 0 0.03"
                             diaginertia="0.001 0.0025 0.0017"/>
@@ -276,7 +275,7 @@
   <contact>
     <exclude body1="panda_link7" body2="panda_link8"/>
   </contact>
-
+  <!-- TODO: add properties for your new end effector -->
   <!-- <tendon>
     <fixed name="split">
       <joint joint="panda_finger_joint1" coef="0.5"/>
@@ -312,7 +311,7 @@
     <velocity name="panda_act_vel5" joint="panda_joint5" kv="1"/>
     <velocity name="panda_act_vel6" joint="panda_joint6" kv="1"/>
     <velocity name="panda_act_vel7" joint="panda_joint7" kv="1"/>
-
+    <!-- TODO: add the actuators for your new end effector -->
     <!-- <general class="panda" name="panda_act_gripper" tendon="split" forcerange="-100 100" ctrlrange="0 255"
         gainprm="0.01568627451 0 0" biasprm="0 -100 -10"/> -->
   </actuator>
