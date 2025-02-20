@@ -50,8 +50,8 @@ def generate_launch_description():
     else:
         scene_file = 'dual_scene_ng.xml'
     franka_xacro_file = os.path.join(get_package_share_directory('franka_description'), 'robots', 'sim',
-                                     scene_file)
-    xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', 'dual_scene.xml')
+                                     "dual_panda_arm_sim.urdf.xacro")
+    xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', scene_file)
     mjros_config_file = os.path.join(get_package_share_directory('franka_bringup'), 'config', 'sim',
                                      'dual_sim_controllers.yaml')
     franka_bringup_path = get_package_share_directory('franka_bringup')
