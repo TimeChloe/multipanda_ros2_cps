@@ -24,7 +24,25 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-
+def concatenate_ns(ns1, ns2, absolute=False):
+    
+    if(len(ns1) == 0):
+        return ns2
+    if(len(ns2) == 0):
+        return ns1
+    
+    # check for /s at the end and start
+    if(ns1[0] == '/'):
+        ns1 = ns1[1:]
+    if(ns1[-1] == '/'):
+        ns1 = ns1[:-1]
+    if(ns2[0] == '/'):
+        ns2 = ns2[1:]
+    if(ns2[-1] == '/'):
+        ns2 = ns2[:-1]
+    if(absolute):
+        ns1 = '/' + ns1
+    return ns1 + '/' + ns2
 
 def generate_launch_description():
     arm_id_1_param = "arm_id_1"
@@ -38,7 +56,7 @@ def generate_launch_description():
     initial_positions_1 = LaunchConfiguration(initial_positions_1_param)
     initial_positions_2 = LaunchConfiguration(initial_positions_2_param)
     use_rviz = LaunchConfiguration(use_rviz_param)
-    ns=""
+    
 
     # Fixed variables
     load_gripper = True # We make gripper a fixed variable, mainly because parsing the argument 
@@ -56,6 +74,7 @@ def generate_launch_description():
                                      'dual_sim_controllers.yaml')
     franka_bringup_path = get_package_share_directory('franka_bringup')
 
+    # Robot state publisher setup
     robot_description = Command(
         [FindExecutable(name='xacro'), ' ', franka_xacro_file, 
             ' arm_id_1:=', arm_id_1, 
@@ -65,9 +84,35 @@ def generate_launch_description():
             ' initial_positions_1:=', initial_positions_1,
             ' initial_positions_2:=', initial_positions_2])
 
+    params = {'robot_description': robot_description}
+    node_robot_state_publisher = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        output='screen',
+        namespace= ns,
+        parameters=[params]
+    )
+
+    # Joint state publisher setup
+    jsp_source_list = [concatenate_ns(ns, 'joint_states', True)]
+    if(load_gripper):
+        jsp_source_list.append(concatenate_ns(ns, 'mj_left_gripper_sim_node/joint_states/joint_states', True))
+        jsp_source_list.append(concatenate_ns(ns, 'mj_right_gripper_sim_node/joint_states/joint_states', True))
+
+    node_joint_state_publisher = Node( # RVIZ dependency
+            package='joint_state_publisher',
+            executable='joint_state_publisher',
+            name='joint_state_publisher',
+            namespace= ns,
+            parameters=[
+                {'source_list': jsp_source_list,
+                 'rate': 30}],
+    )
+
+    # Others
     rviz_file = os.path.join(get_package_share_directory('franka_description'), 'rviz',
                              'visualize_dual_franka.rviz')
-
+    ns=""
 
     return LaunchDescription([
         # Launch args
@@ -111,22 +156,14 @@ def generate_launch_description():
         ),
 
         # Miscellaneous
+        node_robot_state_publisher,
+        node_joint_state_publisher,
+
         Node( # RVIZ dependency
-            package='robot_state_publisher',
-            executable='robot_state_publisher',
-            name='robot_state_publisher',
+            package='controller_manager',
+            executable='spawner',
+            arguments=['joint_state_broadcaster', '-c', concatenate_ns(ns, 'controller_manager', True)],
             output='screen',
-            parameters=[{'robot_description': robot_description}],
-        ),
-        Node( # RVIZ dependency
-            package='joint_state_publisher',
-            executable='joint_state_publisher',
-            name='joint_state_publisher',
-            parameters=[ # TODO: Review source list
-                {'source_list': ['franka/joint_states', 
-                                '/mj_left_gripper_sim_node/joint_states',
-                                '/mj_right_gripper_sim_node/joint_states'],
-                 'rate': 30}],
         ),
         Node(package='rviz2',
              executable='rviz2',
