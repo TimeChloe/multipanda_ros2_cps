@@ -58,6 +58,7 @@ def generate_launch_description():
     initial_positions = LaunchConfiguration(initial_positions_param)
     use_rviz = LaunchConfiguration(use_rviz_param)
 
+    # Robot state publisher setup
     robot_description = Command(
         [FindExecutable(name='xacro'), ' ', franka_xacro_file, 
             ' arm_id:=', arm_id, 
@@ -65,10 +66,6 @@ def generate_launch_description():
             ' initial_positions:=', initial_positions])
     
     params = {'robot_description': robot_description}
-    rviz_file = os.path.join(get_package_share_directory('franka_description'), 'rviz',
-                             'visualize_franka.rviz')
-    ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
-                # See the ros2_control_plugins_example_with_ns.yaml file for more details.
 
     node_robot_state_publisher = Node(
         package='robot_state_publisher',
@@ -78,6 +75,7 @@ def generate_launch_description():
         parameters=[params]
     )
 
+    # Joint state publisher setup
     jsp_source_list = [concatenate_ns(ns, 'joint_states', True)]
     if(load_gripper):
         jsp_source_list.append(concatenate_ns(ns, 'panda_gripper_sim_node/joint_states', True))
@@ -91,7 +89,13 @@ def generate_launch_description():
                 {'source_list': jsp_source_list,
                  'rate': 30}],
     )
-    
+
+    # Others
+    rviz_file = os.path.join(get_package_share_directory('franka_description'), 'rviz',
+                             'visualize_franka.rviz')
+    ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
+                # See the ros2_control_plugins_example_with_ns.yaml file for more details.
+
     return LaunchDescription([
         # Launch args
         DeclareLaunchArgument(
@@ -126,7 +130,7 @@ def generate_launch_description():
         node_robot_state_publisher,
         node_joint_state_publisher,
 
-        Node( # RVIZ dependency; broken right now
+        Node( # RVIZ dependency
             package='controller_manager',
             executable='spawner',
             arguments=['joint_state_broadcaster', '-c', concatenate_ns(ns, 'controller_manager', True)],
