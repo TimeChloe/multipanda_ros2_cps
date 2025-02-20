@@ -52,7 +52,10 @@ def generate_launch_description():
     xml_path = os.path.join(get_package_share_directory('garmi_description'), 'mujoco', 'garmi', 'assets', 'xml', scene_file)
     mjros_config_file = os.path.join(get_package_share_directory('garmi_bringup'), 'config', 'sim',
                                      'sim_garmi.yaml')
+    ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
+                # See the ros2_control_plugins_example_with_ns.yaml file for more details.
 
+    # Robot state publisher setup
     robot_description = Command(
         [FindExecutable(name='xacro'), ' ', garmi_xacro_file, 
             ' arm_id_1:=left', 
@@ -61,11 +64,7 @@ def generate_launch_description():
             ' hand_2:=', str(load_gripper).lower(),
             ' initial_positions_1:=', initial_positions_1,
             ' initial_positions_2:=', initial_positions_2])
-    ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
-                # See the ros2_control_plugins_example_with_ns.yaml file for more details.
-
-    rviz_file = os.path.join(get_package_share_directory('garmi_description'), 'rviz',
-                             'visualize_garmi.rviz')
+    
     node_robot_state_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
@@ -73,15 +72,28 @@ def generate_launch_description():
         namespace= ns,
         parameters=[{'robot_description': robot_description}]
     )
-    node_joint_state_broadcaster = Node( # RVIZ dependency
+    
+    # Joint state publisher setup
+    jsp_source_list = [concatenate_ns(ns, 'joint_states', True)]
+    if(load_gripper):
+        jsp_source_list.append(concatenate_ns(ns, 'left_gripper_sim_node/joint_states/joint_states', True))
+        jsp_source_list.append(concatenate_ns(ns, 'right_gripper_sim_node/joint_states/joint_states', True))
+
+    node_joint_state_publisher = Node( # RVIZ dependency
             package='joint_state_publisher',
             executable='joint_state_publisher',
             name='joint_state_publisher',
             namespace= ns,
             parameters=[
-                {'source_list': [concatenate_ns(ns, 'joint_states', True)],
-                 'rate': 10}],
+                {'source_list': jsp_source_list,
+                 'rate': 30}],
     )
+
+    # Others
+    rviz_file = os.path.join(get_package_share_directory('garmi_description'), 'rviz',
+                             'visualize_garmi.rviz')
+    
+
     return LaunchDescription([
         # Launch args
         DeclareLaunchArgument(
@@ -110,13 +122,14 @@ def generate_launch_description():
             }.items()
         ),
         node_robot_state_publisher,
-        # Node( # RVIZ dependency; broken right now
-        #     package='controller_manager',
-        #     executable='spawner',
-        #     arguments=['joint_state_broadcaster', '-c', concatenate_ns(ns, 'controller_manager', True)],
-        #     output='screen',
-        # ),
-        node_joint_state_broadcaster,
+        node_joint_state_publisher,
+
+        Node( # RVIZ dependency
+            package='controller_manager',
+            executable='spawner',
+            arguments=['joint_state_broadcaster', '-c', concatenate_ns(ns, 'controller_manager', True)],
+            output='screen',
+        ),
         Node(package='rviz2',
              executable='rviz2',
              name='rviz2',
