@@ -30,9 +30,16 @@ def concatenate_ns(ns1, ns2, absolute=False):
     return ns1 + '/' + ns2
 
 def generate_launch_description():
+    # Parameters as launch arguments
+    arm_id_param = 'arm_id'
+    initial_positions_param = 'initial_positions'
+    use_rviz_param = 'use_rviz'
+    
+    arm_id = LaunchConfiguration(arm_id_param)
+    initial_positions = LaunchConfiguration(initial_positions_param)
+    use_rviz = LaunchConfiguration(use_rviz_param)
 
     # Fixed variables
-    
     load_gripper = True # We make gripper a fixed variable, mainly because parsing the argument 
                         # within generate_launch_description is a fairly unintuitive process, 
                         # and it's not worth doing just for a single boolean.
@@ -47,16 +54,8 @@ def generate_launch_description():
     mjros_config_file = os.path.join(get_package_share_directory('franka_bringup'), 'config', 'sim',
                                      'single_sim_controllers.yaml')
     franka_bringup_path = get_package_share_directory('franka_bringup')
-
-    # Parameters as launch arguments
-    arm_id_param = 'arm_id'
-    initial_positions_param = 'initial_positions'
-    use_rviz_param = 'use_rviz'
-
-    
-    arm_id = LaunchConfiguration(arm_id_param)
-    initial_positions = LaunchConfiguration(initial_positions_param)
-    use_rviz = LaunchConfiguration(use_rviz_param)
+    ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
+                # See the ros2_control_plugins_example_with_ns.yaml file for more details.
 
     # Robot state publisher setup
     robot_description = Command(
@@ -93,8 +92,7 @@ def generate_launch_description():
     # Others
     rviz_file = os.path.join(get_package_share_directory('franka_description'), 'rviz',
                              'visualize_franka.rviz')
-    ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
-                # See the ros2_control_plugins_example_with_ns.yaml file for more details.
+    
 
     return LaunchDescription([
         # Launch args

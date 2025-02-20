@@ -56,7 +56,6 @@ def generate_launch_description():
     initial_positions_1 = LaunchConfiguration(initial_positions_1_param)
     initial_positions_2 = LaunchConfiguration(initial_positions_2_param)
     use_rviz = LaunchConfiguration(use_rviz_param)
-    
 
     # Fixed variables
     load_gripper = True # We make gripper a fixed variable, mainly because parsing the argument 
@@ -73,6 +72,7 @@ def generate_launch_description():
     mjros_config_file = os.path.join(get_package_share_directory('franka_bringup'), 'config', 'sim',
                                      'dual_sim_controllers.yaml')
     franka_bringup_path = get_package_share_directory('franka_bringup')
+    ns=""
 
     # Robot state publisher setup
     robot_description = Command(
@@ -112,7 +112,7 @@ def generate_launch_description():
     # Others
     rviz_file = os.path.join(get_package_share_directory('franka_description'), 'rviz',
                              'visualize_dual_franka.rviz')
-    ns=""
+    
 
     return LaunchDescription([
         # Launch args
