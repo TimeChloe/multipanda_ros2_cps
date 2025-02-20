@@ -52,7 +52,7 @@ def generate_launch_description():
     arm_id_param = 'arm_id'
     initial_positions_param = 'initial_positions'
     use_rviz_param = 'use_rviz'
-    
+
     
     arm_id = LaunchConfiguration(arm_id_param)
     initial_positions = LaunchConfiguration(initial_positions_param)
@@ -77,15 +77,21 @@ def generate_launch_description():
         namespace= ns,
         parameters=[params]
     )
-    node_joint_state_broadcaster = Node( # RVIZ dependency
+
+    jsp_source_list = [concatenate_ns(ns, 'joint_states', True)]
+    if(load_gripper):
+        jsp_source_list.append(concatenate_ns(ns, 'panda_gripper_sim_node/joint_states', True))
+
+    node_joint_state_publisher = Node( # RVIZ dependency
             package='joint_state_publisher',
             executable='joint_state_publisher',
             name='joint_state_publisher',
             namespace= ns,
             parameters=[
-                {'source_list': [concatenate_ns(ns, 'joint_states', True)],
-                 'rate': 10}],
+                {'source_list': jsp_source_list,
+                 'rate': 30}],
     )
+    
     return LaunchDescription([
         # Launch args
         DeclareLaunchArgument(
@@ -118,7 +124,7 @@ def generate_launch_description():
 
         # Miscellaneous
         node_robot_state_publisher,
-        node_joint_state_broadcaster,
+        node_joint_state_publisher,
 
         Node( # RVIZ dependency; broken right now
             package='controller_manager',
