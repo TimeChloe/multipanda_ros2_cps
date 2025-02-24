@@ -90,10 +90,7 @@
     <general biastype="affine" name="left_act_gripper" tendon="left_fingers" forcelimited="true" forcerange="-100 100" ctrllimited="true" ctrlrange="0 1" gainprm="4 0 0" biasprm="0 -100 0"/>
   </actuator>
 
-  <sensor>
-    <rangefinder site="lidar_front" cutoff="12"/>
-    <rangefinder site="lidar_back" cutoff="12"/>
-  </sensor>
+  
 
   <contact>
     <exclude body1="torso" body2="left_link1" />
@@ -310,20 +307,80 @@
           </body>
         </body>
         <body name="lidar_front_body" pos="0.42 0 0.232">
-          <joint name="lidar_front_joint" axis="0 0 1"/>
-          <geom type="mesh" mesh="rplidarA2" mass="0.1"/>
-          <replicate count="8" euler="0 0 0.007853981633974483">   
-              <site name="lidar_front" pos=".05 0 0" zaxis="1 0 0" rgba="0.2 0.2 0.2 0.1"/>
-          </replicate>
+          <joint name="lidar_front_joint" pos="0 0 0" axis="0 0 1"/>
+          <geom type="mesh" mass="0.1" mesh="rplidarA2"/>
+          <frame>
+            <site name="lidar_front0" pos="0.05 0 0" quat="0.707107 0 0.707107 0" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_front1" pos="0.0499985 0.000392695 0" quat="0.707101 -0.00277679 0.707101 0.00277679" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_front2" pos="0.0499938 0.000785366 0" quat="0.707085 -0.00555355 0.707085 0.00555355" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_front3" pos="0.0499861 0.00117799 0" quat="0.707058 -0.00833021 0.707058 0.00833021" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_front4" pos="0.0499753 0.00157054 0" quat="0.70702 -0.0111068 0.70702 0.0111068" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_front5" pos="0.0499615 0.00196299 0" quat="0.70697 -0.0138831 0.70697 0.0138831" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_front6" pos="0.0499445 0.00235532 0" quat="0.706911 -0.0166593 0.706911 0.0166593" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_front7" pos="0.0499245 0.00274751 0" quat="0.70684 -0.0194352 0.70684 0.0194352" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
         </body>
         <body name="lidar_back_body" pos="-0.42 0 0.232">
-          <joint name="lidar_back_joint" axis="0 0 1"/>
-          <geom type="mesh" mesh="rplidarA2" mass="0.1"/>
-          <replicate count="8" euler="0 0 0.007853981633974483">   
-              <site name="lidar_back" pos=".05 0 0" zaxis="1 0 0" rgba="0.2 0.2 0.2 0.1"/>
-          </replicate>
+          <joint name="lidar_back_joint" pos="0 0 0" axis="0 0 1"/>
+          <geom type="mesh" mass="0.1" mesh="rplidarA2"/>
+          <frame>
+            <site name="lidar_back0" pos="0.05 0 0" quat="0.707107 0 0.707107 0" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_back1" pos="0.0499985 0.000392695 0" quat="0.707101 -0.00277679 0.707101 0.00277679" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_back2" pos="0.0499938 0.000785366 0" quat="0.707085 -0.00555355 0.707085 0.00555355" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_back3" pos="0.0499861 0.00117799 0" quat="0.707058 -0.00833021 0.707058 0.00833021" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_back4" pos="0.0499753 0.00157054 0" quat="0.70702 -0.0111068 0.70702 0.0111068" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_back5" pos="0.0499615 0.00196299 0" quat="0.70697 -0.0138831 0.70697 0.0138831" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_back6" pos="0.0499445 0.00235532 0" quat="0.706911 -0.0166593 0.706911 0.0166593" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
+          <frame>
+            <site name="lidar_back7" pos="0.0499245 0.00274751 0" quat="0.70684 -0.0194352 0.70684 0.0194352" rgba="0.2 0.2 0.2 0.1"/>
+          </frame>
         </body>
       </body>
     </body>
   </worldbody>
+  <sensor>
+    <rangefinder site="lidar_front0" cutoff="12"/>
+    <rangefinder site="lidar_front1" cutoff="12"/>
+    <rangefinder site="lidar_front2" cutoff="12"/>
+    <rangefinder site="lidar_front3" cutoff="12"/>
+    <rangefinder site="lidar_front4" cutoff="12"/>
+    <rangefinder site="lidar_front5" cutoff="12"/>
+    <rangefinder site="lidar_front6" cutoff="12"/>
+    <rangefinder site="lidar_front7" cutoff="12"/>
+    <rangefinder site="lidar_back0" cutoff="12"/>
+    <rangefinder site="lidar_back1" cutoff="12"/>
+    <rangefinder site="lidar_back2" cutoff="12"/>
+    <rangefinder site="lidar_back3" cutoff="12"/>
+    <rangefinder site="lidar_back4" cutoff="12"/>
+    <rangefinder site="lidar_back5" cutoff="12"/>
+    <rangefinder site="lidar_back6" cutoff="12"/>
+    <rangefinder site="lidar_back7" cutoff="12"/>
+  </sensor>
 </garmi>
