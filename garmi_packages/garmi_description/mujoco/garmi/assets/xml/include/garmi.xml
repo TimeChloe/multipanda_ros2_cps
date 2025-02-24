@@ -306,7 +306,7 @@
             </body>
           </body>
         </body>
-        <body name="lidar_front_body" pos="0.42 0 0.232">
+        <body name="lidar_front" pos="0.42 0 0.232">
           <joint name="lidar_front_joint" pos="0 0 0" axis="0 0 1"/>
           <geom type="mesh" mass="0.1" mesh="rplidarA2"/>
           <frame>
@@ -334,7 +334,7 @@
             <site name="lidar_front7" pos="0.0499245 0.00274751 0" quat="0.70684 -0.0194352 0.70684 0.0194352" rgba="0.2 0.2 0.2 0.1"/>
           </frame>
         </body>
-        <body name="lidar_back_body" pos="-0.42 0 0.232">
+        <body name="lidar_back" pos="-0.42 0 0.232">
           <joint name="lidar_back_joint" pos="0 0 0" axis="0 0 1"/>
           <geom type="mesh" mass="0.1" mesh="rplidarA2"/>
           <frame>
