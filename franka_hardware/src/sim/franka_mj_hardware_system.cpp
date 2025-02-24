@@ -100,6 +100,7 @@ bool FrankaMjHardwareSystem::initSim(
     clock_ = rclcpp::Clock(RCL_ROS_TIME);
 
     // Set up the mujoco and RobotSim 
+    // TODO: Clean up executor to use the one passed down from mj_env
     executor_ = std::make_shared<FrankaExecutor>();
     for(size_t i = 1; i <= robot_count_; i++){
         // Setup arm container
@@ -124,16 +125,19 @@ bool FrankaMjHardwareSystem::initSim(
         bool has_gripper = info_.hardware_parameters.at("hand" + suffix) == std::string("True") ? true : false;
         arm.robot_ = std::make_unique<RobotSim>(mj_robot_name, has_gripper);
         arm.robot_->franka_hardware_model_ = std::make_unique<ModelSim>(m_, d_);
-        arm.robot_->populateIndices();
+        if(!arm.robot_->populateIndices()){
+          RCLCPP_FATAL(getLogger(), "Populating indices failed!");
+          return false;
+        };
 
         // Start the gripper node if true
         if(arm.robot_->has_gripper_){
+            RCLCPP_INFO_STREAM(getLogger(), "Gripper found for " << arm.robot_name_ << ". Creating a gripper server.");
             gripper_states_ptrs_.insert(std::make_pair(arm.robot_name_, std::make_shared<std::array<double,3>>()));
             gripper_nodes_.insert(std::make_pair(arm.robot_name_, std::make_shared<franka_gripper::GripperSimActionServer>(rclcpp::NodeOptions(), arm.robot_name_)));
             gripper_nodes_[arm.robot_name_]->initGripperPtrs(gripper_states_ptrs_[arm.robot_name_]);
             executor_->add_node(gripper_nodes_[arm.robot_name_]);
         }
-
         // Initialize with all the actuators set to "off"
         for(size_t i=0; i<kNumberOfJoints; i++){
             set_torque_control(m_, arm.robot_->act_trq_indices_[i], 0);
@@ -241,7 +245,9 @@ hardware_interface::return_type FrankaMjHardwareSystem::read(const rclcpp::Time&
     arm.hw_positions_ = arm.hw_franka_robot_state_.q;
     arm.hw_velocities_ = arm.hw_franka_robot_state_.dq;
     arm.hw_efforts_ = arm.hw_franka_robot_state_.tau_J;
-    gripper_states_ptrs_[arm.robot_name_]->at(1) = d_->qpos[arm.robot_->gripper_joint_qpos_indices_[0]];
+    if(arm.robot_->has_gripper_){
+      gripper_states_ptrs_[arm.robot_name_]->at(1) = d_->qpos[arm.robot_->gripper_joint_qpos_indices_[0]];
+    }
   }
 //   for(auto& obj_pair: mj_objs_){
 //     updateObjectContainer(obj_pair.first);
