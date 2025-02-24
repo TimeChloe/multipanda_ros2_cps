@@ -309,14 +309,14 @@
             </body>
           </body>
         </body>
-        <body pos="0.42 0 0.232">
+        <body name="lidar_front_body" pos="0.42 0 0.232">
           <joint name="lidar_front_joint" axis="0 0 1"/>
           <geom type="mesh" mesh="rplidarA2" mass="0.1"/>
           <replicate count="8" euler="0 0 0.007853981633974483">   
               <site name="lidar_front" pos=".05 0 0" zaxis="1 0 0" rgba="0.2 0.2 0.2 0.1"/>
           </replicate>
         </body>
-        <body pos="-0.42 0 0.232">
+        <body name="lidar_back_body" pos="-0.42 0 0.232">
           <joint name="lidar_back_joint" axis="0 0 1"/>
           <geom type="mesh" mesh="rplidarA2" mass="0.1"/>
           <replicate count="8" euler="0 0 0.007853981633974483">   
