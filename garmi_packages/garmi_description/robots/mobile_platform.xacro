@@ -12,7 +12,7 @@
     <link name="mobile_platform">
       <visual>
         <geometry>
-          <mesh filename="package://franka_description/meshes/visual/mobile_platform.dae" scale="1 1 1"/>
+          <mesh filename="package://garmi_description/robots/meshes/mobile_platform.dae" scale="1 1 1"/>
         </geometry>
         <origin rpy="0 0 ${+90 * pi/180}" xyz="0 0 -0.21"/>
       </visual>

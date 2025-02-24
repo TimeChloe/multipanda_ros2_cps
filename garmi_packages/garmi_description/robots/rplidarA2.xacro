@@ -42,7 +42,7 @@
       </collision>
       <visual>
         <geometry>
-          <mesh filename="package://garmi_robot_description/meshes/visual/rplidarA2.dae" />
+          <mesh filename="package://garmi_description/robots/meshes/rplidarA2.dae" />
         </geometry>
       </visual>
 
