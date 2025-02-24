@@ -30,8 +30,8 @@
     <mesh name="garmi_visor" file="garmi/visor.obj" />
     <mesh name="rplidarA2" file="garmi/rplidarA2.obj" />
   </asset>
-  <actuator>
 
+  <actuator>
     <motor name="left_act_trq1" joint="left_joint1" ctrlrange="-87 87" ctrllimited="true"/>
     <motor name="left_act_trq2" joint="left_joint2" ctrlrange="-87 87" ctrllimited="true"/>
     <motor name="left_act_trq3" joint="left_joint3" ctrlrange="-87 87" ctrllimited="true"/>
@@ -88,8 +88,12 @@
     <!-- Remap original ctrlrange (0, 0.04) to (0, 1): 0.04 * 100 / 1 = 4 -->
     <general biastype="affine" name="right_act_gripper" tendon="right_fingers" forcelimited="true" forcerange="-100 100" ctrllimited="true" ctrlrange="0 1" gainprm="4 0 0" biasprm="0 -100 0"/>
     <general biastype="affine" name="left_act_gripper" tendon="left_fingers" forcelimited="true" forcerange="-100 100" ctrllimited="true" ctrlrange="0 1" gainprm="4 0 0" biasprm="0 -100 0"/>
-
   </actuator>
+
+  <sensor>
+    <rangefinder site="lidar_front" cutoff="12"/>
+    <rangefinder site="lidar_back" cutoff="12"/>
+  </sensor>
 
   <contact>
     <exclude body1="torso" body2="left_link1" />
@@ -153,20 +157,6 @@
             <joint name="back_wheel_spin" />
             <geom type="cylinder" size=".065 .018" rgba="0 0 0 0" />
           </body>
-        </body>
-        <body pos="0.42 0 0.232">
-          <joint name="lidar_front_joint" axis="0 0 1"/>
-          <geom type="mesh" mesh="rplidarA2" mass="0.1"/>
-          <!-- <replicate count="8" euler="0 0 0.45">   
-              <site name="lidar_front" pos=".05 0 0" zaxis="1 0 0" rgba="0 0 0 0"/>
-          </replicate> -->
-        </body>
-        <body pos="-0.42 0 0.232">
-          <joint name="lidar_back_joint" axis="0 0 1"/>
-          <geom type="mesh" mesh="rplidarA2" mass="0.1"/>
-          <!-- <replicate count="8" euler="0 0 0.45">    -->
-              <!-- <site name="lidar_back" pos=".05 0 0" zaxis="1 0 0" rgba="0 0 0 0"/> -->
-          <!-- </replicate> -->
         </body>
 
         <body name="torso" pos="0 0 0.20489">
@@ -318,6 +308,20 @@
               </body>
             </body>
           </body>
+        </body>
+        <body pos="0.42 0 0.232">
+          <joint name="lidar_front_joint" axis="0 0 1"/>
+          <geom type="mesh" mesh="rplidarA2" mass="0.1"/>
+          <replicate count="8" euler="0 0 0.007853981633974483">   
+              <site name="lidar_front" pos=".05 0 0" zaxis="1 0 0" rgba="0.2 0.2 0.2 0.1"/>
+          </replicate>
+        </body>
+        <body pos="-0.42 0 0.232">
+          <joint name="lidar_back_joint" axis="0 0 1"/>
+          <geom type="mesh" mesh="rplidarA2" mass="0.1"/>
+          <replicate count="8" euler="0 0 0.007853981633974483">   
+              <site name="lidar_back" pos=".05 0 0" zaxis="1 0 0" rgba="0.2 0.2 0.2 0.1"/>
+          </replicate>
         </body>
       </body>
     </body>
