@@ -28,6 +28,7 @@
     <mesh name="garmi_wheel" file="garmi/wheel.obj" />
     <mesh name="garmi_tire" file="garmi/tire.obj" />
     <mesh name="garmi_visor" file="garmi/visor.obj" />
+    <mesh name="rplidarA2" file="garmi/rplidarA2.obj" />
   </asset>
   <actuator>
 
@@ -153,6 +154,21 @@
             <geom type="cylinder" size=".065 .018" rgba="0 0 0 0" />
           </body>
         </body>
+        <body pos="0.42 0 0.232">
+          <joint name="lidar_front_joint" axis="0 0 1"/>
+          <geom type="mesh" mesh="rplidarA2" mass="0.1"/>
+          <!-- <replicate count="8" euler="0 0 0.45">   
+              <site name="lidar_front" pos=".05 0 0" zaxis="1 0 0" rgba="0 0 0 0"/>
+          </replicate> -->
+        </body>
+        <body pos="-0.42 0 0.232">
+          <joint name="lidar_back_joint" axis="0 0 1"/>
+          <geom type="mesh" mesh="rplidarA2" mass="0.1"/>
+          <!-- <replicate count="8" euler="0 0 0.45">    -->
+              <!-- <site name="lidar_back" pos=".05 0 0" zaxis="1 0 0" rgba="0 0 0 0"/> -->
+          <!-- </replicate> -->
+        </body>
+
         <body name="torso" pos="0 0 0.20489">
           <geom type="mesh" mesh="torso" material="torso" />
           <body name="torso_d435" pos="0.13 0 .896" euler="3.13889799 1.27079594 -1.56901835">

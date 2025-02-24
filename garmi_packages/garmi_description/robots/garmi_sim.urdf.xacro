@@ -14,7 +14,7 @@
   <xacro:include filename="$(find garmi_description)/robots/head.xacro" />
   <xacro:include filename="$(find garmi_description)/robots/garmi_wheel.xacro" />
   <xacro:include filename="$(find garmi_description)/robots/mobile_platform.xacro" />
-  <!-- <xacro:include filename="$(find franka_description)/robots/lidar_with_wheel_mount.xacro" /> -->
+  <xacro:include filename="$(find garmi_description)/robots/lidar_with_wheel_mount.xacro" />
 
   <link name="base_link" />
    
@@ -40,8 +40,8 @@
   <xacro:garmi_wheel wheel_id="left" connected_to="base_link" rpy="${-90 * pi/180} 0 0" xyz="0 0.375 -0.125" />
   <xacro:garmi_wheel wheel_id="right" connected_to="base_link" rpy="${90 * pi/180} 0 0" xyz="0 -0.375 -0.125" />
 
-  <!-- <xacro:lidar connected_to="base_link" xyz="0.42 0 0" rpy="0 0 ${pi}" ns="lidar_front" />
-  <xacro:lidar connected_to="base_link" xyz="-0.42 0 0" rpy="0 0 0.05" ns="lidar_rear" /> -->
+  <xacro:lidar connected_to="base_link" xyz="0.42 0 0.01" rpy="0 0 ${pi}" ns="lidar_front" />
+  <xacro:lidar connected_to="base_link" xyz="-0.42 0 0.01" rpy="0 0 0.05" ns="lidar_rear" />
 
   <xacro:include filename="$(find franka_description)/robots/sim/dual_panda_arm_sim.ros2_control.xacro"/>
   <xacro:dual_panda_mjros_ros2_control  ns_1="$(arg arm_id_1)" 
