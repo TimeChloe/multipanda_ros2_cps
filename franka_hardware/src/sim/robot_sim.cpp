@@ -9,28 +9,16 @@ bool RobotSim::populateIndices(){
   // body index loop
   for(int n = 0; n < kNumberOfJoints+2; n++){
     std::string link_name = robot_name_ + "_link" + std::to_string(n);
-    for(int i = 0; i < m_->nbody; i++){
-      int subarray_len = 0;
-      int max_len = m_->name_bodyadr[i+1] - m_->name_bodyadr[i];
-      if(i == m_->nbody - 1){
-          max_len = 30;
-      }
-      for(int j = m_->name_bodyadr[i]; j < m_->name_bodyadr[i] + max_len; j++){
-        subarray_len++;
-        if(m_->names[j] == '\0'){
-            break;
-        }
-      }
-      char *temp_cname = new char[subarray_len];
-      std::memcpy(temp_cname, m_->names + m_->name_bodyadr[i], subarray_len);
-      std::string temp_name(temp_cname);
-      if(link_name == temp_name){
-        link_indices_[n] = i;
-        delete temp_cname;
-        break;
-      }
+    int body_id = mj_name2id(m_, mjOBJ_BODY, link_name.c_str());
+    if(body_id != -1){
+      link_indices_[n] = body_id;
+    }
+    else{
+      std::cerr << "No mjOBJ_BODY called " << link_name << " found" << std::endl;
+      return false;
     }
   }
+
   // joint site loop
   for(int n = 0; n < kNumberOfJoints+2; n++){
     std::string site_name;
@@ -43,90 +31,61 @@ bool RobotSim::populateIndices(){
     else{
       site_name = robot_name_ + "_ee_site";
     }
-    
-    for(int i = 0; i < m_->nsite; i++){
-      int subarray_len = 0;
-      int max_len = m_->name_siteadr[i+1] - m_->name_siteadr[i];
-      if(i == m_->nsite - 1){
-          max_len = 30;
-      }
-      for(int j = m_->name_siteadr[i]; j < m_->name_siteadr[i] + max_len; j++){
-        subarray_len++;
-        if(m_->names[j] == '\0'){
-            break;
-        }
-      }
-      
-      char *temp_cname = new char[subarray_len];
-      std::memcpy(temp_cname, m_->names + m_->name_siteadr[i], subarray_len);
-      std::string temp_name(temp_cname);
-      if(site_name == temp_name){
-        joint_site_indices_[n] = i;
-        delete temp_cname;
-        break;
-      }
+
+    int site_id = mj_name2id(m_, mjOBJ_SITE, site_name.c_str());
+    if(site_id != -1){
+      joint_site_indices_[n] = site_id;
+    }
+    else{
+      std::cerr << "No mjOBJ_SITE called " << site_name << " found" << std::endl;
+      return false;
     }
   }
 
   // joint index loop
   for(int n = 0; n < kNumberOfJoints; n++){
     std::string joint_name = robot_name_ + "_joint" + std::to_string(n+1);
-    for(int i = 0; i < m_->njnt; i++){
-      
-      int subarray_len = 0;
-      int max_len = m_->name_jntadr[i+1] - m_->name_jntadr[i];
-      if(i == m_->njnt - 1){
-          max_len = 30;
-      }
-      for(int j = m_->name_jntadr[i]; j < m_->name_jntadr[i] + max_len; j++){
-        subarray_len++;
-        if(m_->names[j] == '\0'){
-            break;
-        }
-      }
-      char *temp_cname = new char[subarray_len];
-      std::memcpy(temp_cname, m_->names + m_->name_jntadr[i], subarray_len);
-      std::string temp_name(temp_cname);
-
-      if(joint_name == temp_name){
-        joint_indices_[n] = i;
-        joint_qvel_indices_[n] = m_->jnt_dofadr[i]; // for qvel (nv x 1) indexing
-        joint_qpos_indices_[n] = m_->jnt_qposadr[i]; // for qpos (nq x 1) indexing
-        delete temp_cname;
-        break;
-      }
+    int joint_id = mj_name2id(m_, mjOBJ_JOINT, joint_name.c_str());
+    if(joint_id != -1){
+      joint_indices_[n] = joint_id;
+      joint_qvel_indices_[n] = m_->jnt_dofadr[joint_id]; // for qvel (nv x 1) indexing
+      joint_qpos_indices_[n] = m_->jnt_qposadr[joint_id]; // for qpos (nq x 1) indexing
+    }
+    else{
+      std::cerr << "No mjOBJ_JOINT called " << joint_name << " found" << std::endl;
+      return false;
     }
   }
-  
 
   // Find the actuator indices for each of the robot's torque and velocity actuators
   for(int n = 0; n < kNumberOfJoints; n++){
     std::string joint_name = robot_name_ + "_joint" + std::to_string(n+1);
-    for(int i = 0; i < m_->nu; i++){
-      int subarray_len = 0;
-      int max_len = m_->name_actuatoradr[i+1] - m_->name_actuatoradr[i];
-      if(i == m_->nu - 1){
-          max_len = 30;
-      }
-      for(int j = m_->name_actuatoradr[i]; j < m_->name_actuatoradr[i] + max_len; j++){
-        subarray_len++;
-        if(m_->names[j] == '\0'){
-          break;
-        }
-      }
-      char *temp_cname = new char[subarray_len];
-      std::memcpy(temp_cname, m_->names + m_->name_actuatoradr[i], subarray_len);
-      std::string temp_name(temp_cname);
-      if(robot_name_ + "_act_trq" + std::to_string(n+1) == temp_name){
-        act_trq_indices_[n] = i;
-      }
-      if(robot_name_ + "_act_pos" + std::to_string(n+1) == temp_name){
-        act_pos_indices_[n] = i;
-      }
-      if(robot_name_ + "_act_vel" + std::to_string(n+1) == temp_name){
-        act_vel_indices_[n] = i;
-      }
-      delete temp_cname;
+    std::string trq_name = robot_name_ + "_act_trq" + std::to_string(n+1);
+    std::string vel_name = robot_name_ + "_act_vel" + std::to_string(n+1);
+    std::string pos_name = robot_name_ + "_act_pos" + std::to_string(n+1);
+    int trq_id = mj_name2id(m_, mjOBJ_ACTUATOR, trq_name.c_str());
+    int vel_id = mj_name2id(m_, mjOBJ_ACTUATOR, vel_name.c_str());
+    int pos_id = mj_name2id(m_, mjOBJ_ACTUATOR, pos_name.c_str());
+    if(trq_id != -1){
+      act_trq_indices_[n] = trq_id;
+    }
+    else{
+      std::cerr << "No torque mjOBJ_ACTUATOR " << trq_name << " found for " << joint_name<< std::endl; 
+      return false;
+    }
+    if(vel_id != -1){
+      act_vel_indices_[n] = vel_id;
+    }
+    else{
+      std::cerr << "No velocity mjOBJ_ACTUATOR " << vel_name << " found for " << joint_name << std::endl; 
+      return false;
+    }
+    if(pos_id != -1){
+      act_pos_indices_[n] = pos_id;
+    }
+    else{
+      std::cerr << "No position mjOBJ_ACTUATOR " << pos_name << " found for " << joint_name << std::endl; 
+      return false;
     }
   }
 
@@ -135,53 +94,26 @@ bool RobotSim::populateIndices(){
     // gripper joint loop
     for(int n = 0; n < 2; n++){
       std::string joint_name = robot_name_ + "_finger_joint" + std::to_string(n+1); //left, then right
-      for(int i = 0; i < m_->njnt; i++){
-        int subarray_len = 0;
-        int max_len = m_->name_jntadr[i+1] - m_->name_jntadr[i];
-        if(i == m_->njnt - 1){
-            max_len = 30;
-        }
-        for(int j = m_->name_jntadr[i]; j < m_->name_jntadr[i] + max_len; j++){
-          subarray_len++;
-          if(m_->names[j] == '\0'){
-              break;
-          }
-        }
-        char *temp_cname = new char[subarray_len];
-        std::memcpy(temp_cname, m_->names + m_->name_jntadr[i], subarray_len);
-        std::string temp_name(temp_cname);
-
-        if(joint_name == temp_name){
-          gripper_joint_indices_[n] = i;
-          gripper_joint_qvel_indices_[n] = m_->jnt_dofadr[i]; // for qvel (nv x 1) indexing
-          gripper_joint_qpos_indices_[n] = m_->jnt_qposadr[i]; // for qpos (nq x 1) indexing
-          delete temp_cname;
-          break;
-        }
+      int joint_id = mj_name2id(m_, mjOBJ_JOINT, joint_name.c_str());
+      if(joint_id != -1){
+        gripper_joint_indices_[n] = joint_id;
+        gripper_joint_qvel_indices_[n] = m_->jnt_dofadr[joint_id]; // for qvel (nv x 1) indexing
+        gripper_joint_qpos_indices_[n] = m_->jnt_qposadr[joint_id]; // for qpos (nq x 1) indexing
+      }
+      else{
+        std::cerr << "No joint found for " << joint_name << std::endl; 
+        return false;
       }
     }
     // gripper act loop
     std::string act_name = robot_name_ + "_act_gripper";
-    for(int i = 0; i < m_->nu; i++){
-      int subarray_len = 0;
-      int max_len = m_->name_actuatoradr[i+1] - m_->name_actuatoradr[i];
-      if(i == m_->nu - 1){
-          max_len = 30;
-      }
-      for(int j = m_->name_actuatoradr[i]; j < m_->name_actuatoradr[i] + max_len; j++){
-        subarray_len++;
-        if(m_->names[j] == '\0'){
-          break;
-        }
-      }
-      char *temp_cname = new char[subarray_len];
-      std::memcpy(temp_cname, m_->names + m_->name_actuatoradr[i], subarray_len);
-      std::string temp_name(temp_cname);
-      if(act_name == temp_name){
-        gripper_act_idx_ = i;
-        break;
-      }
-      delete temp_cname;
+    int act_id = mj_name2id(m_, mjOBJ_ACTUATOR, act_name.c_str());
+    if(act_id != -1){
+      gripper_act_idx_ = act_id;
+    }
+    else{
+      std::cerr << "No mjOBJ_ACTUATOR " << act_name << " found for gripper" << std::endl; 
+      return false;
     }
   }
   setModelIndices();
