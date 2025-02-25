@@ -68,19 +68,7 @@ def generate_launch_description():
     arm_id = LaunchConfiguration(arm_id_param)
     initial_positions = LaunchConfiguration(initial_positions_param)
 
-    # robot_ip_parameter_name = 'robot_ip'
-    # use_fake_hardware_parameter_name = 'use_fake_hardware'
-    # load_gripper_parameter_name = 'load_gripper'
-    # fake_sensor_commands_parameter_name = 'fake_sensor_commands'
-
-    # robot_ip = LaunchConfiguration(robot_ip_parameter_name)
-    # use_fake_hardware = LaunchConfiguration(use_fake_hardware_parameter_name)
-    # load_gripper = LaunchConfiguration(load_gripper_parameter_name)
-    # fake_sensor_commands = LaunchConfiguration(fake_sensor_commands_parameter_name)
-
-
     # Command-line arguments
-
     db_arg = DeclareLaunchArgument(
         'db', default_value='False', description='Database flag'
     )
