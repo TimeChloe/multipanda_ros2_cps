@@ -73,25 +73,14 @@ def generate_launch_description():
     initial_positions_1 = LaunchConfiguration(initial_positions_1_param)
     initial_positions_2 = LaunchConfiguration(initial_positions_2_param)
     
-    # robot_ip_parameter_name = 'robot_ip'
-    # use_fake_hardware_parameter_name = 'use_fake_hardware'
-    # load_gripper_parameter_name = 'load_gripper'
-    # fake_sensor_commands_parameter_name = 'fake_sensor_commands'
-
-    # robot_ip = LaunchConfiguration(robot_ip_parameter_name)
-    # use_fake_hardware = LaunchConfiguration(use_fake_hardware_parameter_name)
-    # load_gripper = LaunchConfiguration(load_gripper_parameter_name)
-    # fake_sensor_commands = LaunchConfiguration(fake_sensor_commands_parameter_name)
-
 
     # Command-line arguments
-
     db_arg = DeclareLaunchArgument(
         'db', default_value='False', description='Database flag'
     )
 
     # Fixed variables
-    load_gripper = False # We make gripper a fixed variable, mainly because parsing the argument 
+    load_gripper = True # We make gripper a fixed variable, mainly because parsing the argument 
                         # within generate_launch_description is a fairly unintuitive process, 
                         # and it's not worth doing just for a single boolean.
     
