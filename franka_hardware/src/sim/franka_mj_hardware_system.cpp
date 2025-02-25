@@ -96,7 +96,7 @@ bool FrankaMjHardwareSystem::initSim(
             }
         }
     }
-    RCLCPP_INFO(getLogger(), "Initial checks all passed");
+    RCLCPP_DEBUG(getLogger(), "Initial checks all passed");
     clock_ = rclcpp::Clock(RCL_ROS_TIME);
 
     // Set up the mujoco and RobotSim 
@@ -151,11 +151,11 @@ bool FrankaMjHardwareSystem::initSim(
         for(size_t j = 7*(i-1); j < i*7; j++){
           // arm.default_arm_qpos_.push_back(std::stod(info_.joints[j].parameters.at("initial_position")));
           d_->qpos[arm.robot_->joint_qpos_indices_[j - (7*(i-1))]] = std::stod(info_.joints[j].parameters.at("initial_position"));
-          RCLCPP_INFO(getLogger(), "Joint %ld (name %s) initial position: %f", j, info_.joints[j].name.c_str(), std::stod(info_.joints[j].parameters.at("initial_position")));
+          RCLCPP_DEBUG(getLogger(), "Joint %ld (name %s) initial position: %f", j, info_.joints[j].name.c_str(), std::stod(info_.joints[j].parameters.at("initial_position")));
         }
         
     }
-    
+    RCLCPP_INFO(getLogger(), "Robot successfully initialized!");
     return true;
   }
 CallbackReturn FrankaMjHardwareSystem::on_init(const hardware_interface::HardwareInfo& info) {
