@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="panda">
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="dual_panda">
   <xacro:arg name="arm_id_1" default="left"/> <!-- Name of this panda -->
   <xacro:arg name="arm_id_2" default="right"/> <!-- Name of this panda -->
   <xacro:arg name="hand_1" default="false"/> <!-- Should a franka_gripper be mounted at the flange?" -->
