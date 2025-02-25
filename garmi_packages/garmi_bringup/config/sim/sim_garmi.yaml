@@ -27,15 +27,15 @@ mujoco_ros2_sensors:
       - lidar_front
       - lidar_back
     lidar_front:
-      max: 10.0
-      min: 1.0
+      max: 12.0
+      min: 0.2
       rf_count: 8
-      angle: 0.45
+      angle: 0.007853981633974483 # 0.45 degrees in rad
     lidar_back:
-      max: 10.0
-      min: 1.0
+      max: 12.0
+      min: 0.2
       rf_count: 8
-      angle: 0.45
+      angle: 0.007853981633974483 # 0.45 degrees in rad
 
 controller_manager:
   ros__parameters:
