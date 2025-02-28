@@ -98,7 +98,6 @@ On a computer running Ubuntu 22.04 and real-time kernel (if you wish to use it w
             - `arm_id` is fixed to `panda`.
         2. for simulated robot, source the workspace, and run:
             - Default: `ros2 launch franka_bringup franka_sim.launch.py`.
-            - Multi-mode: `ros2 launch franka_bringup multimode_sim.launch.py`.
             - `arm_id` is fixed to `panda`.
             - Currently, only the robot with gripper attachment is available.
     - Dual arm:
@@ -109,7 +108,6 @@ On a computer running Ubuntu 22.04 and real-time kernel (if you wish to use it w
             - Grippers are set to true by default; add `hand_n=false` to disable this.
         2. for simulated robot, source the workspace, and run:
             - Default: `ros2 launch franka_bringup dual_franka_sim.launch.py`.
-            - Multi-mode: `ros2 launch franka_bringup dual_multimode_sim.launch.py`
             - `arm_id_1=mj_left` and `arm_id_2=mj_right` by default.
     - Garmi (mobile manipulator with two Panda arms):
         1. for simulated robot, source the workspace, and run:
