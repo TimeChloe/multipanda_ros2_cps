@@ -48,13 +48,33 @@ More thorough information is available in the documentation.
 (Tested on Ubuntu 22.04, ROS2 Humble, Panda 4.2.2 & 4.2.1, `libfranka` 0.9.2 and MuJoCo 3.2.0)
 On a computer running Ubuntu 22.04 and real-time kernel (if you wish to use it with a real robot), do the following:
 1. Install ROS2 Humble by following their [instructions][humble-instructions] and create a workspace.
-2. Build `libfranka` 0.9.2 from source by following the [instructions][libfranka-instructions].
-3. Build MuJoCo **3.2.0** (required by `mujoco_ros_pkg`) from source by following the [instructions][mujoco-instructions].
-4. Install `mujoco_ros_pkg`, specifically [this fork](https://github.com/tenfoldpaper/mujoco_ros_pkgs).
 5. Install library dependencies:
     - Install [Eigen **3.3.9**](https://gitlab.com/libeigen/eigen/-/releases/3.3.9). Remove Eigen 3.4.0 if that was installed from following the `libfranka` steps.
         - Some functions will break if you use Eigen 3.4.0, and will fail to compile.
     - Install [`dq-robotics`](https://dqrobotics.github.io/) C++ version
+2. Build `libfranka` 0.9.2 from source: 
+    - Install dependencies: `sudo apt-get install -y build-essential cmake git libpoco-dev  libfmt-dev`
+        - (Ideally, you should already have `build-essential`, `cmake` and `git`already installed)
+    - Clone the `libfranka` repo: `git clone https://github.com/frankaemika/libfranka.git`
+    && mkdir /home/user/Libraries/libfranka \
+    && cd libfranka \
+    - Check out 0.9.2 and update the submodules:
+        ``` bash
+        cd libfranka
+        git checkout 0.9.2 
+        git submodule init 
+        git submodule update 
+        ```
+    - Build the library, and install it to the directory of your choice (here, `~/Libraries/libfranka`)
+        ``` bash
+        mkdir build && cd build
+        cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=/home/user/Libraries/libfranka ..
+        cmake --build .
+        cmake --install .
+        ```
+
+3. Build MuJoCo **3.2.0** (required by `mujoco_ros_pkg`) from source by following the [instructions][mujoco-instructions].
+4. Install `mujoco_ros_pkg`, specifically [this fork](https://github.com/tenfoldpaper/mujoco_ros_pkgs).
 6. Clone this repository (i.e. the multipanda) into your workspace's `src` folder.
 7. Install the dependencies by running this rosdep command from the workspace root: 
     
