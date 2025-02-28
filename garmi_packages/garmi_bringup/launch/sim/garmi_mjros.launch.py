@@ -46,7 +46,7 @@ def generate_launch_description():
     load_lidars = False # Lidar sensor simulation takes up a pretty significant amount of resources,
                         # so it should only be enabled if it's necessary.
     
-    yaml_config = 'sim_garm.yaml'
+    yaml_config = 'sim_garmi.yaml'
     if(load_gripper): # mujoco scene file must be manually adjusted since there's no way to pass parameters
         if(load_lidars):
             scene_file = 'garmi_lidar.xml'
