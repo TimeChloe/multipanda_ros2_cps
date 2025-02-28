@@ -365,22 +365,4 @@
       </body>
     </body>
   </worldbody>
-  <sensor>
-    <rangefinder site="lidar_front0" cutoff="12"/>
-    <rangefinder site="lidar_front1" cutoff="12"/>
-    <rangefinder site="lidar_front2" cutoff="12"/>
-    <rangefinder site="lidar_front3" cutoff="12"/>
-    <rangefinder site="lidar_front4" cutoff="12"/>
-    <rangefinder site="lidar_front5" cutoff="12"/>
-    <rangefinder site="lidar_front6" cutoff="12"/>
-    <rangefinder site="lidar_front7" cutoff="12"/>
-    <rangefinder site="lidar_back0" cutoff="12"/>
-    <rangefinder site="lidar_back1" cutoff="12"/>
-    <rangefinder site="lidar_back2" cutoff="12"/>
-    <rangefinder site="lidar_back3" cutoff="12"/>
-    <rangefinder site="lidar_back4" cutoff="12"/>
-    <rangefinder site="lidar_back5" cutoff="12"/>
-    <rangefinder site="lidar_back6" cutoff="12"/>
-    <rangefinder site="lidar_back7" cutoff="12"/>
-  </sensor>
 </garmi>
