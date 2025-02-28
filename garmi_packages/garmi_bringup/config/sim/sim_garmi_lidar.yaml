@@ -2,7 +2,10 @@ mujoco_server:
   ros__parameters:
     MujocoPlugins:
       names:
+      - mujoco_ros2_sensors
       - mujoco_ros2_control
+      mujoco_ros2_sensors:
+        type: mujoco_ros::sensors::MujocoRos2SensorsPlugin
       mujoco_ros2_control:
         type: mujoco_ros2_control::MujocoRos2ControlPlugin
         hardware:
@@ -16,6 +19,23 @@ mujoco_server:
 # The indentation must reflect the namespace argument given under mujoco_ros2_control part above.
 # e.g. if there is a namespace,called foo, the root must be foo, followed by controller_manager and mujoco_server.
 # if there is no namespace, then the root would just be controller_manager.
+
+mujoco_ros2_sensors:
+  ros__parameters:
+    test_name: MujocoRos2SensorsName
+    lidars:
+      - lidar_front
+      - lidar_back
+    lidar_front:
+      max: 12.0
+      min: 0.2
+      rf_count: 8
+      angle: 0.007853981633974483 # 0.45 degrees in rad
+    lidar_back:
+      max: 12.0
+      min: 0.2
+      rf_count: 8
+      angle: 0.007853981633974483 # 0.45 degrees in rad
 
 controller_manager:
   ros__parameters:

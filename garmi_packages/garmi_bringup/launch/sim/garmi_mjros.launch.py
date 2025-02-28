@@ -42,16 +42,24 @@ def generate_launch_description():
     load_gripper = True # We make gripper a fixed variable, mainly because parsing the argument 
                         # within generate_launch_description is a fairly unintuitive process, 
                         # and it's not worth doing just for a single boolean.
-                        
+    
+    load_lidars = False # Lidar sensor simulation takes up a pretty significant amount of resources,
+                        # so it should only be enabled if it's necessary.
+    
+    yaml_config = 'sim_garm.yaml'
     if(load_gripper): # mujoco scene file must be manually adjusted since there's no way to pass parameters
-        scene_file = 'garmi.xml'
+        if(load_lidars):
+            scene_file = 'garmi_lidar.xml'
+            yaml_config = 'sim_garmi_lidarless.yaml'
+        else:
+            scene_file = 'garmi.xml'
     else:
         scene_file = 'garmi_ng.xml'
     garmi_xacro_file = os.path.join(get_package_share_directory('garmi_description'), 'robots',
                                      'garmi_sim.urdf.xacro')
     xml_path = os.path.join(get_package_share_directory('garmi_description'), 'mujoco', 'garmi', 'assets', 'xml', scene_file)
     mjros_config_file = os.path.join(get_package_share_directory('garmi_bringup'), 'config', 'sim',
-                                     'sim_garmi.yaml')
+                                     yaml_config)
     ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
                 # See the ros2_control_plugins_example_with_ns.yaml file for more details.
 
