@@ -139,7 +139,8 @@ franka::RobotState RobotSim::populateFrankaState(){
     current_state_.dq[i] = d->qvel[joint_qvel_indices_[i]];
     // the actual franka publishes non-zero values when in gravcomp mode, so add the qfrc_gravcomp to match that
     current_state_.tau_J[i] = d->actuator_force[act_trq_indices_[i]] + d->qfrc_gravcomp[joint_qvel_indices_[i]]; 
-    tau_ext_hat_filtered[i] = d->qfrc_applied[joint_qvel_indices_[i]] - current_state_.tau_J[i]; 
+    tau_ext_hat_filtered[i] = d->qfrc_applied[joint_qvel_indices_[i]];
+    current_state_.tau_ext_hat_filtered[i] = tau_ext_hat_filtered[i];
   }
 
   // calculate end effector jacobian, and then compose the EE force transform
