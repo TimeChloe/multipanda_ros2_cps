@@ -133,13 +133,13 @@ franka::RobotState RobotSim::populateFrankaState(){
   */
   // mjModel* m = franka_hardware_model_->getMjModel();
   mjData* d = franka_hardware_model_->getMjData();
-  double tau_J[7] = {0};
+  double tau_ext_hat_filtered[7] = {0};
   for(int i=0; i<kNumberOfJoints; i++){
     current_state_.q[i] = d->qpos[joint_qpos_indices_[i]];
     current_state_.dq[i] = d->qvel[joint_qvel_indices_[i]];
     // the actual franka publishes non-zero values when in gravcomp mode, so add the qfrc_gravcomp to match that
-    current_state_.tau_J[i] = d->actuator_force[act_trq_indices_[i]] + d->qfrc_gravcomp[act_trq_indices_[i]]; 
-    tau_J[i] = d->actuator_force[act_trq_indices_[i]]; 
+    current_state_.tau_J[i] = d->actuator_force[act_trq_indices_[i]] + d->qfrc_gravcomp[joint_qvel_indices_[i]]; 
+    tau_ext_hat_filtered[i] = d->qfrc_applied[joint_qvel_indices_[i]] - current_state_.tau_J[i]; 
   }
 
   // calculate end effector jacobian, and then compose the EE force transform
@@ -160,7 +160,7 @@ franka::RobotState RobotSim::populateFrankaState(){
   mju_mulMatMat(rJac, forceTMat, Jac, 6, 6, 7);
   // finally, get the force
   double eeForce[6] = {0};
-  mju_mulMatVec(eeForce, rJac, tau_J, 6, 7);
+  mju_mulMatVec(eeForce, rJac, tau_ext_hat_filtered, 6, 7);
   // forceTMat * Jac * torques
   for(int i=0; i<6; i++){
     // we want the end-effector external forces, so 8th body in the link indices.
