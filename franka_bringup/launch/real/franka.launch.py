@@ -52,6 +52,7 @@ def generate_launch_description():
         [
             FindPackageShare('franka_bringup'),
             'config',
+            'real',
             'controllers.yaml',
         ]
     )
