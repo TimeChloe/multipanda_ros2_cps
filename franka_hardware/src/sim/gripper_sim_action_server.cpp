@@ -272,7 +272,7 @@ void GripperSimActionServer::onExecuteGripperCommand(
     goal_handle->succeed(result);
     return;
   }
-  // guard.unlock();
+  guard.unlock();
   auto command = [kTargetWidth, kCurrentWidth, kGoal, this]() {
     if (kTargetWidth >= kCurrentWidth) {
       return simGripperMove(kTargetWidth, default_speed_);
