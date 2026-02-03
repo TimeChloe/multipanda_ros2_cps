@@ -147,7 +147,23 @@ On a computer running Ubuntu 22.04 and real-time kernel (if you wish to use it w
     - For RT kernel and robot connection, run
         - `~/Libraries/libfranka/bin/communication_test <robot-ip>`
 
-            
+## Citation 
+If multipanda_ros2 framework helps your research, please cite our paper:
+
+**[Bridging the Sim-to-Real Gap with multipanda_ros2: A Real-Time ROS2 Framework for Multimanual Systems](https://arxiv.org/abs/2602.02269)** 
+
+```bibtex
+@misc{škerlj2026multipanda_ros2,
+      title={Bridging the Sim-to-Real Gap with multipanda_ros2: A Real-Time ROS2 Framework for Multimanual Systems}, 
+      author={Jon Škerlj and Seongjin Bien and Abdeldjallil Naceri and Sami Haddadin},
+      year={2026},
+      eprint={2602.02269},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={[https://arxiv.org/abs/2602.02269](https://arxiv.org/abs/2602.02269)}, 
+}
+```
+
 ## Credits
 The original version is forked from mcbed's port of franka_ros2 for [humble][mcbed-humble].
 
