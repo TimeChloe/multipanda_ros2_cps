@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+
+# *********************************************************
+# One-click installer for development with multipanda_ros2
+#   Developed by: Jon Skerlj
+#   Last update: 04.02.2026
+#   Tested using Ubuntu 22.04
+# *********************************************************
+
+# Exit script on error
+set -e
+
+# *********************************************************
+# Settings and Help
+# *********************************************************
+DOCKER_CLEAN=false
+GIT_CLEAN=false
+DRY_RUN=false
+DOCKER_ARGS=()
+
+show_help() {
+    echo "Usage: .tools/setup [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --git-clean   Remove all ignored files via 'git clean -fdX'"
+    echo "  --clean       Prune Docker system before building"
+    echo "  --dry-run     Show commands without executing them"
+    echo "  --build-arg   Pass build arguments to Docker"
+    echo "  --help        Show this help message"
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --git-clean) GIT_CLEAN=true; shift ;;
+        --clean) DOCKER_CLEAN=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        --build-arg) DOCKER_ARGS+=(--build-arg "$2"); shift 2 ;;
+        --help) show_help; exit 0 ;;
+        *) echo "Unknown option: $1"; show_help; exit 1 ;;
+    esac
+done
+
+# *********************************************************
+# Path and User Identity Detection (Dynamic UID/GID)
+# *********************************************************
+REPO_PATH="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+REPO_NAME="$(basename "$REPO_PATH")"
+cd "$REPO_PATH"
+
+# Detect current user info for permission mapping
+USER_UID=$(id -u)
+USER_GID=$(id -g)
+DOCKER_ARGS+=(--build-arg USER_UID="$USER_UID" --build-arg USER_GID="$USER_GID")
+
+# Detect Architecture
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)  TAG_ARCH="amd64" ;;
+    aarch64) TAG_ARCH="arm64" ;;
+    *)       TAG_ARCH="$ARCH" ;;
+esac
+
+run_cmd() {
+    if $DRY_RUN; then
+        echo "[DRY-RUN] Executing: $*"
+    else
+        "$@"
+    fi
+}
+
+highlight_echo() {
+    printf "==> ✓ %s\n\n" "$1"
+}
+
+echo "Setting up environment for $REPO_NAME ($TAG_ARCH)"
+
+# *********************************************************
+# Tool Installation (Git, Python3, Pip3)
+# *********************************************************
+
+# Git
+if ! command -v git >/dev/null; then
+    echo "Installing git..."
+    run_cmd sudo apt update && run_cmd sudo apt install -y git
+fi
+
+# Python3
+if ! command -v python3 >/dev/null; then
+    echo "Installing python3..."
+    run_cmd sudo apt update && run_cmd sudo apt install -y python3
+fi
+
+# Pip3
+if ! command -v pip3 >/dev/null; then
+    echo "Installing python3-pip..."
+    run_cmd sudo apt update && run_cmd sudo apt install -y python3-pip
+fi
+
+highlight_echo "Core tools (git, python3, pip3) are installed"
+
+# *********************************************************
+# Git Cleanup (Optional)
+# *********************************************************
+if [ "$GIT_CLEAN" = true ]; then
+    echo "Performing requested git cleanup..."
+    run_cmd git clean -fdX || run_cmd sudo git clean -fdX
+    run_cmd git remote prune origin
+    highlight_echo "Git environment cleaned"
+fi
+
+# *********************************************************
+# Docker Installation & Daemon Check
+# *********************************************************
+if ! command -v docker >/dev/null; then
+    echo "Installing Docker..."
+    run_cmd sudo apt update && run_cmd sudo apt install -y docker.io
+    run_cmd sudo usermod -aG docker "$USER"
+    echo "NOTICE: Docker installed. A logout may be required for group changes."
+fi
+
+# Daemon Check
+if ! $DRY_RUN; then
+    if ! docker info >/dev/null 2>&1; then
+        echo "Docker daemon not running. Starting..."
+        sudo systemctl start docker
+        sleep 2
+    fi
+fi
+highlight_echo "Docker is ready"
+
+# *********************************************************
+# Build Process
+# *********************************************************
+DOCKERFILE="$REPO_PATH/tools/Dockerfile"
+if [ ! -f "$DOCKERFILE" ]; then
+    echo "Error: Dockerfile missing at $DOCKERFILE"
+    exit 1
+fi
+
+if $DOCKER_CLEAN; then
+    echo "Cleaning Docker system..."
+    run_cmd docker system prune --force
+fi
+
+IMAGE_TAG="build-env:${REPO_NAME}-${TAG_ARCH}"
+echo "Building image: $IMAGE_TAG"
+
+run_cmd docker build \
+    -t "$IMAGE_TAG" \
+    "${DOCKER_ARGS[@]}" \
+    -f "$DOCKERFILE" \
+    "$(dirname "$DOCKERFILE")"
+
+echo "★ $REPO_NAME image is ready! ★"

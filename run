@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -e
+
+# *********************************************************
+# One-click development environment start-up
+#   Developed by: Jon Skerlj
+#   Last update: 04.02.2026
+#   Tested using Ubuntu 22.04
+# *********************************************************
+
+# Setup Paths
+REPO_PATH=$(git rev-parse --show-toplevel)
+REPO_NAME=$(basename "$REPO_PATH")
+
+# ==============================================================================
+# 1. Path and Identity Setup
+# ==============================================================================
+REPO_PATH=$(git rev-parse --show-toplevel)
+REPO_NAME=$(basename "$REPO_PATH")
+IMAGE_NAME="build-env"
+CONTAINER_NAME="multipanda-container"
+
+# Detect Architecture
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)  TAG_ARCH="amd64" ;;
+    aarch64) TAG_ARCH="arm64" ;;
+    *)       TAG_ARCH="$ARCH" ;;
+esac
+IMAGE_TAG="${IMAGE_NAME}:${REPO_NAME}-${TAG_ARCH}"
+
+# ==============================================================================
+# 2. Hardware Support Checks
+# ==============================================================================
+check_nvidia_gpu() {
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1
+}
+
+check_gpu_support() {
+    docker info 2>/dev/null | grep -q "nvidia"
+}
+
+# Ensure XServer access
+xhost +local:docker > /dev/null
+
+# ==============================================================================
+# 3. Dynamic Argument Construction (Using All Your Flags)
+# ==============================================================================
+# Workspace Path inside container
+WS_SRC="/home/developer/multipanda_ws/src"
+
+# GPU Configuration
+WITH_GPU_CONFIG=()
+if check_nvidia_gpu && check_gpu_support; then
+    # Adding 'display' capability is key for OpenGL performance (MuJoCo/RViz)
+    WITH_GPU_CONFIG+=(--gpus 'all,"capabilities=compute,utility,graphics,display"')
+    echo "GPU support detected."
+else
+    echo "No GPU support. Using CPU rendering."
+fi
+
+# ==============================================================================
+# 4. Container Execution
+# ==============================================================================
+if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
+    echo "$CONTAINER_NAME is already running."
+else
+    echo "Launching $CONTAINER_NAME..."
+    
+    docker run -d \
+        --name "$CONTAINER_NAME" \
+        --user "$(id -u):$(id -g)" \
+        --network host \
+        --ipc host \
+        --pid host \
+        --privileged \
+        --tty \
+        --interactive \
+        --env "DISPLAY=$DISPLAY" \
+        --env "USER=$(id -u)" \
+        --env "ROS_DOMAIN_ID=1" \
+        --volume "/tmp/.X11-unix:/tmp/.X11-unix:rw" \
+        --volume "/dev:/dev" \
+        --volume "$HOME:/host" \
+        --volume "${REPO_PATH}:/home/developer/multipanda_ws/src/" \
+        --ulimit rtprio=99 \
+        --ulimit rttime=-1 \
+        --ulimit memlock=-1 \
+        --cap-add=sys_nice \
+        "${WITH_GPU_CONFIG[@]}" \
+        "$IMAGE_TAG"
+fi
+
+# Enter the container
+echo "➡ Entering environment..."
+docker exec -it --user developer "$CONTAINER_NAME" /bin/bash -c "source /home/developer/.bashrc && bash"
