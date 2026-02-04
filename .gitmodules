@@ -1,0 +1,4 @@
+[submodule "mujoco_ros_pkgs"]
+	path = mujoco_ros_pkgs
+	url = https://github.com/tenfoldpaper/mujoco_ros_pkgs
+	branch = wip_ros_control_humble
