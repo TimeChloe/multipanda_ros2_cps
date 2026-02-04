@@ -1,5 +1,9 @@
 # Changelog
 
+## Added 04.02.26
+* Added tools/ directory for one-click installation and start-up scripts utilizing docker.
+* Updated the installation instructions, especially one-click setup.
+
 ## Added 28.11.23
 * Added dual panda arm moveit configurations and launch files. Still some bugs remaining, but plan & execute works.
 

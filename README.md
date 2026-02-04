@@ -44,7 +44,53 @@ More thorough information is available in the documentation.
 * Joint position controller might cause some bad motor behaviors. Suggest using torque or velocity for now.
 * The default `franka_moveit_config` package depends on `warehouse_ros_mongo`, which has been deprecated. It has been changed to `warehouse_ros_sqlite` for now to ensure that `rosdep install` works properly. For now, please refer to this discussion [here](https://discourse.ros.org/t/fixing-moveit2-humble-moveit-ros-benchmarks-package/32048) for a potential solution; once a proper solution has been identified, it will be added.
 
-## Installation guide
+## Installation with One-Click Installer (Recommended)
+1. Clone the repository recursively to include **mujoco_ros_pkgs**:
+```
+git clone --recursive https://github.com/tenfoldpaper/multipanda_ros2.git
+```
+2. Then cd into the cloned repository:
+```
+cd multipanda_ros2
+```
+3. Build the docker image by running one command (takes some time):
+```
+./tools/setup_env
+```
+4. Once the image is built, start the development container:
+```
+./run
+```
+Default config allows for communication in the network, gpu access, display forwarding for GUI applications, hardware devices, etc. By default the script opens a bash shell inside the container as a developer user (password can be modified in Dockerfile) in ros2 workspace under ~/multipanda_ws.
+
+5. Build ROS2 packages with:
+```
+colcon build
+```
+* In case there are some problems with missing packages, try running the following commands inside the container before `colcon build`:
+    ```
+    sudo apt update && \
+    rosdep update && \
+    rosdep install --from-paths src --ignore-src -y -r
+    ```
+6. To verify that the installation was successful, run:
+```
+source ~/multipanda_ws/install/setup.bash && \
+ros2 launch franka_bringup franka_sim.launch.py
+```
+* This should open up MuJoCo simulation with one Franka Panda arm
+* To open the docker container in additional terminal, use *docker exec* command:
+    ```
+    docker exec -it --user developer multipanda-container bash
+    ```
+7. (OPTIONAL) Check that the connection to the robot, RT kernel and screen are all working fine (make sure that FCI feature is activated). 
+    - You can check if docker is properly linked to your screen by running:
+        - `ros2 run rviz2 rviz2` or
+        - `~/Libraries/mujoco/bin/simulate`
+    - For RT kernel and robot connection, run
+        - `~/Libraries/libfranka/bin/communication_test <robot-ip>`
+
+## Manual Installation Guide (Not recommended)
 (Tested on Ubuntu 22.04, ROS2 Humble, Panda 4.2.2 & 4.2.1, `libfranka` 0.9.2 and MuJoCo 3.2.0)
 On a computer running Ubuntu 22.04 and real-time kernel (if you wish to use it with a real robot), do the following:
 1. Install ROS2 Humble by following their [instructions][humble-instructions] and create a workspace.
@@ -112,40 +158,6 @@ On a computer running Ubuntu 22.04 and real-time kernel (if you wish to use it w
     - Garmi (mobile manipulator with two Panda arms):
         1. for simulated robot, source the workspace, and run:
             - `ros2 launch garmi_bringup sim_garmi.launch.py`
-
-## Using with Docker
-1. Build the docker image:
-    1. at the root of the repository (where `Dockerfile` is located), run 
-        `sudo docker build -t "bimanual:garmi" ./`, or whatever name you want; just adjust them in the `docker-compose.yml` or the `docker run` command below.
-    2. This installs all the required packages including `rosdep`.
-2. Start the docker container with `docker compose` (for iGPUs):
-    *   `xhost +; sudo docker compose -f docker-compose.yml up`
-        * `xhost +` is needed to give the Docker container access to the host's screen.
-        * The `docker-compose.yml` file defines configurations that allow the container to run on the realtime kernel of the host, assuming that the host has one. The instructions were found in [here](https://github.com/2b-t/docker-realtime?tab=readme-ov-file).
-        * Currently, running GUI apps outputs warnings in the console. Those can be ignored.
-    *   Alternatively, with `docker run` (this has no RT kernel, so only the sim would work)
-        ``` bash
-        xhost +
-        sudo docker run \
-        -dit \
-        -v /tmp/.X11-unix:/tmp/.X11-unix \
-        --device=/dev/dri:/dev/dri \
-        --env="DISPLAY=$DISPLAY" \
-        --name=my_container \
-        --network="host" \
-        bimanual:garmi
-        ```
-        * The `--network="host"` is what enables the FCI IP address to be found from inside Docker without any additional configuration. TODO: Add a more elegant way to handle this.
-    * For other GPUs, please refer online.
-3. Access the container with:
-    - for `compose`, `sudo docker exec -it realtime_humble bash`
-    - for `run`, `sudo docker exec -it my_container bash`
-4. (OPTIONAL) Check that the connection to the robot, RT kernel and screen are all working fine. 
-    - You can check if docker is properly linked to your screen by running:
-        - `ros2 run rviz2 rviz2` or
-        - `~/Libraries/mujoco/bin/simulate`
-    - For RT kernel and robot connection, run
-        - `~/Libraries/libfranka/bin/communication_test <robot-ip>`
 
 ## Citation 
 If multipanda_ros2 framework helps your research, please cite our paper:
