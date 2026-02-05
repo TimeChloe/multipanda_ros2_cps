@@ -63,7 +63,7 @@ def generate_launch_description():
             FindPackageShare('franka_bringup'),
             'config',
             'real',
-            'multimode.yaml',
+            'single_multimode.yaml',
         ]
     )
 
