@@ -123,6 +123,7 @@ RUN apt-get update -y && apt-get install -y --allow-unauthenticated \
     ros-humble-rqt \
     ros-humble-joint-trajectory-controller \
     ros-humble-rqt-common-plugins \
+    ros-humble-rqt-controller-manager \
     ros-humble-rqt-robot-steering \
     ros-humble-rqt-tf-tree \
     ros-humble-rqt-graph \
