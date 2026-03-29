@@ -65,11 +65,13 @@ RUN curl -L https://gitlab.com/libeigen/eigen/-/archive/3.3.9/eigen-3.3.9.tar.gz
     cmake .. && sudo make install
 
 # Libfranka 0.9.2
-RUN git clone https://github.com/frankaemika/libfranka.git && \
-    cd libfranka && git checkout 0.9.2 && git submodule update --init --recursive && \
-    mkdir build && cd build && \
-    cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=$HOME_DIR/Libraries/libfranka .. && \
-    cmake --build . --parallel $(nproc) && cmake --install .
+# RUN git clone https://github.com/frankaemika/libfranka.git && \
+#     cd libfranka && git checkout 0.9.2 && git submodule update --init --recursive && \
+#     mkdir build && cd build && \
+#     cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=$HOME_DIR/Libraries/libfranka .. && \
+#     cmake --build . --parallel $(nproc) && cmake --install .
+
+
 
 # Ensure the developer user owns the libraries we just built as root
 RUN chown -R developer:developer $HOME_DIR/Libraries
@@ -148,9 +150,14 @@ RUN rosdep update
 # Environment Config
 # *********************************************************
 # Source ROS2 and set library paths in bashrc
+# RUN echo 'source /opt/ros/humble/setup.bash' >> $HOME_DIR/.bashrc && \
+#     echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/Libraries/libfranka/lib:$HOME/Libraries/mujoco/lib' >> $HOME_DIR/.bashrc && \
+#     echo 'export CMAKE_PREFIX_PATH=$HOME/Libraries/libfranka/lib/cmake:$HOME/Libraries/mujoco/lib/cmake' >> $HOME_DIR/.bashrc
+
 RUN echo 'source /opt/ros/humble/setup.bash' >> $HOME_DIR/.bashrc && \
-    echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/Libraries/libfranka/lib:$HOME/Libraries/mujoco/lib' >> $HOME_DIR/.bashrc && \
-    echo 'export CMAKE_PREFIX_PATH=$HOME/Libraries/libfranka/lib/cmake:$HOME/Libraries/mujoco/lib/cmake' >> $HOME_DIR/.bashrc
+    echo 'export LD_LIBRARY_PATH=/opt/libfranka/lib:$HOME/Libraries/mujoco/lib:$LD_LIBRARY_PATH' >> $HOME_DIR/.bashrc && \
+    echo 'export CMAKE_PREFIX_PATH=/opt/libfranka:$HOME/Libraries/mujoco/lib/cmake:$CMAKE_PREFIX_PATH' >> $HOME_DIR/.bashrc && \
+    echo 'export franka_DIR=/opt/libfranka/lib/cmake/franka' >> $HOME_DIR/.bashrc
 
 # Ensure developer owns their home directory
 RUN chown -R developer:developer $HOME_DIR

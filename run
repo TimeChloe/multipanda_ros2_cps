@@ -15,10 +15,16 @@ REPO_NAME=$(basename "$REPO_PATH")
 # ==============================================================================
 # 1. Path and Identity Setup
 # ==============================================================================
-REPO_PATH=$(git rev-parse --show-toplevel)
-REPO_NAME=$(basename "$REPO_PATH")
 IMAGE_NAME="build-env"
 CONTAINER_NAME="multipanda-container"
+
+LIBFRANKA_INSTALL="$HOME/Documents/cps/install/libfranka-docker"
+LIBFRANKA_SOURCE="$HOME/Documents/cps/libfranka"   # optional
+
+if [ ! -d "$LIBFRANKA_INSTALL" ]; then
+    echo "Error: libfranka install dir not found: $LIBFRANKA_INSTALL"
+    exit 1
+fi
 
 # Detect Architecture
 ARCH=$(uname -m)
@@ -44,15 +50,12 @@ check_gpu_support() {
 xhost +local:docker > /dev/null
 
 # ==============================================================================
-# 3. Dynamic Argument Construction (Using All Your Flags)
+# 3. Dynamic Argument Construction
 # ==============================================================================
-# Workspace Path inside container
 WS_SRC="/home/developer/multipanda_ws/src"
 
-# GPU Configuration
 WITH_GPU_CONFIG=()
 if check_nvidia_gpu && check_gpu_support; then
-    # Adding 'display' capability is key for OpenGL performance (MuJoCo/RViz)
     WITH_GPU_CONFIG+=(--gpus 'all,"capabilities=compute,utility,graphics,display"')
     echo "GPU support detected."
 else
@@ -62,11 +65,50 @@ fi
 # ==============================================================================
 # 4. Container Execution
 # ==============================================================================
-if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
+# if [ "$(docker ps -q -f name=$CONTAINER_NAME)" ]; then
+#     echo "$CONTAINER_NAME is already running."
+# else
+#     echo "Launching $CONTAINER_NAME..."
+
+#     docker run -d \
+#         --name "$CONTAINER_NAME" \
+#         --user "$(id -u):$(id -g)" \
+#         --network host \
+#         --ipc host \
+#         --pid host \
+#         --privileged \
+#         --tty \
+#         --interactive \
+#         --env "DISPLAY=$DISPLAY" \
+#         --env "USER=$(id -u)" \
+#         --env "ROS_DOMAIN_ID=1" \
+#         --env "CMAKE_PREFIX_PATH=/opt/libfranka" \
+#         --env "LD_LIBRARY_PATH=/opt/libfranka/lib" \
+#         --volume "/tmp/.X11-unix:/tmp/.X11-unix:rw" \
+#         --volume "/dev:/dev" \
+#         --volume "$HOME:/host" \
+#         --volume "${REPO_PATH}:/home/developer/multipanda_ws/src/" \
+#         --volume "$LIBFRANKA_INSTALL:/opt/libfranka:ro" \
+#         --volume "$LIBFRANKA_SOURCE:/home/developer/external/libfranka-src:rw" \
+#         --ulimit rtprio=99 \
+#         --ulimit rttime=-1 \
+#         --ulimit memlock=-1 \
+#         --cap-add=sys_nice \
+#         "${WITH_GPU_CONFIG[@]}" \
+#         "$IMAGE_TAG"
+# fi
+
+# ==============================================================================
+# 4. Container Execution
+# ==============================================================================
+if [ -n "$(docker ps -q -f "name=^/${CONTAINER_NAME}$")" ]; then
     echo "$CONTAINER_NAME is already running."
+elif [ -n "$(docker ps -aq -f "name=^/${CONTAINER_NAME}$")" ]; then
+    echo "$CONTAINER_NAME exists but is stopped. Starting it..."
+    docker start "$CONTAINER_NAME" > /dev/null
 else
     echo "Launching $CONTAINER_NAME..."
-    
+
     docker run -d \
         --name "$CONTAINER_NAME" \
         --user "$(id -u):$(id -g)" \
@@ -79,10 +121,14 @@ else
         --env "DISPLAY=$DISPLAY" \
         --env "USER=$(id -u)" \
         --env "ROS_DOMAIN_ID=1" \
+        --env "CMAKE_PREFIX_PATH=/opt/libfranka" \
+        --env "LD_LIBRARY_PATH=/opt/libfranka/lib" \
         --volume "/tmp/.X11-unix:/tmp/.X11-unix:rw" \
         --volume "/dev:/dev" \
         --volume "$HOME:/host" \
         --volume "${REPO_PATH}:/home/developer/multipanda_ws/src/" \
+        --volume "$LIBFRANKA_INSTALL:/opt/libfranka:ro" \
+        --volume "$LIBFRANKA_SOURCE:/home/developer/external/libfranka-src:rw" \
         --ulimit rtprio=99 \
         --ulimit rttime=-1 \
         --ulimit memlock=-1 \
@@ -91,6 +137,9 @@ else
         "$IMAGE_TAG"
 fi
 
-# Enter the container
 echo "➡ Entering environment..."
-docker exec -it --user developer "$CONTAINER_NAME" /bin/bash -c "source /home/developer/.bashrc && bash"
+docker exec -it --user developer "$CONTAINER_NAME" /bin/bash -lc \
+"export CMAKE_PREFIX_PATH=/opt/libfranka:\$CMAKE_PREFIX_PATH; \
+ export LD_LIBRARY_PATH=/opt/libfranka/lib:\$LD_LIBRARY_PATH; \
+ source /home/developer/.bashrc; \
+ exec bash"

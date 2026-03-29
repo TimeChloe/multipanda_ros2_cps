@@ -24,6 +24,7 @@ find_package(generate_parameter_library)
 find_package(franka_msgs REQUIRED)
 find_package(multi_mode_control_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(pinocchio REQUIRED)
 
 add_library(
         ${PROJECT_NAME}
@@ -61,6 +62,8 @@ ament_target_dependencies(
         franka_semantic_components
         multi_mode_control_msgs
 )
+
+target_link_libraries(${PROJECT_NAME} pinocchio::pinocchio)
 
 generate_parameter_library(franka_example_controllers_parameters src/comless/model_example_controller_parameters.yaml)
 
@@ -118,5 +121,6 @@ ament_export_dependencies(
         hardware_interface
         franka_hardware
         multi_mode_control_msgs
+        pinocchio
 )
 ament_package()

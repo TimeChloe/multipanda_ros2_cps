@@ -61,6 +61,10 @@ joint_impedance_example_controller:
 cartesian_impedance_example_controller:
   ros__parameters:
     arm_id: panda
+    enable_error_logging: true
+    use_constant_reference: false
+    error_log_path: /home/developer/multipanda_ws/src/data_log/cartesian_pose_error_nonlinear.csv
+    urdf_model_path: /home/developer/multipanda_ws/src/model_urdf/panda.urdf
   
 multi_mode_controller:
   ros__parameters:
