@@ -79,6 +79,7 @@ class CartesianImpedanceExampleController
   Matrix6d D_m_;
   double n_stiffness_{10.0};
   bool use_constant_reference_{true};
+  bool use_nonlinear_feedforward_{true};
 };
 
 }  // namespace franka_example_controllers

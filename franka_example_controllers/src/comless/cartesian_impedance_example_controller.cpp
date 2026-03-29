@@ -128,6 +128,10 @@ TaskRef6D makeReference(double t,
   constexpr double Ary = 0.1047;  // 6 deg
   constexpr double Arz = 0.1745;  // 10 deg
 
+  // constexpr double Arx = 0;  // 8 deg
+  // constexpr double Ary = 0;  // 6 deg
+  // constexpr double Arz = 0;  // 10 deg
+
   const Eigen::Vector3d p_base(
       Ax * (std::sin(wt * t + ph_px) - std::sin(ph_px)),
       Ay * (std::sin(wt * t + ph_py) - std::sin(ph_py)),
@@ -520,10 +524,18 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   // nonlinear impedance law matching the slide structure:
   // tau = M(q) qddot_r + C(q,dq) qdot_r + J^T [ D (rdot_d-rdot) + K (r_d-r) ]
   // NOTE: gravity is NOT added here because the effort interface already compensates gravity.
-  Vector7d tau =
-      M * ddq_ref +
-      C * dq_ref +
+  Vector7d tau_impedance =
       J_r.transpose() * (D_m_ * de + K_m_ * e);
+
+  Vector7d tau_ff =
+      M * ddq_ref +
+      C * dq_ref;
+
+  Vector7d tau = tau_impedance;
+
+  if (use_nonlinear_feedforward_) {
+    tau += tau_ff;
+  }
 
   // torque-space nullspace projector
   const Matrix7d N_tau =
@@ -535,6 +547,10 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   tau += tau_null;
 
   const double tau_norm = tau.norm();
+
+  const double tau_impedance_norm = tau_impedance.norm();
+  const double tau_ff_norm = tau_ff.norm();
+  const double tau_null_norm = tau_null.norm();
 
   for (int i = 0; i < kNumJoints; ++i) {
     command_interfaces_[i].set_value(tau(i));
@@ -576,7 +592,12 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
         << pos_error_norm << "," << rot_error_norm << ","
         << task_velocity_norm << ","
         << vel_residual_norm << "," << acc_residual_norm << ","
-        << pinv_projection_error_norm << "," << tau_norm
+        << pinv_projection_error_norm << ","
+        << tau_impedance_norm << ","
+        << tau_ff_norm << ","
+        << tau_null_norm << ","
+        << (use_nonlinear_feedforward_ ? 1 : 0) << ","
+        << tau_norm
         << "\n";
 
     ++log_write_counter_;
@@ -593,6 +614,7 @@ CallbackReturn CartesianImpedanceExampleController::on_init() {
     auto_declare<std::string>("arm_id", "panda");
     auto_declare<bool>("enable_error_logging", false);
     auto_declare<bool>("use_constant_reference", true);
+    auto_declare<bool>("use_nonlinear_feedforward", true);
     auto_declare<std::string>(
         "error_log_path",
         "/home/developer/multipanda_ws/src/data_log/cartesian_pose_error.csv");
@@ -612,6 +634,7 @@ CallbackReturn CartesianImpedanceExampleController::on_configure(
   try {
     arm_id_ = get_node()->get_parameter("arm_id").as_string();
     use_constant_reference_ = get_node()->get_parameter("use_constant_reference").as_bool();
+    use_nonlinear_feedforward_ = get_node()->get_parameter("use_nonlinear_feedforward").as_bool();
     enable_error_logging_ = get_node()->get_parameter("enable_error_logging").as_bool();
     error_log_path_ = get_node()->get_parameter("error_log_path").as_string();
     urdf_model_path_ = get_node()->get_parameter("urdf_model_path").as_string();
@@ -675,8 +698,8 @@ CallbackReturn CartesianImpedanceExampleController::on_activate(
   desired_orientation_.normalize();
 
   // same stiffness settings as base impedance controller
-  const double pos_stiff = 1500.0;
-  const double rot_stiff = 70.0;
+  const double pos_stiff = 400.0;
+  const double rot_stiff = 20.0;
 
   K_m_.setZero();
   D_m_.setZero();
@@ -720,7 +743,9 @@ CallbackReturn CartesianImpedanceExampleController::on_activate(
         << "acc_res_rx,acc_res_ry,acc_res_rz,"
         << "pos_err_norm,rot_err_norm,"
         << "task_velocity_norm,vel_residual_norm,acc_residual_norm,"
-        << "pinv_projection_error_norm,tau_norm\n";
+        << "pinv_projection_error_norm,"
+        << "tau_impedance_norm,tau_ff_norm,tau_null_norm,"
+        << "use_nonlinear_feedforward,tau_norm\n";
 
     RCLCPP_INFO(get_node()->get_logger(),
                 "Cartesian pose error logging enabled, writing to: %s",
