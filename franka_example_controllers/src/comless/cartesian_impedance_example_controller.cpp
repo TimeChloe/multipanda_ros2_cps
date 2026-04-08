@@ -20,6 +20,7 @@
 #include <iomanip>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <Eigen/Dense>
 
@@ -211,6 +212,43 @@ inline Eigen::Matrix<double, 7, 1> arrayToVector7d(
     out(static_cast<int>(i)) = data[i];
   }
   return out;
+}
+
+inline std::array<double, 7> vectorToArray7(
+    const std::vector<double>& values,
+    double default_value = 0.0) {
+  std::array<double, 7> out{};
+  out.fill(default_value);
+  const size_t n = std::min<size_t>(7, values.size());
+  for (size_t i = 0; i < n; ++i) {
+    out[i] = values[i];
+  }
+  return out;
+}
+
+inline Eigen::Matrix<double, 7, 1> computeSmoothJointFrictionTorque(
+    const Eigen::Matrix<double, 7, 1>& dq_like,
+    const std::array<double, 7>& friction_coulomb,
+    const std::array<double, 7>& friction_viscous,
+    const std::array<double, 7>& friction_velocity_scale,
+    const std::array<double, 7>& friction_offset,
+    double friction_scale) {
+  Eigen::Matrix<double, 7, 1> tau_friction;
+  tau_friction.setZero();
+
+  for (int i = 0; i < 7; ++i) {
+    const double vs = std::max(std::abs(friction_velocity_scale[i]), 1e-6);
+    const double dq_i = dq_like(i);
+    const double smooth_sign = std::tanh(dq_i / vs);
+
+    tau_friction(i) =
+        friction_scale *
+        (friction_coulomb[i] * smooth_sign +
+         friction_viscous[i] * dq_i +
+         friction_offset[i]);
+  }
+
+  return tau_friction;
 }
 
 // ---------------- trajectory 1: straight line ----------------
@@ -481,6 +519,22 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   const bool use_franka_model_for_dynamics =
       get_node()->get_parameter("use_franka_model_for_dynamics").as_bool();
 
+  const bool use_friction_compensation =
+      get_node()->get_parameter("use_friction_compensation").as_bool();
+  const bool friction_use_reference_velocity =
+      get_node()->get_parameter("friction_use_reference_velocity").as_bool();
+  const double friction_scale =
+      get_node()->get_parameter("friction_scale").as_double();
+
+  const std::array<double, 7> friction_coulomb =
+      vectorToArray7(get_node()->get_parameter("friction_coulomb").as_double_array(), 0.0);
+  const std::array<double, 7> friction_viscous =
+      vectorToArray7(get_node()->get_parameter("friction_viscous").as_double_array(), 0.0);
+  const std::array<double, 7> friction_velocity_scale =
+      vectorToArray7(get_node()->get_parameter("friction_velocity_scale").as_double_array(), 0.05);
+  const std::array<double, 7> friction_offset =
+      vectorToArray7(get_node()->get_parameter("friction_offset").as_double_array(), 0.0);
+
   // measured state
   Eigen::Map<const Vector7d> q(franka_robot_model_->getRobotState()->q.data());
   Eigen::Map<const Vector7d> dq(franka_robot_model_->getRobotState()->dq.data());
@@ -605,6 +659,31 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   const Vector7d dq_ref = J_r_pinv * dr_d;
   const Vector7d ddq_ref = J_r_pinv * (ddr_d - J_r_dot * dq_ref);
 
+  Vector7d tau_friction_current = Vector7d::Zero();
+  Vector7d tau_friction_ref = Vector7d::Zero();
+  Vector7d tau_friction_nonlinear = Vector7d::Zero();
+
+  if (use_friction_compensation) {
+    tau_friction_current = computeSmoothJointFrictionTorque(
+        dq,
+        friction_coulomb,
+        friction_viscous,
+        friction_velocity_scale,
+        friction_offset,
+        friction_scale);
+
+    tau_friction_ref = computeSmoothJointFrictionTorque(
+        dq_ref,
+        friction_coulomb,
+        friction_viscous,
+        friction_velocity_scale,
+        friction_offset,
+        friction_scale);
+
+    tau_friction_nonlinear =
+        friction_use_reference_velocity ? tau_friction_ref : tau_friction_current;
+  }
+
   const Vector6d vel_residual = J_r * dq_ref - dr_d;
   const Vector6d acc_residual = J_r * ddq_ref + J_r_dot * dq_ref - ddr_d;
 
@@ -627,13 +706,13 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
 
   // Current-velocity Coriolis term for the comparison branch
   const Vector7d tau_impedance_total =
-      tau_impedance + coriolis_current_vec + tau_null_impedance;
+      tau_impedance + coriolis_current_vec + tau_friction_current + tau_null_impedance;
 
   // ------------------------------------------------------------
   // Branch B: nonlinear model-based law, implemented to be
   // as close as possible to the screenshot:
   //
-  // tau = M(q) qdd_ref + C(q,dq) qd_ref
+  // tau = M(q) qdd_ref + C(q,dq) qd_ref + tau_f(qd_ref or qd)
   //       + J_r^T [ D_m (rd_d - rd) + K_m (r_d - r) ]
   //
   // Gravity is NOT added here because the effort interface already
@@ -646,7 +725,7 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   const Vector7d coriolis_ref_vec = C_pin * dq_ref;
 
   const Vector7d tau_task_id =
-      M_model * ddq_ref + coriolis_ref_vec + tau_impedance;
+      M_model * ddq_ref + coriolis_ref_vec + tau_friction_nonlinear + tau_impedance;
 
   const Vector7d tau_id_total =
       tau_task_id + tau_null_impedance;
@@ -678,7 +757,11 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   // useful extra diagnostics for analysis / papers
   const double coriolis_current_norm = coriolis_current_vec.norm();
   const double coriolis_ref_norm = coriolis_ref_vec.norm();
+  const double friction_current_norm = tau_friction_current.norm();
+  const double friction_ref_norm = tau_friction_ref.norm();
+  const double friction_nonlinear_norm = tau_friction_nonlinear.norm();
   const int using_franka_dynamics_int = using_franka_dynamics ? 1 : 0;
+  const int using_friction_compensation_int = use_friction_compensation ? 1 : 0;
 
   for (int i = 0; i < kNumJoints; ++i) {
     command_interfaces_[i].set_value(tau(i));
@@ -731,7 +814,11 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
         << C_norm << ","
         << coriolis_current_norm << ","
         << coriolis_ref_norm << ","
+        << friction_current_norm << ","
+        << friction_ref_norm << ","
+        << friction_nonlinear_norm << ","
         << using_franka_dynamics_int << ","
+        << using_friction_compensation_int << ","
         << (use_nonlinear_feedforward_ ? 1 : 0) << ","
         << tau_norm
         << "\n";
@@ -753,6 +840,15 @@ CallbackReturn CartesianImpedanceExampleController::on_init() {
     auto_declare<bool>("use_constant_reference", true);
     auto_declare<bool>("use_nonlinear_feedforward", true);
     auto_declare<bool>("use_franka_model_for_dynamics", true);
+
+    auto_declare<bool>("use_friction_compensation", false);
+    auto_declare<bool>("friction_use_reference_velocity", true);
+    auto_declare<double>("friction_scale", 1.0);
+    auto_declare<std::vector<double>>("friction_coulomb", std::vector<double>(7, 0.0));
+    auto_declare<std::vector<double>>("friction_viscous", std::vector<double>(7, 0.0));
+    auto_declare<std::vector<double>>("friction_velocity_scale", std::vector<double>(7, 0.05));
+    auto_declare<std::vector<double>>("friction_offset", std::vector<double>(7, 0.0));
+
     auto_declare<std::string>("reference_trajectory_type", "lissajous"); //line lissajous
     auto_declare<std::string>(
         "error_log_path",
@@ -882,7 +978,9 @@ CallbackReturn CartesianImpedanceExampleController::on_activate(
         << "pinv_projection_error_norm,"
         << "tau_impedance_norm,tau_ff_norm,tau_null_norm,"
         << "dq_ref_norm,ddq_ref_norm,J_r_dot_norm,M_norm,C_norm,"
-        << "coriolis_current_norm,coriolis_ref_norm,using_franka_dynamics,"
+        << "coriolis_current_norm,coriolis_ref_norm,"
+        << "friction_current_norm,friction_ref_norm,friction_nonlinear_norm,"
+        << "using_franka_dynamics,using_friction_compensation,"
         << "use_nonlinear_feedforward,tau_norm\n";
 
     RCLCPP_INFO(get_node()->get_logger(),

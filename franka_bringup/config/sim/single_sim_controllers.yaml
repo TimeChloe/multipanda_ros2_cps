@@ -63,9 +63,20 @@ cartesian_impedance_example_controller:
     arm_id: panda
     enable_error_logging: true
     use_constant_reference: false
-    use_nonlinear_feedforward: true
-    error_log_path: /home/developer/multipanda_ws/src/data_log/cartesian_pose_error_nonlinear_use.csv
+    error_log_path: /home/developer/multipanda_ws/src/data_log/cartesian_pose_error_no_use_friction_compensation.csv
     urdf_model_path: /home/developer/multipanda_ws/src/model_urdf/panda_ng.urdf
+
+    use_nonlinear_feedforward: true
+    use_franka_model_for_dynamics: true
+
+    use_friction_compensation: false
+    friction_use_reference_velocity: false
+    friction_scale: 1.0
+
+    friction_coulomb: [0.15, 0.15, 0.12, 0.10, 0.08, 0.05, 0.03]
+    friction_viscous: [0.04, 0.04, 0.03, 0.02, 0.02, 0.01, 0.01]
+    friction_velocity_scale: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+    friction_offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   
 multi_mode_controller:
   ros__parameters:
