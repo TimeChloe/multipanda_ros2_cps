@@ -30,48 +30,44 @@
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/kinematics.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
+#include <pinocchio/algorithm/kinematics-derivatives.hpp>
 #include <pinocchio/algorithm/rnea.hpp>
 
 namespace {
 
-constexpr double kPseudoInverseDamping = 1e-4;
 constexpr double kMinDt = 1e-6;
 constexpr double kPitchCosEps = 1e-6;
-constexpr double kSmoothStartDuration = 2.0;  // seconds
+constexpr double kSmoothStartDuration = 2.0;  // s
+constexpr double kDynInvReg = 1e-9;
 
-struct TaskRef6D {
-  Eigen::Vector3d p, dp, ddp;
-  Eigen::Vector3d phi, dphi, ddphi;
-  Eigen::Matrix3d R;
+using Matrix6d = Eigen::Matrix<double, 6, 6>;
+using Matrix67d = Eigen::Matrix<double, 6, 7>;
+using Matrix76d = Eigen::Matrix<double, 7, 6>;
+
+enum class ReferenceTrajectoryType {
+  kLine,
+  kLissajous
 };
 
 struct SmoothStartProfile {
-  double s;    // position scaling
-  double ds;   // velocity scaling
-  double dds;  // acceleration scaling
+  double s;
+  double ds;
+  double dds;
 };
 
-inline Eigen::Matrix3d skew(const Eigen::Vector3d& v) {
-  Eigen::Matrix3d S;
-  S << 0.0, -v.z(),  v.y(),
-       v.z(),  0.0, -v.x(),
-      -v.y(),  v.x(), 0.0;
-  return S;
-}
+struct TaskRefZYX {
+  Eigen::Vector3d p, dp, ddp;
+  Eigen::Vector3d rpy, drpy, ddrpy;
+  Eigen::Matrix3d R;
+};
 
-inline Eigen::Matrix3d expMapSO3(const Eigen::Vector3d& phi) {
-  const double theta = phi.norm();
-  if (theta < 1e-10) {
-    return Eigen::Matrix3d::Identity() + skew(phi);
+inline ReferenceTrajectoryType parseReferenceTrajectoryType(const std::string& name) {
+  if (name == "lissajous") {
+    return ReferenceTrajectoryType::kLissajous;
   }
-  Eigen::AngleAxisd aa(theta, phi / theta);
-  return aa.toRotationMatrix();
+  return ReferenceTrajectoryType::kLine;
 }
 
-// quintic smooth start:
-// t <= 0     : s = 0
-// 0 < t < T  : s = 10x^3 - 15x^4 + 6x^5, x=t/T
-// t >= T     : s = 1
 inline SmoothStartProfile makeSmoothStartProfile(double t, double T) {
   SmoothStartProfile out{0.0, 0.0, 0.0};
 
@@ -96,93 +92,14 @@ inline SmoothStartProfile makeSmoothStartProfile(double t, double T) {
   return out;
 }
 
-// 新版参考轨迹：
-// 保留原来的周期轨迹形状，但加一个 smooth-start 包络，保证
-// t=0 时 offset=0, velocity=0, acceleration=0
-TaskRef6D makeReference(double t,
-                        const Eigen::Vector3d& p0,
-                        const Eigen::Matrix3d& R0) {
-  TaskRef6D ref;
-
-  const double wt = 2.0 * M_PI * 0.25;
-  const double wr = 2.0 * M_PI * 0.20;
-
-  // 保留原来相位，保持轨迹“丰富度”
-  const double ph_px = 0.0;
-  const double ph_py = M_PI / 2.0;
-  const double ph_pz = 0.0;
-
-  const double ph_rx = 0.0;
-  const double ph_ry = M_PI / 3.0;
-  const double ph_rz = 2.0 * M_PI / 3.0;
-
-  const SmoothStartProfile ramp = makeSmoothStartProfile(t, kSmoothStartDuration);
-
-  // ---------- base translational offsets (before smooth-start envelope) ----------
-  // enlarged amplitudes for clearer controller validation
-  constexpr double Ax = 0.08;   // 8 cm
-  constexpr double Ay = 0.08;   // 8 cm
-  constexpr double Az = 0.04;   // 4 cm
-
-  constexpr double Arx = 0.1396;  // 8 deg
-  constexpr double Ary = 0.1047;  // 6 deg
-  constexpr double Arz = 0.1745;  // 10 deg
-
-  // constexpr double Arx = 0;  // 8 deg
-  // constexpr double Ary = 0;  // 6 deg
-  // constexpr double Arz = 0;  // 10 deg
-
-  const Eigen::Vector3d p_base(
-      Ax * (std::sin(wt * t + ph_px) - std::sin(ph_px)),
-      Ay * (std::sin(wt * t + ph_py) - std::sin(ph_py)),
-      Az * (std::sin(0.5 * wt * t + ph_pz) - std::sin(ph_pz)));
-
-  const Eigen::Vector3d dp_base(
-      Ax * wt * std::cos(wt * t + ph_px),
-      Ay * wt * std::cos(wt * t + ph_py),
-      Az * 0.5 * wt * std::cos(0.5 * wt * t + ph_pz));
-
-  const Eigen::Vector3d ddp_base(
-      -Ax * wt * wt * std::sin(wt * t + ph_px),
-      -Ay * wt * wt * std::sin(wt * t + ph_py),
-      -Az * 0.25 * wt * wt * std::sin(0.5 * wt * t + ph_pz));
-
-  const Eigen::Vector3d phi_base(
-      Arx * (std::sin(wr * t + ph_rx) - std::sin(ph_rx)),
-      Ary * (std::sin(wr * t + ph_ry) - std::sin(ph_ry)),
-      Arz * (std::sin(wr * t + ph_rz) - std::sin(ph_rz)));
-
-  const Eigen::Vector3d dphi_base(
-      Arx * wr * std::cos(wr * t + ph_rx),
-      Ary * wr * std::cos(wr * t + ph_ry),
-      Arz * wr * std::cos(wr * t + ph_rz));
-
-  const Eigen::Vector3d ddphi_base(
-      -Arx * wr * wr * std::sin(wr * t + ph_rx),
-      -Ary * wr * wr * std::sin(wr * t + ph_ry),
-      -Arz * wr * wr * std::sin(wr * t + ph_rz));
-
-  // ---------- apply smooth-start envelope ----------
-  const Eigen::Vector3d p_offset = ramp.s * p_base;
-  const Eigen::Vector3d dp_offset = ramp.ds * p_base + ramp.s * dp_base;
-  const Eigen::Vector3d ddp_offset =
-      ramp.dds * p_base + 2.0 * ramp.ds * dp_base + ramp.s * ddp_base;
-
-  const Eigen::Vector3d phi = ramp.s * phi_base;
-  const Eigen::Vector3d dphi = ramp.ds * phi_base + ramp.s * dphi_base;
-  const Eigen::Vector3d ddphi =
-      ramp.dds * phi_base + 2.0 * ramp.ds * dphi_base + ramp.s * ddphi_base;
-
-  ref.p = p0 + p_offset;
-  ref.dp = dp_offset;
-  ref.ddp = ddp_offset;
-
-  ref.phi = phi;
-  ref.dphi = dphi;
-  ref.ddphi = ddphi;
-
-  ref.R = R0 * expMapSO3(ref.phi);
-  return ref;
+inline Eigen::Matrix3d rpyToRotationMatrixZYX(const Eigen::Vector3d& rpy) {
+  const Eigen::Matrix3d Rz =
+      Eigen::AngleAxisd(rpy(2), Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  const Eigen::Matrix3d Ry =
+      Eigen::AngleAxisd(rpy(1), Eigen::Vector3d::UnitY()).toRotationMatrix();
+  const Eigen::Matrix3d Rx =
+      Eigen::AngleAxisd(rpy(0), Eigen::Vector3d::UnitX()).toRotationMatrix();
+  return Rz * Ry * Rx;
 }
 
 // ZYX RPY from rotation matrix
@@ -204,39 +121,8 @@ inline Eigen::Vector3d rotationMatrixToRpy(const Eigen::Matrix3d& R) {
   return rpy;
 }
 
-inline Eigen::Vector3d unwrapToNearby(const Eigen::Vector3d& ref,
-                                      const Eigen::Vector3d& x) {
-  Eigen::Vector3d out = x;
-  for (int i = 0; i < 3; ++i) {
-    while (out(i) - ref(i) > M_PI) {
-      out(i) -= 2.0 * M_PI;
-    }
-    while (out(i) - ref(i) < -M_PI) {
-      out(i) += 2.0 * M_PI;
-    }
-  }
-  return out;
-}
-
-// omega_world = E(rpy) * rpy_dot
-inline Eigen::Matrix3d rpyRatesToWorldOmegaMatrix(const Eigen::Vector3d& rpy) {
-  const double pitch = rpy(1);
-  const double yaw = rpy(2);
-
-  const double ctheta = std::cos(pitch);
-  const double stheta = std::sin(pitch);
-  const double cpsi = std::cos(yaw);
-  const double spsi = std::sin(yaw);
-
-  Eigen::Matrix3d E;
-  E << cpsi * ctheta, -spsi, 0.0,
-       spsi * ctheta,  cpsi, 0.0,
-       -stheta,        0.0,  1.0;
-  return E;
-}
-
-// rpy_dot = E^{-1}(rpy) * omega_world
-inline Eigen::Matrix3d worldOmegaToRpyRatesMatrix(const Eigen::Vector3d& rpy) {
+// T^{-1}(rpy): omega_world -> rpy_dot
+inline Eigen::Matrix3d worldOmegaToRpyRatesMatrixZYX(const Eigen::Vector3d& rpy) {
   const double pitch = rpy(1);
   const double yaw = rpy(2);
 
@@ -251,71 +137,216 @@ inline Eigen::Matrix3d worldOmegaToRpyRatesMatrix(const Eigen::Vector3d& rpy) {
 
   const double tan_theta = stheta / ctheta;
 
-  Eigen::Matrix3d E_inv;
-  E_inv << cpsi / ctheta,      spsi / ctheta,      0.0,
-          -spsi,               cpsi,               0.0,
-           cpsi * tan_theta,   spsi * tan_theta,   1.0;
-  return E_inv;
+  Eigen::Matrix3d Tinv;
+  Tinv << cpsi / ctheta,      spsi / ctheta,      0.0,
+         -spsi,               cpsi,               0.0,
+          cpsi * tan_theta,   spsi * tan_theta,   1.0;
+  return Tinv;
 }
 
-inline Eigen::Matrix<double, 7, 6> dampedRightPseudoInverse(
-    const Eigen::Matrix<double, 6, 7>& J,
-    double lambda = kPseudoInverseDamping) {
-  const Eigen::Matrix<double, 6, 6> JJt =
-      J * J.transpose() + lambda * Eigen::Matrix<double, 6, 6>::Identity();
-  return J.transpose() * JJt.inverse();
+// d/dt[T^{-1}(rpy)]
+inline Eigen::Matrix3d worldOmegaToRpyRatesMatrixDotZYX(
+    const Eigen::Vector3d& rpy,
+    const Eigen::Vector3d& rpy_dot) {
+  const double pitch = rpy(1);
+  const double yaw = rpy(2);
+
+  double ctheta = std::cos(pitch);
+  const double stheta = std::sin(pitch);
+  const double cpsi = std::cos(yaw);
+  const double spsi = std::sin(yaw);
+
+  if (std::abs(ctheta) < kPitchCosEps) {
+    ctheta = (ctheta >= 0.0 ? kPitchCosEps : -kPitchCosEps);
+  }
+
+  const double sec_theta = 1.0 / ctheta;
+  const double tan_theta = stheta / ctheta;
+  const double sec2_theta = sec_theta * sec_theta;
+
+  const double pitch_dot = rpy_dot(1);
+  const double yaw_dot = rpy_dot(2);
+
+  Eigen::Matrix3d dT_dtheta = Eigen::Matrix3d::Zero();
+  dT_dtheta << cpsi * sec_theta * tan_theta,  spsi * sec_theta * tan_theta, 0.0,
+               0.0,                           0.0,                          0.0,
+               cpsi * sec2_theta,             spsi * sec2_theta,            0.0;
+
+  Eigen::Matrix3d dT_dyaw = Eigen::Matrix3d::Zero();
+  dT_dyaw << -spsi * sec_theta,   cpsi * sec_theta,   0.0,
+             -cpsi,              -spsi,               0.0,
+             -spsi * tan_theta,   cpsi * tan_theta,   0.0;
+
+  return dT_dtheta * pitch_dot + dT_dyaw * yaw_dot;
 }
 
-// 从与旧控制器完全相同的 pose reference 中，构造新控制器使用的
-// r_d = [p_d; rpy_d], dr_d, ddr_d
+inline Matrix76d dynamicallyConsistentRightInverse(
+    const Matrix67d& J,
+    const Eigen::Matrix<double, 7, 7>& M,
+    double reg = kDynInvReg) {
+  const Matrix76d M_inv_JT = M.ldlt().solve(J.transpose());
+
+  Matrix6d lambda_inv = J * M_inv_JT;
+  lambda_inv.diagonal().array() += reg;
+
+  return M_inv_JT *
+         lambda_inv.ldlt().solve(Matrix6d::Identity());
+}
+
+inline Eigen::Matrix<double, 7, 7> arrayToMatrix7d(
+    const std::array<double, 49>& data) {
+  Eigen::Matrix<double, 7, 7> out;
+  for (size_t i = 0; i < 7; ++i) {
+    for (size_t j = 0; j < 7; ++j) {
+      out(static_cast<int>(i), static_cast<int>(j)) = data[i * 7 + j];
+    }
+  }
+  return out;
+}
+
+inline Eigen::Matrix<double, 7, 1> arrayToVector7d(
+    const std::array<double, 7>& data) {
+  Eigen::Matrix<double, 7, 1> out;
+  for (size_t i = 0; i < 7; ++i) {
+    out(static_cast<int>(i)) = data[i];
+  }
+  return out;
+}
+
+// ---------------- trajectory 1: straight line ----------------
+inline TaskRefZYX makeReferenceZYXLine(
+    double t,
+    const Eigen::Vector3d& p0,
+    const Eigen::Vector3d& rpy0) {
+  TaskRefZYX ref;
+
+  constexpr double T_move = 3.0;   // total motion duration [s]
+  constexpr double dz = -0.40;     // move downward by 40 cm
+
+  const SmoothStartProfile ramp = makeSmoothStartProfile(t, T_move);
+
+  ref.p = p0 + Eigen::Vector3d(0.0, 0.0, dz * ramp.s);
+  ref.dp = Eigen::Vector3d(0.0, 0.0, dz * ramp.ds);
+  ref.ddp = Eigen::Vector3d(0.0, 0.0, dz * ramp.dds);
+
+  ref.rpy = rpy0;
+  ref.drpy = Eigen::Vector3d::Zero();
+  ref.ddrpy = Eigen::Vector3d::Zero();
+
+  ref.R = rpyToRotationMatrixZYX(ref.rpy);
+  return ref;
+}
+
+// ---------------- trajectory 2: Lissajous-like trajectory ----------------
+inline TaskRefZYX makeReferenceZYXLissajous(
+    double t,
+    const Eigen::Vector3d& p0,
+    const Eigen::Vector3d& rpy0) {
+  TaskRefZYX ref;
+
+  const double wt = 2.0 * M_PI * 0.25;  // 0.25 Hz
+  const double wr = 2.0 * M_PI * 0.20;  // 0.20 Hz
+
+  const double ph_px = 0.0;
+  const double ph_py = M_PI / 2.0;
+  const double ph_pz = 0.0;
+
+  const double ph_rx = 0.0;
+  const double ph_ry = M_PI / 3.0;
+  const double ph_rz = 2.0 * M_PI / 3.0;
+
+  const SmoothStartProfile ramp = makeSmoothStartProfile(t, kSmoothStartDuration);
+
+  // translational amplitudes
+  constexpr double Ax = 0.08;  // 8 cm
+  constexpr double Ay = 0.08;  // 8 cm
+  constexpr double Az = 0.04;  // 4 cm
+
+  // rotational amplitudes
+  constexpr double Aroll  = 0.06981317008;   // 4 deg
+  constexpr double Apitch = 0.05235987756;   // 3 deg
+  constexpr double Ayaw   = 0.08726646260;   // 5 deg
+
+  const Eigen::Vector3d p_base(
+      Ax * (std::sin(wt * t + ph_px) - std::sin(ph_px)),
+      Ay * (std::sin(wt * t + ph_py) - std::sin(ph_py)),
+      Az * (std::sin(0.5 * wt * t + ph_pz) - std::sin(ph_pz)));
+
+  const Eigen::Vector3d dp_base(
+      Ax * wt * std::cos(wt * t + ph_px),
+      Ay * wt * std::cos(wt * t + ph_py),
+      Az * 0.5 * wt * std::cos(0.5 * wt * t + ph_pz));
+
+  const Eigen::Vector3d ddp_base(
+      -Ax * wt * wt * std::sin(wt * t + ph_px),
+      -Ay * wt * wt * std::sin(wt * t + ph_py),
+      -Az * 0.25 * wt * wt * std::sin(0.5 * wt * t + ph_pz));
+
+  const Eigen::Vector3d rpy_base(
+      Aroll  * (std::sin(wr * t + ph_rx) - std::sin(ph_rx)),
+      Apitch * (std::sin(wr * t + ph_ry) - std::sin(ph_ry)),
+      Ayaw   * (std::sin(wr * t + ph_rz) - std::sin(ph_rz)));
+
+  const Eigen::Vector3d drpy_base(
+      Aroll  * wr * std::cos(wr * t + ph_rx),
+      Apitch * wr * std::cos(wr * t + ph_ry),
+      Ayaw   * wr * std::cos(wr * t + ph_rz));
+
+  const Eigen::Vector3d ddrpy_base(
+      -Aroll  * wr * wr * std::sin(wr * t + ph_rx),
+      -Apitch * wr * wr * std::sin(wr * t + ph_ry),
+      -Ayaw   * wr * wr * std::sin(wr * t + ph_rz));
+
+  ref.p = p0 + ramp.s * p_base;
+  ref.dp = ramp.ds * p_base + ramp.s * dp_base;
+  ref.ddp = ramp.dds * p_base + 2.0 * ramp.ds * dp_base + ramp.s * ddp_base;
+
+  ref.rpy = rpy0 + ramp.s * rpy_base;
+  ref.drpy = ramp.ds * rpy_base + ramp.s * drpy_base;
+  ref.ddrpy = ramp.dds * rpy_base + 2.0 * ramp.ds * drpy_base + ramp.s * ddrpy_base;
+
+  ref.R = rpyToRotationMatrixZYX(ref.rpy);
+  return ref;
+}
+
+inline TaskRefZYX makeReferenceZYX(
+    double t,
+    const Eigen::Vector3d& p0,
+    const Eigen::Vector3d& rpy0,
+    const ReferenceTrajectoryType traj_type) {
+  switch (traj_type) {
+    case ReferenceTrajectoryType::kLissajous:
+      return makeReferenceZYXLissajous(t, p0, rpy0);
+    case ReferenceTrajectoryType::kLine:
+    default:
+      return makeReferenceZYXLine(t, p0, rpy0);
+  }
+}
+
 inline void buildTaskReferenceFromSamePoseTrajectory(
     double t,
-    double dt,
     const Eigen::Vector3d& p0,
     const Eigen::Matrix3d& R0,
+    const ReferenceTrajectoryType traj_type,
     Eigen::Matrix<double, 6, 1>& r_d,
     Eigen::Matrix<double, 6, 1>& dr_d,
-    Eigen::Matrix<double, 6, 1>& ddr_d) {
-  const double h = std::max(dt, 1e-3);
-
-  const TaskRef6D ref = makeReference(t, p0, R0);
+    Eigen::Matrix<double, 6, 1>& ddr_d,
+    Eigen::Vector3d& desired_position_cur,
+    Eigen::Quaterniond& desired_orientation_cur) {
+  const Eigen::Vector3d rpy0 = rotationMatrixToRpy(R0);
+  const TaskRefZYX ref = makeReferenceZYX(t, p0, rpy0, traj_type);
 
   r_d.head<3>() = ref.p;
   dr_d.head<3>() = ref.dp;
   ddr_d.head<3>() = ref.ddp;
 
-  const Eigen::Vector3d rpy_cur = rotationMatrixToRpy(ref.R);
+  r_d.tail<3>() = ref.rpy;
+  dr_d.tail<3>() = ref.drpy;
+  ddr_d.tail<3>() = ref.ddrpy;
 
-  // 姿态部分：仍来自同一个 R_d(t)，这里只是映射到 rpy 坐标
-  Eigen::Vector3d rpy_prev, rpy_next, rpy_next2;
-
-  if (t < h) {
-    const TaskRef6D ref_next  = makeReference(t + h,     p0, R0);
-    const TaskRef6D ref_next2 = makeReference(t + 2.0 * h, p0, R0);
-
-    rpy_next  = rotationMatrixToRpy(ref_next.R);
-    rpy_next2 = rotationMatrixToRpy(ref_next2.R);
-
-    rpy_next  = unwrapToNearby(rpy_cur, rpy_next);
-    rpy_next2 = unwrapToNearby(rpy_next, rpy_next2);
-
-    r_d.tail<3>() = rpy_cur;
-    dr_d.tail<3>() = (rpy_next - rpy_cur) / h;
-    ddr_d.tail<3>() = (rpy_next2 - 2.0 * rpy_next + rpy_cur) / (h * h);
-  } else {
-    const TaskRef6D ref_prev = makeReference(t - h, p0, R0);
-    const TaskRef6D ref_next = makeReference(t + h, p0, R0);
-
-    rpy_prev = rotationMatrixToRpy(ref_prev.R);
-    rpy_next = rotationMatrixToRpy(ref_next.R);
-
-    rpy_prev = unwrapToNearby(rpy_cur, rpy_prev);
-    rpy_next = unwrapToNearby(rpy_cur, rpy_next);
-
-    r_d.tail<3>() = rpy_cur;
-    dr_d.tail<3>() = (rpy_next - rpy_prev) / (2.0 * h);
-    ddr_d.tail<3>() = (rpy_next - 2.0 * rpy_cur + rpy_prev) / (h * h);
-  }
+  desired_position_cur = ref.p;
+  desired_orientation_cur = Eigen::Quaterniond(ref.R);
+  desired_orientation_cur.normalize();
 }
 
 inline void buildConstantTaskReference(
@@ -323,13 +354,19 @@ inline void buildConstantTaskReference(
     const Eigen::Matrix3d& R0,
     Eigen::Matrix<double, 6, 1>& r_d,
     Eigen::Matrix<double, 6, 1>& dr_d,
-    Eigen::Matrix<double, 6, 1>& ddr_d) {
+    Eigen::Matrix<double, 6, 1>& ddr_d,
+    Eigen::Vector3d& desired_position_cur,
+    Eigen::Quaterniond& desired_orientation_cur) {
   r_d.setZero();
   dr_d.setZero();
   ddr_d.setZero();
 
   r_d.head<3>() = p0;
   r_d.tail<3>() = rotationMatrixToRpy(R0);
+
+  desired_position_cur = p0;
+  desired_orientation_cur = Eigen::Quaterniond(rpyToRotationMatrixZYX(r_d.tail<3>()));
+  desired_orientation_cur.normalize();
 }
 
 }  // namespace
@@ -386,11 +423,12 @@ Eigen::Matrix<double, 6, 7>
 CartesianImpedanceExampleController::computeAnalyticJacobian(
     const Eigen::Matrix<double, 6, 7>& J_geo,
     const Eigen::Vector3d& rpy) const {
-  Eigen::Matrix<double, 6, 6> T_inv = Eigen::Matrix<double, 6, 6>::Identity();
-  T_inv.bottomRightCorner<3, 3>() = worldOmegaToRpyRatesMatrix(rpy);
-  return T_inv * J_geo;
+  Matrix6d T = Matrix6d::Identity();
+  T.bottomRightCorner<3, 3>() = worldOmegaToRpyRatesMatrixZYX(rpy);
+  return T * J_geo;
 }
 
+// 保留定义，避免与你已有的 hpp 声明不匹配
 Eigen::Matrix<double, 6, 7>
 CartesianImpedanceExampleController::computeAnalyticJacobianDotNumerical(
     const Vector7d& q,
@@ -407,11 +445,11 @@ CartesianImpedanceExampleController::computeAnalyticJacobianDotNumerical(
   pinocchio::computeJointJacobians(pin_model_, data_now, q);
   pinocchio::updateFramePlacements(pin_model_, data_now);
 
-  Eigen::Matrix<double, 6, 7> J_geo_now = Eigen::Matrix<double, 6, 7>::Zero();
+  Matrix67d J_geo_now = Matrix67d::Zero();
   pinocchio::getFrameJacobian(
       pin_model_, data_now, ee_frame_id_, pinocchio::ReferenceFrame::WORLD, J_geo_now);
 
-  const Eigen::Matrix<double, 6, 7> J_r_now = computeAnalyticJacobian(J_geo_now, rpy);
+  const Matrix67d J_r_now = computeAnalyticJacobian(J_geo_now, rpy);
 
   pinocchio::forwardKinematics(pin_model_, data_next, q_next);
   pinocchio::computeJointJacobians(pin_model_, data_next, q_next);
@@ -420,11 +458,11 @@ CartesianImpedanceExampleController::computeAnalyticJacobianDotNumerical(
   const Eigen::Matrix3d R_next = data_next.oMf[ee_frame_id_].rotation();
   const Eigen::Vector3d rpy_next = rotationMatrixToRpy(R_next);
 
-  Eigen::Matrix<double, 6, 7> J_geo_next = Eigen::Matrix<double, 6, 7>::Zero();
+  Matrix67d J_geo_next = Matrix67d::Zero();
   pinocchio::getFrameJacobian(
       pin_model_, data_next, ee_frame_id_, pinocchio::ReferenceFrame::WORLD, J_geo_next);
 
-  const Eigen::Matrix<double, 6, 7> J_r_next = computeAnalyticJacobian(J_geo_next, rpy_next);
+  const Matrix67d J_r_next = computeAnalyticJacobian(J_geo_next, rpy_next);
 
   return (J_r_next - J_r_now) / safe_dt;
 }
@@ -435,15 +473,21 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   const double dt = std::max(period.seconds(), kMinDt);
   const double t = (this->get_node()->now() - start_time_).seconds();
 
-  // measured robot state always from native Franka state
+  const std::string reference_trajectory_type =
+      get_node()->get_parameter("reference_trajectory_type").as_string();
+  const ReferenceTrajectoryType traj_type =
+      parseReferenceTrajectoryType(reference_trajectory_type);
+
+  const bool use_franka_model_for_dynamics =
+      get_node()->get_parameter("use_franka_model_for_dynamics").as_bool();
+
+  // measured state
   Eigen::Map<const Vector7d> q(franka_robot_model_->getRobotState()->q.data());
   Eigen::Map<const Vector7d> dq(franka_robot_model_->getRobotState()->dq.data());
 
-  // desired reference anchor (must use the same EE frame as control/logging)
   const Eigen::Vector3d p0 = desired_position_;
   const Eigen::Matrix3d R0 = desired_orientation_.toRotationMatrix();
 
-  // desired task reference
   Vector6d r_d = Vector6d::Zero();
   Vector6d dr_d = Vector6d::Zero();
   Vector6d ddr_d = Vector6d::Zero();
@@ -453,27 +497,52 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   desired_orientation_cur.normalize();
 
   if (use_constant_reference_) {
-    buildConstantTaskReference(p0, R0, r_d, dr_d, ddr_d);
+    buildConstantTaskReference(
+        p0, R0, r_d, dr_d, ddr_d, desired_position_cur, desired_orientation_cur);
   } else {
-    buildTaskReferenceFromSamePoseTrajectory(t, dt, p0, R0, r_d, dr_d, ddr_d);
-
-    const TaskRef6D ref_pose = makeReference(t, p0, R0);
-    desired_position_cur = ref_pose.p;
-    desired_orientation_cur = Eigen::Quaterniond(ref_pose.R);
-    desired_orientation_cur.normalize();
+    buildTaskReferenceFromSamePoseTrajectory(
+        t, p0, R0, traj_type, r_d, dr_d, ddr_d, desired_position_cur, desired_orientation_cur);
   }
 
-  // Pinocchio kinematics + dynamics, all in one consistent model/frame
+  // Pinocchio kinematics + dynamics
   pinocchio::forwardKinematics(pin_model_, *pin_data_, q, dq);
   pinocchio::computeJointJacobians(pin_model_, *pin_data_, q);
+  pinocchio::computeJointJacobiansTimeVariation(pin_model_, *pin_data_, q, dq);
   pinocchio::updateFramePlacements(pin_model_, *pin_data_);
 
   pinocchio::crba(pin_model_, *pin_data_, q);
   pin_data_->M.template triangularView<Eigen::StrictlyLower>() =
       pin_data_->M.transpose().template triangularView<Eigen::StrictlyLower>();
 
-  const Matrix7d C = pinocchio::computeCoriolisMatrix(pin_model_, *pin_data_, q, dq);
-  const Matrix7d M = pin_data_->M;
+  // Pinocchio quantities are always available
+  const Matrix7d M_pin = pin_data_->M;
+  const Matrix7d C_pin = pinocchio::computeCoriolisMatrix(pin_model_, *pin_data_, q, dq);
+
+  // Hybrid model selection:
+  // - Use libfranka/franka_semantic_components mass/coriolis if available
+  // - Fall back to Pinocchio otherwise
+  // - Keep Pinocchio Coriolis matrix for screenshot-like C(q,dq) * dq_ref term
+  Matrix7d M_model = M_pin;
+  Vector7d coriolis_current_vec = C_pin * dq;  // default fallback
+  bool using_franka_dynamics = false;
+
+  if (use_franka_model_for_dynamics) {
+    try {
+      M_model = arrayToMatrix7d(franka_robot_model_->getMassMatrix());
+      coriolis_current_vec = arrayToVector7d(franka_robot_model_->getCoriolisForceVector());
+      using_franka_dynamics = true;
+    } catch (const std::exception& e) {
+      RCLCPP_WARN_THROTTLE(
+          get_node()->get_logger(),
+          *get_node()->get_clock(),
+          2000,
+          "Failed to read Franka dynamics model, falling back to Pinocchio: %s",
+          e.what());
+      M_model = M_pin;
+      coriolis_current_vec = C_pin * dq;
+      using_franka_dynamics = false;
+    }
+  }
 
   const Eigen::Vector3d p = pin_data_->oMf[ee_frame_id_].translation();
   const Eigen::Matrix3d R = pin_data_->oMf[ee_frame_id_].rotation();
@@ -484,15 +553,30 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
 
   const Vector6d r = computeTaskPose(R, p);
 
-  Eigen::Matrix<double, 6, 7> J_geo = Eigen::Matrix<double, 6, 7>::Zero();
+  // geometric Jacobian and its time variation
+  Matrix67d J_geo = Matrix67d::Zero();
+  Matrix67d J_geo_dot = Matrix67d::Zero();
+
   pinocchio::getFrameJacobian(
       pin_model_, *pin_data_, ee_frame_id_, pinocchio::ReferenceFrame::WORLD, J_geo);
 
-  const Eigen::Matrix<double, 6, 7> J_r = computeAnalyticJacobian(J_geo, r.tail<3>());
-  const Eigen::Matrix<double, 6, 7> J_r_dot =
-      computeAnalyticJacobianDotNumerical(q, dq, r.tail<3>(), dt);
+  pinocchio::getFrameJacobianTimeVariation(
+      pin_model_, *pin_data_, ee_frame_id_, pinocchio::ReferenceFrame::WORLD, J_geo_dot);
 
+  const Eigen::Matrix3d Tinv = worldOmegaToRpyRatesMatrixZYX(r.tail<3>());
+  Matrix6d T = Matrix6d::Identity();
+  T.bottomRightCorner<3, 3>() = Tinv;
+
+  const Matrix67d J_r = T * J_geo;
   const Vector6d dr = J_r * dq;
+
+  const Eigen::Matrix3d Tinv_dot =
+      worldOmegaToRpyRatesMatrixDotZYX(r.tail<3>(), dr.tail<3>());
+  Matrix6d Tdot = Matrix6d::Zero();
+  Tdot.bottomRightCorner<3, 3>() = Tinv_dot;
+
+  const Matrix67d J_r_dot = Tdot * J_geo + T * J_geo_dot;
+
   const Eigen::Vector3d desired_rpy = r_d.tail<3>();
   const Eigen::Vector3d current_rpy = r.tail<3>();
   const double task_velocity_norm = dr.norm();
@@ -502,11 +586,22 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   e.tail<3>() = wrapEulerError(e.tail<3>());
   const Vector6d de = dr_d - dr;
 
-  const Eigen::Matrix<double, 7, 6> J_r_pinv = dampedRightPseudoInverse(J_r);
+  // dynamically consistent right inverse and task-space inertia inverse
+  const Matrix76d M_inv_JT = M_model.ldlt().solve(J_r.transpose());
 
-  // zero-tracking-error style reference joint motion:
-  // qdot_r = J# * rdot_d
-  // qddot_r = J# * (rddot_d - Jdot * qdot_r)
+  Matrix6d lambda_inv = J_r * M_inv_JT;
+  lambda_inv.diagonal().array() += kDynInvReg;
+
+  const Matrix76d J_r_pinv =
+      M_inv_JT * lambda_inv.ldlt().solve(Matrix6d::Identity());
+
+  const Matrix6d task_projection = J_r * J_r_pinv;
+  const double pinv_projection_error_norm =
+      (task_projection - Matrix6d::Identity()).norm();
+
+  // Screenshot-like reference realization:
+  // qdot_ref = J_r^{-1} rdot_d
+  // qddot_ref = J_r^{-1} (rddot_d - Jdot_r qdot_ref)
   const Vector7d dq_ref = J_r_pinv * dr_d;
   const Vector7d ddq_ref = J_r_pinv * (ddr_d - J_r_dot * dq_ref);
 
@@ -516,41 +611,74 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   const double vel_residual_norm = vel_residual.norm();
   const double acc_residual_norm = acc_residual.norm();
 
-  const Eigen::Matrix<double, 6, 6> task_projection =
-      J_r * J_r_pinv;
-  const double pinv_projection_error_norm =
-      (task_projection - Eigen::Matrix<double, 6, 6>::Identity()).norm();
-
-  // nonlinear impedance law matching the slide structure:
-  // tau = M(q) qddot_r + C(q,dq) qdot_r + J^T [ D (rdot_d-rdot) + K (r_d-r) ]
-  // NOTE: gravity is NOT added here because the effort interface already compensates gravity.
-  Vector7d tau_impedance =
+  // impedance-like task feedback wrench (kept for logging / comparison branch)
+  const Vector7d tau_impedance =
       J_r.transpose() * (D_m_ * de + K_m_ * e);
 
-  Vector7d tau_ff =
-      M * ddq_ref +
-      C * dq_ref;
-
-  Vector7d tau = tau_impedance;
-
-  if (use_nonlinear_feedforward_) {
-    tau += tau_ff;
-  }
-
-  // torque-space nullspace projector
+  // ------------------------------------------------------------
+  // Branch A: impedance torque form (comparison branch)
+  // ------------------------------------------------------------
   const Matrix7d N_tau =
       Matrix7d::Identity() - J_r.transpose() * J_r_pinv.transpose();
 
-  const Vector7d tau_null =
-      N_tau * (n_stiffness_ * (desired_qn_ - q) - 2.0 * std::sqrt(n_stiffness_) * dq);
+  const Vector7d tau_null_impedance =
+      N_tau * (n_stiffness_ * (desired_qn_ - q) -
+               2.0 * std::sqrt(n_stiffness_) * dq);
 
-  tau += tau_null;
+  // Current-velocity Coriolis term for the comparison branch
+  const Vector7d tau_impedance_total =
+      tau_impedance + coriolis_current_vec + tau_null_impedance;
+
+  // ------------------------------------------------------------
+  // Branch B: nonlinear model-based law, implemented to be
+  // as close as possible to the screenshot:
+  //
+  // tau = M(q) qdd_ref + C(q,dq) qd_ref
+  //       + J_r^T [ D_m (rd_d - rd) + K_m (r_d - r) ]
+  //
+  // Gravity is NOT added here because the effort interface already
+  // provides gravity compensation at the low level.
+  // ------------------------------------------------------------
+
+  // For screenshot alignment, this term should be C(q,dq) * qdot_ref.
+  // libfranka semantic component usually exposes the Coriolis vector
+  // c(q,dq), not the full C(q,dq) matrix, so we keep Pinocchio here.
+  const Vector7d coriolis_ref_vec = C_pin * dq_ref;
+
+  const Vector7d tau_task_id =
+      M_model * ddq_ref + coriolis_ref_vec + tau_impedance;
+
+  const Vector7d tau_id_total =
+      tau_task_id + tau_null_impedance;
+
+  const Vector7d tau_null_id = tau_null_impedance;
+
+  // keep same variable name for logging compatibility
+  const Vector7d tau_ff = tau_id_total;
+
+  Vector7d tau = tau_impedance_total;
+  Vector7d tau_null = tau_null_impedance;
+
+  if (use_nonlinear_feedforward_) {
+    tau = tau_id_total;
+    tau_null = tau_null_id;
+  }
 
   const double tau_norm = tau.norm();
-
   const double tau_impedance_norm = tau_impedance.norm();
   const double tau_ff_norm = tau_ff.norm();
   const double tau_null_norm = tau_null.norm();
+
+  const double dq_ref_norm = dq_ref.norm();
+  const double ddq_ref_norm = ddq_ref.norm();
+  const double J_r_dot_norm = J_r_dot.norm();
+  const double M_norm = M_model.norm();
+  const double C_norm = C_pin.norm();
+
+  // useful extra diagnostics for analysis / papers
+  const double coriolis_current_norm = coriolis_current_vec.norm();
+  const double coriolis_ref_norm = coriolis_ref_vec.norm();
+  const int using_franka_dynamics_int = using_franka_dynamics ? 1 : 0;
 
   for (int i = 0; i < kNumJoints; ++i) {
     command_interfaces_[i].set_value(tau(i));
@@ -596,6 +724,14 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
         << tau_impedance_norm << ","
         << tau_ff_norm << ","
         << tau_null_norm << ","
+        << dq_ref_norm << ","
+        << ddq_ref_norm << ","
+        << J_r_dot_norm << ","
+        << M_norm << ","
+        << C_norm << ","
+        << coriolis_current_norm << ","
+        << coriolis_ref_norm << ","
+        << using_franka_dynamics_int << ","
         << (use_nonlinear_feedforward_ ? 1 : 0) << ","
         << tau_norm
         << "\n";
@@ -606,6 +742,7 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
     }
   }
 
+  (void)dt;
   return controller_interface::return_type::OK;
 }
 
@@ -615,6 +752,8 @@ CallbackReturn CartesianImpedanceExampleController::on_init() {
     auto_declare<bool>("enable_error_logging", false);
     auto_declare<bool>("use_constant_reference", true);
     auto_declare<bool>("use_nonlinear_feedforward", true);
+    auto_declare<bool>("use_franka_model_for_dynamics", true);
+    auto_declare<std::string>("reference_trajectory_type", "lissajous"); //line lissajous
     auto_declare<std::string>(
         "error_log_path",
         "/home/developer/multipanda_ws/src/data_log/cartesian_pose_error.csv");
@@ -634,7 +773,8 @@ CallbackReturn CartesianImpedanceExampleController::on_configure(
   try {
     arm_id_ = get_node()->get_parameter("arm_id").as_string();
     use_constant_reference_ = get_node()->get_parameter("use_constant_reference").as_bool();
-    use_nonlinear_feedforward_ = get_node()->get_parameter("use_nonlinear_feedforward").as_bool();
+    use_nonlinear_feedforward_ =
+        get_node()->get_parameter("use_nonlinear_feedforward").as_bool();
     enable_error_logging_ = get_node()->get_parameter("enable_error_logging").as_bool();
     error_log_path_ = get_node()->get_parameter("error_log_path").as_string();
     urdf_model_path_ = get_node()->get_parameter("urdf_model_path").as_string();
@@ -685,11 +825,9 @@ CallbackReturn CartesianImpedanceExampleController::on_activate(
   franka_robot_model_->assign_loaned_state_interfaces(state_interfaces_);
   start_time_ = this->get_node()->now();
 
-  // measured q from native state
   const Eigen::Map<const Vector7d> q(franka_robot_model_->getRobotState()->q.data());
   desired_qn_ = q;
 
-  // initialize desired anchor using the SAME Pinocchio EE frame as control/logging
   pinocchio::forwardKinematics(pin_model_, *pin_data_, q);
   pinocchio::updateFramePlacements(pin_model_, *pin_data_);
 
@@ -697,7 +835,6 @@ CallbackReturn CartesianImpedanceExampleController::on_activate(
   desired_orientation_ = Quaterniond(pin_data_->oMf[ee_frame_id_].rotation());
   desired_orientation_.normalize();
 
-  // same stiffness settings as base impedance controller
   const double pos_stiff = 400.0;
   const double rot_stiff = 20.0;
 
@@ -711,7 +848,6 @@ CallbackReturn CartesianImpedanceExampleController::on_activate(
   D_m_.bottomRightCorner<3, 3>() =
       0.8 * 2.0 * std::sqrt(rot_stiff) * Matrix3d::Identity();
 
-  // first debug the main task controller without nullspace interference
   n_stiffness_ = 0.0;
   log_write_counter_ = 0;
 
@@ -745,6 +881,8 @@ CallbackReturn CartesianImpedanceExampleController::on_activate(
         << "task_velocity_norm,vel_residual_norm,acc_residual_norm,"
         << "pinv_projection_error_norm,"
         << "tau_impedance_norm,tau_ff_norm,tau_null_norm,"
+        << "dq_ref_norm,ddq_ref_norm,J_r_dot_norm,M_norm,C_norm,"
+        << "coriolis_current_norm,coriolis_ref_norm,using_franka_dynamics,"
         << "use_nonlinear_feedforward,tau_norm\n";
 
     RCLCPP_INFO(get_node()->get_logger(),
