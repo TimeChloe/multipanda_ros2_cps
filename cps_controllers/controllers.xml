@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<library path="cps_controllers">
+  <class name="cps_controllers/JointImpedanceEnergyBudgetController"
+         type="cps_controllers::JointImpedanceEnergyBudgetController"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Joint-space impedance controller that enforces an energy budget (Lachner et al. 2021).
+    </description>
+  </class>
+
+  <class name="cps_controllers/ReachableCartesianImpedanceController"
+         type="cps_controllers::ReachableCartesianImpedanceController"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Validation-oriented Cartesian impedance controller with nominal/failsafe modes,
+      reference freezing, safety monitor, and logging.
+    </description>
+  </class>
+</library>
