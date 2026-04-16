@@ -9,7 +9,7 @@
 //
 // Features
 // --------
-// 1) Nominal / failsafe mode
+// 1) Per-cycle nominal / failsafe safety filter
 // 2) Freeze current reference when entering failsafe
 // 3) Reference trajectory switch:
 //      - constant
@@ -19,17 +19,21 @@
 //      - future nominal contact energy uses predicted contact-time normal velocity
 //      - scans all candidate times within the nominal horizon
 //      - computes worst-case hybrid forward reach = nominal progress + failsafe tail reach
+// 5) Energy-aware monitor upgrade:
+//      - h_geom = d - Delta_max
+//      - h_nominal_energy = E_safe - Tn_contact_nominal
+//      - h_failsafe_energy = E_safe - E_fs_worst
+//      - current failsafe storage V_fs and finite-difference derivative
+// 6) Safety filter with hysteresis:
+//      - enter failsafe if predicted_trigger == true
+//      - return to nominal if hysteresis conditions are satisfied
+//      - no minimum dwell time
+// 7) Nominal-time pause during failsafe:
+//      - nominal trajectory time is frozen while in failsafe
 //
 // Controller law
 // --------------
 // tau = J^T(-K e - D v) + coriolis + tau_null
-//
-// Notes
-// -----
-// - This is a validation controller, not a final certified implementation.
-// - The monitor is end-effector dominant and uses a static human plane model.
-// - The failsafe reachable set is currently approximated along the plane normal
-//   using a conservative 1D bound.
 
 #include <algorithm>
 #include <array>
@@ -80,11 +84,6 @@ enum class ReferenceTrajectoryType {
   kConstant
 };
 
-enum class SafetyMode {
-  kNominal = 0,
-  kFailsafe = 1
-};
-
 struct SmoothStartProfile {
   double s{0.0};
   double ds{0.0};
@@ -96,42 +95,6 @@ struct TaskRefPose {
   Vector3d dp{Vector3d::Zero()};
   Vector3d ddp{Vector3d::Zero()};
   Matrix3d R{Matrix3d::Identity()};
-};
-
-struct MonitorResult {
-  bool contact_possible_nominal{false};
-  bool contact_possible_hybrid{false};
-  bool unsafe_contact_nominal{false};
-  bool unsafe_contact_hybrid{false};
-  bool predicted_trigger{false};
-
-  double plane_distance_now{std::numeric_limits<double>::infinity()};
-  double plane_distance_min_nominal{std::numeric_limits<double>::infinity()};
-
-  double m_eff_n{0.0};
-  double v_n_now{0.0};
-  double Tn_now{0.0};
-  double v_safe{0.0};
-
-  // First predicted nominal contact sample
-  bool nominal_contact_sample_found{false};
-  double nominal_contact_time{0.0};
-  double nominal_contact_distance{std::numeric_limits<double>::infinity()};
-  double v_n_contact_nominal{0.0};
-  double Tn_contact_nominal{0.0};
-
-  // Worst-case hybrid candidate over the whole future horizon
-  bool worst_case_candidate_found{false};
-  double worst_case_candidate_time{0.0};
-  double worst_case_plane_distance_at_candidate{std::numeric_limits<double>::infinity()};
-  double worst_case_nominal_forward_progress{0.0};
-  double worst_case_e_n{0.0};
-  double worst_case_v_n{0.0};
-  double worst_case_E_fs_1d{0.0};
-  double worst_case_tau_safe{0.0};
-  double worst_case_delta_n_fs{0.0};
-  double worst_case_hybrid_forward_reach{0.0};
-  double worst_case_plane_margin_after_hybrid{std::numeric_limits<double>::infinity()};
 };
 
 inline ReferenceTrajectoryType parseReferenceTrajectoryType(const std::string& name) {
@@ -166,8 +129,8 @@ inline SmoothStartProfile makeSmoothStartProfile(double t, double T) {
   return out;
 }
 
-inline ReferenceTrajectoryType parseTrajectoryTypeOrDefault(bool use_constant_reference,
-                                                            const std::string& name) {
+inline ReferenceTrajectoryType parseTrajectoryTypeOrDefault(
+    bool use_constant_reference, const std::string& name) {
   if (use_constant_reference) {
     return ReferenceTrajectoryType::kConstant;
   }
@@ -180,7 +143,7 @@ inline TaskRefPose makeReferenceLine(double t,
                                      const Matrix3d& R0) {
   TaskRefPose ref;
 
-  constexpr double T_move = 8.0;
+  constexpr double T_move = 3.0;
   constexpr double dz = -0.55;
 
   const SmoothStartProfile ramp = makeSmoothStartProfile(t, T_move);
@@ -238,15 +201,14 @@ inline TaskRefPose makeReferencePose(double t,
   switch (traj_type) {
     case ReferenceTrajectoryType::kLissajous:
       return makeReferenceLissajous(t, p0, R0);
-    case ReferenceTrajectoryType::kConstant:
-      {
-        TaskRefPose ref;
-        ref.p = p0;
-        ref.dp.setZero();
-        ref.ddp.setZero();
-        ref.R = R0;
-        return ref;
-      }
+    case ReferenceTrajectoryType::kConstant: {
+      TaskRefPose ref;
+      ref.p = p0;
+      ref.dp.setZero();
+      ref.ddp.setZero();
+      ref.R = R0;
+      return ref;
+    }
     case ReferenceTrajectoryType::kLine:
     default:
       return makeReferenceLine(t, p0, R0);
@@ -340,18 +302,38 @@ void ReachableCartesianImpedanceController::enterFailsafe(
 
   mode_ = SafetyMode::kFailsafe;
   failsafe_start_time_sec_ = t_now;
+  failsafe_enter_wall_time_sec_ = t_now;
 
-  // Freeze current reference
   frozen_desired_position_ = desired_position_cur;
   frozen_desired_orientation_ = desired_orientation_cur;
   frozen_desired_orientation_.normalize();
+
+  prev_V_fs_valid_ = false;
 
   RCLCPP_WARN(get_node()->get_logger(),
               "Entering failsafe: reference frozen at t = %.6f s", t_now);
 }
 
+void ReachableCartesianImpedanceController::leaveFailsafe(double t_now) {
+  if (mode_ == SafetyMode::kNominal) {
+    return;
+  }
+
+  if (failsafe_enter_wall_time_sec_ >= 0.0) {
+    paused_nominal_time_sec_ += std::max(0.0, t_now - failsafe_enter_wall_time_sec_);
+  }
+
+  mode_ = SafetyMode::kNominal;
+  prev_V_fs_valid_ = false;
+  failsafe_enter_wall_time_sec_ = -1.0;
+
+  RCLCPP_INFO(get_node()->get_logger(),
+              "Returning to nominal mode at t = %.6f s (paused_nominal_time=%.6f s)",
+              t_now, paused_nominal_time_sec_);
+}
+
 void ReachableCartesianImpedanceController::buildReference(
-    double t,
+    double nominal_time,
     Vector3d& desired_position_cur,
     Quaterniond& desired_orientation_cur,
     Vector3d& desired_linear_velocity_cur,
@@ -371,7 +353,7 @@ void ReachableCartesianImpedanceController::buildReference(
   const auto traj_type =
       parseTrajectoryTypeOrDefault(use_constant_reference_, reference_trajectory_type_);
 
-  const TaskRefPose ref = makeReferencePose(t, p0, R0, traj_type);
+  const TaskRefPose ref = makeReferencePose(nominal_time, p0, R0, traj_type);
 
   desired_position_cur = ref.p;
   desired_orientation_cur = Quaterniond(ref.R);
@@ -392,6 +374,7 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
     const Matrix37d& Jv,
     const Vector3d& plane_normal,
     const Vector3d& plane_point) {
+  (void)dt;
   MonitorResult out;
 
   const Vector3d n = plane_normal.normalized();
@@ -404,7 +387,7 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
   lambda_v_inv.diagonal().array() += kLambdaReg;
   const Matrix3d lambda_v = lambda_v_inv.inverse();
 
-  const double denom = n.transpose() * lambda_v_inv * n;
+  const double denom = (n.transpose() * lambda_v_inv * n)(0, 0);
   out.m_eff_n = 1.0 / std::max(denom, kSmallPositive);
 
   out.v_n_now = n.dot(v0);
@@ -416,19 +399,24 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
   out.plane_distance_min_nominal = out.plane_distance_now;
 
   const int N = std::max(1, monitor_nominal_steps_);
-  const double h = std::max(monitor_nominal_horizon_sec_ / static_cast<double>(N), dt);
+  const double h = std::max(monitor_nominal_horizon_sec_ / static_cast<double>(N), kMinDt);
 
   Vector3d x_pred = x0;
   Vector3d v_pred = v0;
 
   double worst_hybrid_forward_reach = -std::numeric_limits<double>::infinity();
 
+  const double k_n_fs =
+      std::max((n.transpose() * K_f_target_.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
+  const double d_n_fs =
+      std::max((n.transpose() * D_f_target_.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
+
   for (int i = 0; i < N; ++i) {
     const double t_i = t + static_cast<double>(i) * h;
+    (void)t_i;
 
     const Vector3d e_nom = desired_position_cur - x_pred;
 
-    // First-version local translational surrogate nominal model
     const Vector3d a_pred =
         ad + lambda_v *
                  (K_runtime_.topLeftCorner<3, 3>() * e_nom +
@@ -442,8 +430,6 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
 
     out.plane_distance_min_nominal = std::min(out.plane_distance_min_nominal, d_plane_next);
 
-    // Predicted first nominal contact sample:
-    // compare FUTURE contact-time normal energy, not current-time energy.
     if (!out.nominal_contact_sample_found && d_plane_pred > 0.0 && d_plane_next <= 0.0) {
       const double alpha =
           std::clamp(d_plane_pred / std::max(d_plane_pred - d_plane_next, kSmallPositive),
@@ -458,13 +444,6 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
       out.v_n_contact_nominal = v_n_contact;
       out.Tn_contact_nominal = 0.5 * out.m_eff_n * v_n_contact * v_n_contact;
     }
-
-    // For each future candidate time, compute:
-    // hybrid forward reach = nominal forward progress + failsafe tail reach
-    const double k_n_fs =
-        std::max((n.transpose() * K_f_target_.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
-    const double d_n_fs =
-        std::max((n.transpose() * D_f_target_.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
 
     const double e_n_i = n.dot(x_pred - desired_position_cur);
     const double v_n_i = n.dot(v_pred);
@@ -524,15 +503,32 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
       out.worst_case_candidate_found &&
       (out.worst_case_plane_margin_after_hybrid <= 0.0);
 
+  out.h_geom = out.worst_case_plane_margin_after_hybrid;
+
+  if (out.nominal_contact_sample_found) {
+    out.h_nominal_energy =
+        safe_collision_energy_joule_ - out.Tn_contact_nominal;
+  } else {
+    out.h_nominal_energy = std::numeric_limits<double>::infinity();
+  }
+
+  if (out.worst_case_candidate_found) {
+    out.h_failsafe_energy =
+        safe_collision_energy_joule_ - out.worst_case_E_fs_1d;
+  } else {
+    out.h_failsafe_energy = std::numeric_limits<double>::infinity();
+  }
+
   out.unsafe_contact_nominal =
       out.nominal_contact_sample_found &&
-      (out.Tn_contact_nominal > safe_collision_energy_joule_);
+      (out.h_nominal_energy < 0.0);
 
   out.unsafe_contact_hybrid =
-      out.contact_possible_hybrid &&
-      (out.worst_case_E_fs_1d > safe_collision_energy_joule_);
+      (out.h_failsafe_energy < 0.0) &&
+      (out.h_geom < 0.0);
 
-  out.predicted_trigger = out.unsafe_contact_nominal || out.unsafe_contact_hybrid;
+  out.predicted_trigger =
+      out.unsafe_contact_nominal || out.unsafe_contact_hybrid;
 
   return out;
 }
@@ -543,7 +539,13 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   const auto tic_total = Clock::now();
 
   const double dt = std::max(period.seconds(), kMinDt);
-  const double t = (this->get_node()->now() - start_time_).seconds();
+  const double wall_time = (this->get_node()->now() - start_time_).seconds();
+
+  double nominal_time = wall_time - paused_nominal_time_sec_;
+  if (mode_ == SafetyMode::kFailsafe && failsafe_enter_wall_time_sec_ >= 0.0) {
+    nominal_time = failsafe_enter_wall_time_sec_ - paused_nominal_time_sec_;
+  }
+  nominal_time = std::max(0.0, nominal_time);
 
   const Eigen::Map<const Vector7d> q(franka_robot_model_->getRobotState()->q.data());
   const Eigen::Map<const Vector7d> dq(franka_robot_model_->getRobotState()->dq.data());
@@ -569,7 +571,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   Vector3d desired_linear_velocity_cur = Vector3d::Zero();
   Vector3d desired_linear_acceleration_cur = Vector3d::Zero();
 
-  buildReference(t,
+  buildReference(nominal_time,
                  desired_position_cur,
                  desired_orientation_cur,
                  desired_linear_velocity_cur,
@@ -585,7 +587,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   if (enable_safety_monitor_) {
     const Matrix37d Jv = J_geo.topRows<3>();
     monitor = runSafetyMonitor(dt,
-                               t,
+                               wall_time,
                                current_position,
                                desired_position_cur,
                                ee_twist,
@@ -596,19 +598,83 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                                human_plane_normal_,
                                human_plane_point_);
 
-    if (monitor.predicted_trigger && auto_enter_failsafe_) {
-      enterFailsafe(t, desired_position_cur, desired_orientation_cur);
+    if (auto_enter_failsafe_) {
+      if (mode_ == SafetyMode::kNominal) {
+        if (monitor.predicted_trigger) {
+          enterFailsafe(wall_time, desired_position_cur, desired_orientation_cur);
 
-      buildReference(t,
-                     desired_position_cur,
-                     desired_orientation_cur,
-                     desired_linear_velocity_cur,
-                     desired_linear_acceleration_cur);
+          buildReference(nominal_time,
+                         desired_position_cur,
+                         desired_orientation_cur,
+                         desired_linear_velocity_cur,
+                         desired_linear_acceleration_cur);
 
-      error.head<3>() = current_position - desired_position_cur;
-      error.tail<3>() = computeOrientationError(current_orientation, desired_orientation_cur);
+          error.head<3>() = current_position - desired_position_cur;
+          error.tail<3>() =
+              computeOrientationError(current_orientation, desired_orientation_cur);
+        }
+      } else {
+        const bool can_return_to_nominal =
+            (monitor.h_geom > return_to_nominal_geom_margin_) &&
+            (monitor.h_failsafe_energy > return_to_nominal_energy_margin_) &&
+            (monitor.h_nominal_energy > return_to_nominal_energy_margin_);
+
+        if (can_return_to_nominal) {
+          leaveFailsafe(wall_time);
+
+          nominal_time = std::max(0.0, wall_time - paused_nominal_time_sec_);
+
+          buildReference(nominal_time,
+                         desired_position_cur,
+                         desired_orientation_cur,
+                         desired_linear_velocity_cur,
+                         desired_linear_acceleration_cur);
+
+          error.head<3>() = current_position - desired_position_cur;
+          error.tail<3>() =
+              computeOrientationError(current_orientation, desired_orientation_cur);
+        }
+      }
     }
   }
+
+  {
+    const Vector3d n = human_plane_normal_.normalized();
+    const double k_n_fs =
+        std::max((n.transpose() * K_f_target_.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
+
+    const double e_n_now_fs = n.dot(current_position - desired_position_cur);
+    const double v_n_now_fs = n.dot(ee_twist.head<3>());
+
+    const double V_fs_now =
+        0.5 * monitor.m_eff_n * v_n_now_fs * v_n_now_fs +
+        0.5 * k_n_fs * e_n_now_fs * e_n_now_fs;
+
+    monitor.e_n_now_fs = e_n_now_fs;
+    monitor.v_n_now_fs = v_n_now_fs;
+    monitor.V_fs_now = V_fs_now;
+
+    if (mode_ == SafetyMode::kFailsafe) {
+      if (prev_V_fs_valid_) {
+        monitor.V_fs_dot_est = (V_fs_now - prev_V_fs_) / std::max(dt, kMinDt);
+      } else {
+        monitor.V_fs_dot_est = 0.0;
+      }
+      prev_V_fs_ = V_fs_now;
+      prev_V_fs_valid_ = true;
+    } else {
+      monitor.V_fs_dot_est = 0.0;
+      prev_V_fs_valid_ = false;
+    }
+
+    last_e_n_fs_ = e_n_now_fs;
+    last_v_n_fs_ = v_n_now_fs;
+  }
+
+  updateRuntimeGains(dt);
+
+  error.head<3>() = current_position - desired_position_cur;
+  error.tail<3>() = computeOrientationError(current_orientation, desired_orientation_cur);
 
   const Vector7d tau_task =
       J_geo.transpose() * (-K_runtime_ * error - D_runtime_ * ee_twist);
@@ -632,7 +698,9 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
   if (enable_error_logging_ && error_log_file_.is_open()) {
     error_log_file_ << std::fixed << std::setprecision(9)
-                    << t << ","
+                    << wall_time << ","
+                    << nominal_time << ","
+                    << paused_nominal_time_sec_ << ","
                     << static_cast<int>(mode_) << ","
                     << desired_position_cur(0) << "," << desired_position_cur(1) << ","
                     << desired_position_cur(2) << ","
@@ -646,7 +714,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                     << error(3) << "," << error(4) << "," << error(5) << ","
                     << tau_task.norm() << ","
                     << tau_nullspace_eff.norm() << ","
-                    << 0.0 << ","  // tau_friction_norm
+                    << 0.0 << ","
                     << tau_cmd.norm() << ","
                     << K_runtime_(0, 0) << "," << K_runtime_(1, 1) << "," << K_runtime_(2, 2)
                     << ","
@@ -674,6 +742,13 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                     << monitor.worst_case_delta_n_fs << ","
                     << monitor.worst_case_hybrid_forward_reach << ","
                     << monitor.worst_case_plane_margin_after_hybrid << ","
+                    << monitor.h_geom << ","
+                    << monitor.h_nominal_energy << ","
+                    << monitor.h_failsafe_energy << ","
+                    << monitor.e_n_now_fs << ","
+                    << monitor.v_n_now_fs << ","
+                    << monitor.V_fs_now << ","
+                    << monitor.V_fs_dot_est << ","
                     << static_cast<int>(monitor.contact_possible_nominal) << ","
                     << static_cast<int>(monitor.contact_possible_hybrid) << ","
                     << static_cast<int>(monitor.unsafe_contact_nominal) << ","
@@ -736,6 +811,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
 
     auto_declare<bool>("enable_safety_monitor", true);
     auto_declare<bool>("auto_enter_failsafe", false);
+
     auto_declare<double>("safe_collision_energy_joule", 0.10);
     auto_declare<double>("ee_collision_radius", 0.04);
     auto_declare<double>("monitor_nominal_horizon_sec", 0.02);
@@ -745,6 +821,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
         "human_plane_normal", std::vector<double>{0.0, 0.0, 1.0});
     auto_declare<std::vector<double>>(
         "human_plane_point", std::vector<double>{0.0, 0.0, 0.2});
+
+    auto_declare<double>("return_to_nominal_geom_margin", 0.005);
+    auto_declare<double>("return_to_nominal_energy_margin", 0.02);
 
     auto_declare<int>("profiling_stats_print_period", 1000);
   } catch (const std::exception& e) {
@@ -785,6 +864,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
 
     enable_safety_monitor_ = get_node()->get_parameter("enable_safety_monitor").as_bool();
     auto_enter_failsafe_ = get_node()->get_parameter("auto_enter_failsafe").as_bool();
+
     safe_collision_energy_joule_ =
         get_node()->get_parameter("safe_collision_energy_joule").as_double();
     ee_collision_radius_ = get_node()->get_parameter("ee_collision_radius").as_double();
@@ -792,6 +872,11 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         get_node()->get_parameter("monitor_nominal_horizon_sec").as_double();
     monitor_nominal_steps_ =
         static_cast<int>(get_node()->get_parameter("monitor_nominal_steps").as_int());
+
+    return_to_nominal_geom_margin_ =
+        get_node()->get_parameter("return_to_nominal_geom_margin").as_double();
+    return_to_nominal_energy_margin_ =
+        get_node()->get_parameter("return_to_nominal_energy_margin").as_double();
 
     const auto normal_vec =
         get_node()->get_parameter("human_plane_normal").as_double_array();
@@ -875,12 +960,19 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
 
   mode_ = SafetyMode::kNominal;
   failsafe_start_time_sec_ = -1.0;
+  failsafe_enter_wall_time_sec_ = -1.0;
+  paused_nominal_time_sec_ = 0.0;
 
   loop_counter_ = 0;
   exec_sum_ms_ = 0.0;
   exec_min_ms_ = 1e9;
   exec_max_ms_ = 0.0;
   log_write_counter_ = 0;
+
+  prev_V_fs_ = 0.0;
+  prev_V_fs_valid_ = false;
+  last_e_n_fs_ = 0.0;
+  last_v_n_fs_ = 0.0;
 
   if (enable_error_logging_) {
     error_log_file_.open(error_log_path_, std::ios::out | std::ios::trunc);
@@ -892,7 +984,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
 
     error_log_file_ << std::fixed << std::setprecision(9);
     error_log_file_
-        << "time_sec,mode,"
+        << "wall_time_sec,nominal_time_sec,paused_nominal_time_sec,mode,"
         << "des_px,des_py,des_pz,cur_px,cur_py,cur_pz,"
         << "cur_vx,cur_vy,cur_vz,cur_wx,cur_wy,cur_wz,des_vx,des_vy,des_vz,"
         << "err_px,err_py,err_pz,err_rx,err_ry,err_rz,"
@@ -906,6 +998,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "worst_case_nominal_forward_progress,worst_case_e_n,worst_case_v_n,"
         << "worst_case_E_fs_1d,worst_case_tau_safe,worst_case_delta_n_fs,"
         << "worst_case_hybrid_forward_reach,worst_case_plane_margin_after_hybrid,"
+        << "h_geom,h_nominal_energy,h_failsafe_energy,"
+        << "e_n_now_fs,v_n_now_fs,V_fs_now,V_fs_dot_est,"
         << "contact_possible_nominal,contact_possible_hybrid,"
         << "unsafe_contact_nominal,unsafe_contact_hybrid,predicted_trigger\n";
 

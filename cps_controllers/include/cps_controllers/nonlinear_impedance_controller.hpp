@@ -16,7 +16,7 @@
 using CallbackReturn =
     rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
-namespace franka_example_controllers {
+namespace cps_controllers {
 
 using Matrix3d = Eigen::Matrix3d;
 using Matrix4d = Eigen::Matrix4d;
@@ -28,7 +28,7 @@ using Vector6d = Eigen::Matrix<double, 6, 1>;
 using Vector7d = Eigen::Matrix<double, 7, 1>;
 using Quaterniond = Eigen::Quaterniond;
 
-class CartesianImpedanceExampleController
+class NonlinearImpedanceController
     : public controller_interface::ControllerInterface {
  public:
   controller_interface::InterfaceConfiguration command_interface_configuration() const override;
@@ -155,4 +155,4 @@ class CartesianImpedanceExampleController
   double prof_total_max_ms_{0.0};
 };
 
-}  // namespace franka_example_controllers
+}  // namespace cps_controllers

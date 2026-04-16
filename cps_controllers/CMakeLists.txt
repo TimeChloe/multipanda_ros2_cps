@@ -16,6 +16,7 @@ find_package(franka_semantic_components REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(franka_msgs REQUIRED)
+find_package(pinocchio REQUIRED)
 
 pluginlib_export_plugin_description_file(
   controller_interface
@@ -24,6 +25,7 @@ pluginlib_export_plugin_description_file(
 
 add_library(${PROJECT_NAME} SHARED
   src/joint_impedance_energybudget_controller.cpp
+  src/nonlinear_impedance_controller.cpp
   src/reachable_cartesian_impedance_controller.cpp
 )
 
@@ -45,6 +47,8 @@ ament_target_dependencies(${PROJECT_NAME}
   geometry_msgs
   franka_msgs
 )
+
+target_link_libraries(${PROJECT_NAME} pinocchio::pinocchio)
 
 install(
   TARGETS ${PROJECT_NAME}
@@ -77,6 +81,7 @@ ament_export_dependencies(
   std_msgs
   geometry_msgs
   franka_msgs
+  pinocchio
 )
 
 if(BUILD_TESTING)

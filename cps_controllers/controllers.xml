@@ -8,6 +8,14 @@
     </description>
   </class>
 
+  <class name="cps_controllers/NonlinearImpedanceController"
+         type="cps_controllers::NonlinearImpedanceController"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Cartesian impedance controller with nonlinear stiffness and damping profiles.
+    </description>
+  </class>
+  
   <class name="cps_controllers/ReachableCartesianImpedanceController"
          type="cps_controllers::ReachableCartesianImpedanceController"
          base_class_type="controller_interface::ControllerInterface">

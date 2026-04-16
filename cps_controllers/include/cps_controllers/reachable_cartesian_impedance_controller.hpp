@@ -66,6 +66,17 @@ struct MonitorResult {
   double worst_case_delta_n_fs{0.0};
   double worst_case_hybrid_forward_reach{0.0};
   double worst_case_plane_margin_after_hybrid{0.0};
+
+  // Safety-function view
+  double h_geom{0.0};
+  double h_nominal_energy{0.0};
+  double h_failsafe_energy{0.0};
+
+  // Current failsafe storage
+  double e_n_now_fs{0.0};
+  double v_n_now_fs{0.0};
+  double V_fs_now{0.0};
+  double V_fs_dot_est{0.0};
 };
 
 class ReachableCartesianImpedanceController
@@ -98,6 +109,8 @@ class ReachableCartesianImpedanceController
   void enterFailsafe(double t_now,
                      const Vector3d& desired_position_cur,
                      const Quaterniond& desired_orientation_cur);
+
+  void leaveFailsafe(double t_now);
 
   MonitorResult runSafetyMonitor(double dt,
                                  double t,
@@ -150,6 +163,10 @@ class ReachableCartesianImpedanceController
   SafetyMode mode_{SafetyMode::kNominal};
   double failsafe_start_time_sec_{-1.0};
 
+  // nominal-time pause bookkeeping
+  double failsafe_enter_wall_time_sec_{-1.0};
+  double paused_nominal_time_sec_{0.0};
+
   // gains
   Matrix6d K_nominal_{Matrix6d::Zero()};
   Matrix6d D_nominal_{Matrix6d::Zero()};
@@ -169,13 +186,25 @@ class ReachableCartesianImpedanceController
   bool auto_enter_failsafe_{false};
 
   double safe_collision_energy_joule_{0.10};
-  double ee_collision_radius_{0.04};
+  double ee_collision_radius_{0.3};
 
   double monitor_nominal_horizon_sec_{0.02};
   int monitor_nominal_steps_{10};
 
   Vector3d human_plane_normal_{Vector3d(0.0, 0.0, 1.0)};
   Vector3d human_plane_point_{Vector3d(0.0, 0.0, 0.2)};
+
+  // hysteresis for returning from failsafe to nominal
+  double return_to_nominal_geom_margin_{0.005};
+  double return_to_nominal_energy_margin_{0.02};
+
+  // --------------------------------------------------------------------------
+  // current failsafe storage tracking
+  // --------------------------------------------------------------------------
+  double prev_V_fs_{0.0};
+  bool prev_V_fs_valid_{false};
+  double last_e_n_fs_{0.0};
+  double last_v_n_fs_{0.0};
 
   // --------------------------------------------------------------------------
   // profiling statistics

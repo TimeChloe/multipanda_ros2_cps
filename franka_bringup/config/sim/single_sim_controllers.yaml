@@ -30,6 +30,8 @@ controller_manager:
         type: multi_mode_controller/MultiModeController
       joint_impedance_energybudget_controller:
         type: cps_controllers/JointImpedanceEnergyBudgetController
+      nonlinear_impedance_controller:
+        type: cps_controllers/NonlinearImpedanceController
       reachable_cartesian_impedance_controller:
         type: cps_controllers/ReachableCartesianImpedanceController
 franka_robot_state_broadcaster:
@@ -104,6 +106,27 @@ joint_impedance_energybudget_controller:
     k_gains: [24.0, 24.0, 24.0, 24.0, 10.0, 6.0, 2.0]
     d_gains: [2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 0.5]
 
+nonlinear_impedance_controller:
+  ros__parameters:
+    arm_id: panda
+    enable_error_logging: true
+    use_constant_reference: false
+    error_log_path: /home/developer/multipanda_ws/src/data_log/cartesian_pose_error_no_use_friction_compensation.csv
+    urdf_model_path: /home/developer/multipanda_ws/src/model_urdf/panda_ng.urdf
+
+    use_nonlinear_feedforward: true
+    use_franka_model_for_dynamics: false
+
+    use_friction_compensation: false
+    friction_use_reference_velocity: false
+    friction_scale: 1.0
+
+    friction_coulomb: [0.15, 0.15, 0.12, 0.10, 0.08, 0.05, 0.03]
+    friction_viscous: [0.04, 0.04, 0.03, 0.02, 0.02, 0.01, 0.01]
+    friction_velocity_scale: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+    friction_offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    profiling_stats_print_period: 1000
+
 reachable_cartesian_impedance_controller:
   ros__parameters:
     arm_id: panda
@@ -130,13 +153,19 @@ reachable_cartesian_impedance_controller:
     enable_safety_monitor: true
     auto_enter_failsafe: true
 
-    safe_collision_energy_joule: 0.10
-    ee_collision_radius: 0.04
+    safe_collision_energy_joule: 0.13
+    ee_collision_radius: 0.5
 
     monitor_nominal_horizon_sec: 0.02
-    monitor_nominal_steps: 10
+    monitor_nominal_steps: 20
 
     human_plane_normal: [0.0, 0.0, -1.0]
     human_plane_point: [0.0, 0.0, 0.2]
 
+    # 新增：failsafe -> nominal 的滞回恢复条件
+    return_to_nominal_geom_margin: 0.005
+    return_to_nominal_energy_margin: 0.02
+
     profiling_stats_print_period: 1000
+
+

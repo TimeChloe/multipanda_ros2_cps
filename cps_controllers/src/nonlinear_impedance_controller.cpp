@@ -10,7 +10,7 @@
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
-#include <franka_example_controllers/comless/cartesian_impedance_example_controller.hpp>
+#include <cps_controllers/nonlinear_impedance_controller.hpp>
 
 #include <algorithm>
 #include <array>
@@ -396,10 +396,10 @@ inline void buildConstantTaskReference(
 
 }  // namespace
 
-namespace franka_example_controllers {
+namespace cps_controllers {
 
 controller_interface::InterfaceConfiguration
-CartesianImpedanceExampleController::command_interface_configuration() const {
+NonlinearImpedanceController::command_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
 
@@ -411,7 +411,7 @@ CartesianImpedanceExampleController::command_interface_configuration() const {
 }
 
 controller_interface::InterfaceConfiguration
-CartesianImpedanceExampleController::state_interface_configuration() const {
+NonlinearImpedanceController::state_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
   config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
 
@@ -422,7 +422,7 @@ CartesianImpedanceExampleController::state_interface_configuration() const {
   return config;
 }
 
-Vector6d CartesianImpedanceExampleController::computeTaskPose(
+Vector6d NonlinearImpedanceController::computeTaskPose(
     const Eigen::Matrix3d& R,
     const Eigen::Vector3d& p) const {
   Vector6d r;
@@ -431,7 +431,7 @@ Vector6d CartesianImpedanceExampleController::computeTaskPose(
   return r;
 }
 
-Vector3d CartesianImpedanceExampleController::wrapEulerError(const Vector3d& e) const {
+Vector3d NonlinearImpedanceController::wrapEulerError(const Vector3d& e) const {
   Vector3d out = e;
   for (int i = 0; i < 3; ++i) {
     while (out(i) > M_PI) {
@@ -445,7 +445,7 @@ Vector3d CartesianImpedanceExampleController::wrapEulerError(const Vector3d& e) 
 }
 
 Eigen::Matrix<double, 6, 7>
-CartesianImpedanceExampleController::computeAnalyticJacobian(
+NonlinearImpedanceController::computeAnalyticJacobian(
     const Eigen::Matrix<double, 6, 7>& J_geo,
     const Eigen::Vector3d& rpy) const {
   Matrix6dLocal T = Matrix6dLocal::Identity();
@@ -454,7 +454,7 @@ CartesianImpedanceExampleController::computeAnalyticJacobian(
 }
 
 Eigen::Matrix<double, 6, 7>
-CartesianImpedanceExampleController::computeAnalyticJacobianDotNumerical(
+NonlinearImpedanceController::computeAnalyticJacobianDotNumerical(
     const Vector7d& q,
     const Vector7d& dq,
     const Eigen::Vector3d& rpy,
@@ -491,7 +491,7 @@ CartesianImpedanceExampleController::computeAnalyticJacobianDotNumerical(
   return (J_r_next - J_r_now) / safe_dt;
 }
 
-controller_interface::return_type CartesianImpedanceExampleController::update(
+controller_interface::return_type NonlinearImpedanceController::update(
     const rclcpp::Time& /*time*/,
     const rclcpp::Duration& period) {
   using Clock = std::chrono::steady_clock;
@@ -1367,7 +1367,7 @@ controller_interface::return_type CartesianImpedanceExampleController::update(
   return controller_interface::return_type::OK;
 }
 
-CallbackReturn CartesianImpedanceExampleController::on_init() {
+CallbackReturn NonlinearImpedanceController::on_init() {
   try {
     auto_declare<std::string>("arm_id", "panda");
     auto_declare<bool>("enable_error_logging", false);
@@ -1404,7 +1404,7 @@ CallbackReturn CartesianImpedanceExampleController::on_init() {
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn CartesianImpedanceExampleController::on_configure(
+CallbackReturn NonlinearImpedanceController::on_configure(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   try {
     arm_id_ = get_node()->get_parameter("arm_id").as_string();
@@ -1510,7 +1510,7 @@ CallbackReturn CartesianImpedanceExampleController::on_configure(
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn CartesianImpedanceExampleController::on_activate(
+CallbackReturn NonlinearImpedanceController::on_activate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   franka_robot_model_->assign_loaned_state_interfaces(state_interfaces_);
   start_time_ = this->get_node()->now();
@@ -1612,7 +1612,7 @@ CallbackReturn CartesianImpedanceExampleController::on_activate(
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn CartesianImpedanceExampleController::on_deactivate(
+CallbackReturn NonlinearImpedanceController::on_deactivate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   if (error_log_file_.is_open()) {
     error_log_file_.flush();
@@ -1623,9 +1623,9 @@ CallbackReturn CartesianImpedanceExampleController::on_deactivate(
   return CallbackReturn::SUCCESS;
 }
 
-}  // namespace franka_example_controllers
+}  // namespace cps_controllers
 
 #include "pluginlib/class_list_macros.hpp"
 
-PLUGINLIB_EXPORT_CLASS(franka_example_controllers::CartesianImpedanceExampleController,
+PLUGINLIB_EXPORT_CLASS(cps_controllers::NonlinearImpedanceController,
                        controller_interface::ControllerInterface)
