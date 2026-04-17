@@ -1,6 +1,10 @@
 // Copyright (c) 2026
 // Reachable Cartesian Impedance Controller
 //
+// Goal B:
+//   Contact/collision is allowed, but collision-related energy
+//   must remain below a prescribed safe threshold.
+//
 // Uses only Franka model data for:
 //   - pose
 //   - zero Jacobian
@@ -13,27 +17,29 @@
 // 2) Freeze current reference when entering failsafe
 // 3) Reference trajectory switch:
 //      - constant
-//      - line      (Cartesian straight downward from initial pose)
+//      - line
 //      - lissajous
 // 4) Safety monitor:
 //      - future nominal contact energy uses predicted contact-time normal velocity
-//      - scans all candidate times within the nominal horizon
-//      - computes worst-case hybrid forward reach = nominal progress + failsafe tail reach
-// 5) Energy-aware monitor upgrade:
-//      - h_geom = d - Delta_max
+//      - scans candidate times within the nominal horizon
+//      - computes worst-case failsafe energy over the horizon
+// 5) Energy-aware monitor:
 //      - h_nominal_energy = E_safe - Tn_contact_nominal
 //      - h_failsafe_energy = E_safe - E_fs_worst
 //      - current failsafe storage V_fs and finite-difference derivative
-// 6) Safety filter with hysteresis:
-//      - enter failsafe if predicted_trigger == true
-//      - return to nominal if hysteresis conditions are satisfied
-//      - no minimum dwell time
-// 7) Nominal-time pause during failsafe:
-//      - nominal trajectory time is frozen while in failsafe
+// 6) Safety filter with hysteresis
+// 7) Nominal-time pause during failsafe
 //
 // Controller law
 // --------------
 // tau = J^T(-K e - D v) + coriolis + tau_null
+//
+// Notes
+// -----
+// - Contact is allowed in principle.
+// - Geometry is used only to detect whether future contact is relevant,
+//   not as a hard safety violation by itself.
+// - Failsafe is triggered only by energy violation predictions.
 
 #include <algorithm>
 #include <array>
@@ -404,7 +410,7 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
   Vector3d x_pred = x0;
   Vector3d v_pred = v0;
 
-  double worst_hybrid_forward_reach = -std::numeric_limits<double>::infinity();
+  double worst_E_fs = -std::numeric_limits<double>::infinity();
 
   const double k_n_fs =
       std::max((n.transpose() * K_f_target_.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
@@ -413,7 +419,6 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
 
   for (int i = 0; i < N; ++i) {
     const double t_i = t + static_cast<double>(i) * h;
-    (void)t_i;
 
     const Vector3d e_nom = desired_position_cur - x_pred;
 
@@ -430,6 +435,7 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
 
     out.plane_distance_min_nominal = std::min(out.plane_distance_min_nominal, d_plane_next);
 
+    // Nominal predicted contact sample
     if (!out.nominal_contact_sample_found && d_plane_pred > 0.0 && d_plane_next <= 0.0) {
       const double alpha =
           std::clamp(d_plane_pred / std::max(d_plane_pred - d_plane_next, kSmallPositive),
@@ -445,6 +451,7 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
       out.Tn_contact_nominal = 0.5 * out.m_eff_n * v_n_contact * v_n_contact;
     }
 
+    // Worst-case failsafe energy over horizon
     const double e_n_i = n.dot(x_pred - desired_position_cur);
     const double v_n_i = n.dot(v_pred);
 
@@ -476,10 +483,9 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
     const double plane_margin_after_hybrid =
         plane_distance_candidate - delta_n_fs_i;
 
-    if (!out.worst_case_candidate_found ||
-        hybrid_forward_reach > worst_hybrid_forward_reach) {
+    if (!out.worst_case_candidate_found || E_fs_i > worst_E_fs) {
       out.worst_case_candidate_found = true;
-      worst_hybrid_forward_reach = hybrid_forward_reach;
+      worst_E_fs = E_fs_i;
 
       out.worst_case_candidate_time = t_i;
       out.worst_case_plane_distance_at_candidate = plane_distance_candidate;
@@ -498,34 +504,32 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
   }
 
   out.contact_possible_nominal = out.nominal_contact_sample_found;
+  out.contact_possible_hybrid = out.worst_case_candidate_found;
 
-  out.contact_possible_hybrid =
-      out.worst_case_candidate_found &&
-      (out.worst_case_plane_margin_after_hybrid <= 0.0);
-
+  // Geometry is no longer a hard unsafe condition.
+  // Keep it only as diagnostic information.
   out.h_geom = out.worst_case_plane_margin_after_hybrid;
 
   if (out.nominal_contact_sample_found) {
-    out.h_nominal_energy =
-        safe_collision_energy_joule_ - out.Tn_contact_nominal;
+    out.h_nominal_energy = safe_collision_energy_joule_ - out.Tn_contact_nominal;
   } else {
     out.h_nominal_energy = std::numeric_limits<double>::infinity();
   }
 
   if (out.worst_case_candidate_found) {
-    out.h_failsafe_energy =
-        safe_collision_energy_joule_ - out.worst_case_E_fs_1d;
+    out.h_failsafe_energy = safe_collision_energy_joule_ - out.worst_case_E_fs_1d;
   } else {
     out.h_failsafe_energy = std::numeric_limits<double>::infinity();
   }
 
+  // Unsafe only by energy, not by geometry.
   out.unsafe_contact_nominal =
       out.nominal_contact_sample_found &&
       (out.h_nominal_energy < 0.0);
 
   out.unsafe_contact_hybrid =
-      (out.h_failsafe_energy < 0.0) &&
-      (out.h_geom < 0.0);
+      out.worst_case_candidate_found &&
+      (out.h_failsafe_energy < 0.0);
 
   out.predicted_trigger =
       out.unsafe_contact_nominal || out.unsafe_contact_hybrid;
@@ -615,9 +619,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         }
       } else {
         const bool can_return_to_nominal =
-            (monitor.h_geom > return_to_nominal_geom_margin_) &&
             (monitor.h_failsafe_energy > return_to_nominal_energy_margin_) &&
-            (monitor.h_nominal_energy > return_to_nominal_energy_margin_);
+            (monitor.h_nominal_energy > return_to_nominal_energy_margin_) &&
+            (std::abs(monitor.v_n_now) < return_to_nominal_speed_threshold_) &&
+            (monitor.V_fs_dot_est <= return_to_nominal_vdot_threshold_);
 
         if (can_return_to_nominal) {
           leaveFailsafe(wall_time);
@@ -822,8 +827,12 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<std::vector<double>>(
         "human_plane_point", std::vector<double>{0.0, 0.0, 0.2});
 
-    auto_declare<double>("return_to_nominal_geom_margin", 0.005);
     auto_declare<double>("return_to_nominal_energy_margin", 0.02);
+    auto_declare<double>("return_to_nominal_speed_threshold", 0.02);
+    auto_declare<double>("return_to_nominal_vdot_threshold", 0.0);
+
+    // kept only for log compatibility / backward compatibility
+    auto_declare<double>("return_to_nominal_geom_margin", 0.005);
 
     auto_declare<int>("profiling_stats_print_period", 1000);
   } catch (const std::exception& e) {
@@ -873,10 +882,16 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     monitor_nominal_steps_ =
         static_cast<int>(get_node()->get_parameter("monitor_nominal_steps").as_int());
 
-    return_to_nominal_geom_margin_ =
-        get_node()->get_parameter("return_to_nominal_geom_margin").as_double();
     return_to_nominal_energy_margin_ =
         get_node()->get_parameter("return_to_nominal_energy_margin").as_double();
+    return_to_nominal_speed_threshold_ =
+        get_node()->get_parameter("return_to_nominal_speed_threshold").as_double();
+    return_to_nominal_vdot_threshold_ =
+        get_node()->get_parameter("return_to_nominal_vdot_threshold").as_double();
+
+    // optional backward compatibility parameter
+    return_to_nominal_geom_margin_ =
+        get_node()->get_parameter("return_to_nominal_geom_margin").as_double();
 
     const auto normal_vec =
         get_node()->get_parameter("human_plane_normal").as_double_array();

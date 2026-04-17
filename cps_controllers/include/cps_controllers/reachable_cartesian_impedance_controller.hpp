@@ -54,7 +54,7 @@ struct MonitorResult {
   double v_n_contact_nominal{0.0};
   double Tn_contact_nominal{0.0};
 
-  // Worst-case hybrid candidate over the whole future horizon
+  // Worst-case candidate over the future horizon
   bool worst_case_candidate_found{false};
   double worst_case_candidate_time{0.0};
   double worst_case_plane_distance_at_candidate{0.0};
@@ -100,7 +100,7 @@ class ReachableCartesianImpedanceController
   // --------------------------------------------------------------------------
   void updateRuntimeGains(double dt);
 
-  void buildReference(double t,
+  void buildReference(double nominal_time,
                       Vector3d& desired_position_cur,
                       Quaterniond& desired_orientation_cur,
                       Vector3d& desired_linear_velocity_cur,
@@ -138,7 +138,6 @@ class ReachableCartesianImpedanceController
   // --------------------------------------------------------------------------
   std::string arm_id_;
   std::string reference_trajectory_type_{"line"};
-
   bool use_constant_reference_{false};
 
   // --------------------------------------------------------------------------
@@ -186,7 +185,7 @@ class ReachableCartesianImpedanceController
   bool auto_enter_failsafe_{false};
 
   double safe_collision_energy_joule_{0.10};
-  double ee_collision_radius_{0.3};
+  double ee_collision_radius_{0.04};
 
   double monitor_nominal_horizon_sec_{0.02};
   int monitor_nominal_steps_{10};
@@ -194,9 +193,12 @@ class ReachableCartesianImpedanceController
   Vector3d human_plane_normal_{Vector3d(0.0, 0.0, 1.0)};
   Vector3d human_plane_point_{Vector3d(0.0, 0.0, 0.2)};
 
-  // hysteresis for returning from failsafe to nominal
+  // hysteresis / return conditions
+  // geom margin is kept for backward-compatible parameter parsing / logging
   double return_to_nominal_geom_margin_{0.005};
   double return_to_nominal_energy_margin_{0.02};
+  double return_to_nominal_speed_threshold_{0.02};
+  double return_to_nominal_vdot_threshold_{0.0};
 
   // --------------------------------------------------------------------------
   // current failsafe storage tracking
