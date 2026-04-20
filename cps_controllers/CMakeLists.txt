@@ -17,6 +17,7 @@ find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(franka_msgs REQUIRED)
 find_package(pinocchio REQUIRED)
+find_package(visualization_msgs REQUIRED)
 
 pluginlib_export_plugin_description_file(
   controller_interface
@@ -46,6 +47,7 @@ ament_target_dependencies(${PROJECT_NAME}
   std_msgs
   geometry_msgs
   franka_msgs
+  visualization_msgs
 )
 
 target_link_libraries(${PROJECT_NAME} pinocchio::pinocchio)

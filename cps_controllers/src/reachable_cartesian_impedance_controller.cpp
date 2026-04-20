@@ -2,7 +2,7 @@
 // Reachable Cartesian Impedance Controller
 //
 // Goal B:
-//   Contact/collision is allowed, but collision-related energy
+//   Contact/collision is allowed, but collision-related kinetic energy
 //   must remain below a prescribed safe threshold.
 //
 // Uses only Franka model data for:
@@ -22,24 +22,29 @@
 // 4) Safety monitor:
 //      - future nominal contact energy uses predicted contact-time normal velocity
 //      - scans candidate times within the nominal horizon
-//      - computes worst-case failsafe energy over the horizon
+//      - computes worst-case conservative failsafe normal kinetic energy upper bound
 // 5) Energy-aware monitor:
 //      - h_nominal_energy = E_safe - Tn_contact_nominal
-//      - h_failsafe_energy = E_safe - E_fs_worst
-//      - current failsafe storage V_fs and finite-difference derivative
+//      - h_failsafe_energy = E_safe - worst_case_Tn_fs_ub
+//      - current failsafe kinetic energy and finite-difference derivative
 // 6) Safety filter with hysteresis
 // 7) Nominal-time pause during failsafe
+// 8) Decimated monitor:
+//      - impedance control remains at 1 kHz
+//      - monitor runs every monitor_decimation cycles
+// 9) RViz diagnostics:
+//      - support plane patch
+//      - spherical hand region
+//      - inflated spherical hand region hint
+//      - EE sphere + collision radius sphere
+//      - predicted nominal contact point
+//      - current normal-velocity arrow
+//      - worst-case failsafe upper-bound arrow
+//      - status text
 //
 // Controller law
 // --------------
 // tau = J^T(-K e - D v) + coriolis + tau_null
-//
-// Notes
-// -----
-// - Contact is allowed in principle.
-// - Geometry is used only to detect whether future contact is relevant,
-//   not as a hard safety violation by itself.
-// - Failsafe is triggered only by energy violation predictions.
 
 #include <algorithm>
 #include <array>
@@ -50,6 +55,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -63,11 +69,16 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/state.hpp>
 
+#include <geometry_msgs/msg/point.hpp>
+#include <geometry_msgs/msg/quaternion.hpp>
+#include <std_msgs/msg/color_rgba.hpp>
+#include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+
 #include <cps_controllers/reachable_cartesian_impedance_controller.hpp>
 
 namespace {
 
-constexpr int kNumJoints = 7;
 constexpr double kMinDt = 1e-6;
 constexpr double kSmoothStartDuration = 2.0;
 constexpr double kLambdaReg = 1e-9;
@@ -83,6 +94,8 @@ using Matrix4d = Eigen::Matrix<double, 4, 4>;
 using Matrix3d = Eigen::Matrix3d;
 using Vector3d = Eigen::Vector3d;
 using Quaterniond = Eigen::Quaterniond;
+using Marker = visualization_msgs::msg::Marker;
+using MarkerArray = visualization_msgs::msg::MarkerArray;
 
 enum class ReferenceTrajectoryType {
   kLine,
@@ -103,6 +116,50 @@ struct TaskRefPose {
   Matrix3d R{Matrix3d::Identity()};
 };
 
+inline std_msgs::msg::ColorRGBA makeColor(float r, float g, float b, float a) {
+  std_msgs::msg::ColorRGBA c;
+  c.r = r;
+  c.g = g;
+  c.b = b;
+  c.a = a;
+  return c;
+}
+
+inline geometry_msgs::msg::Point toPoint(const Vector3d& p) {
+  geometry_msgs::msg::Point msg;
+  msg.x = p.x();
+  msg.y = p.y();
+  msg.z = p.z();
+  return msg;
+}
+
+inline geometry_msgs::msg::Quaternion toQuatMsg(const Quaterniond& q) {
+  geometry_msgs::msg::Quaternion msg;
+  msg.x = q.x();
+  msg.y = q.y();
+  msg.z = q.z();
+  msg.w = q.w();
+  return msg;
+}
+
+inline Quaterniond rotationMatrixToQuaternion(const Matrix3d& R) {
+  Quaterniond q(R);
+  q.normalize();
+  return q;
+}
+
+inline Matrix3d makePlaneFrameFromNormal(const Vector3d& n_in) {
+  const Vector3d n = n_in.normalized();
+  Vector3d ref = std::abs(n.z()) < 0.9 ? Vector3d::UnitZ() : Vector3d::UnitX();
+  Vector3d x = ref.cross(n).normalized();
+  Vector3d y = n.cross(x).normalized();
+  Matrix3d R;
+  R.col(0) = x;
+  R.col(1) = y;
+  R.col(2) = n;
+  return R;
+}
+
 inline ReferenceTrajectoryType parseReferenceTrajectoryType(const std::string& name) {
   if (name == "lissajous") {
     return ReferenceTrajectoryType::kLissajous;
@@ -111,6 +168,14 @@ inline ReferenceTrajectoryType parseReferenceTrajectoryType(const std::string& n
     return ReferenceTrajectoryType::kConstant;
   }
   return ReferenceTrajectoryType::kLine;
+}
+
+inline ReferenceTrajectoryType parseTrajectoryTypeOrDefault(bool use_constant_reference,
+                                                            const std::string& name) {
+  if (use_constant_reference) {
+    return ReferenceTrajectoryType::kConstant;
+  }
+  return parseReferenceTrajectoryType(name);
 }
 
 inline SmoothStartProfile makeSmoothStartProfile(double t, double T) {
@@ -135,21 +200,11 @@ inline SmoothStartProfile makeSmoothStartProfile(double t, double T) {
   return out;
 }
 
-inline ReferenceTrajectoryType parseTrajectoryTypeOrDefault(
-    bool use_constant_reference, const std::string& name) {
-  if (use_constant_reference) {
-    return ReferenceTrajectoryType::kConstant;
-  }
-  return parseReferenceTrajectoryType(name);
-}
-
-// ---------------- trajectory 1: straight line ----------------
 inline TaskRefPose makeReferenceLine(double t,
                                      const Vector3d& p0,
                                      const Matrix3d& R0) {
   TaskRefPose ref;
-
-  constexpr double T_move = 3.0;
+  constexpr double T_move = 1.5;
   constexpr double dz = -0.55;
 
   const SmoothStartProfile ramp = makeSmoothStartProfile(t, T_move);
@@ -161,7 +216,6 @@ inline TaskRefPose makeReferenceLine(double t,
   return ref;
 }
 
-// ---------------- trajectory 2: lissajous ----------------
 inline TaskRefPose makeReferenceLissajous(double t,
                                           const Vector3d& p0,
                                           const Matrix3d& R0) {
@@ -267,6 +321,252 @@ inline Vector7d arrayToVector7d(const std::array<double, 7>& data) {
 
 namespace cps_controllers {
 
+double ReachableCartesianImpedanceController::computeNormalStiffnessUpperBound() const {
+  const Vector3d n = human_plane_normal_.normalized();
+  return std::max((n.transpose() * K_runtime_.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
+}
+
+double ReachableCartesianImpedanceController::computeNormalDampingLowerBound() const {
+  const Vector3d n = human_plane_normal_.normalized();
+  return std::max((n.transpose() * D_f_target_.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
+}
+
+double ReachableCartesianImpedanceController::computeConservativeNormalAccelPositiveBound(
+    double m_eff_n,
+    double e_n_abs,
+    double /*v_n_abs*/) const {
+  const double m_safe = std::max(m_eff_n, kSmallPositive);
+
+  const double k_n_up = computeNormalStiffnessUpperBound();
+  const double a_from_stiffness = (k_n_up * e_n_abs) / m_safe;
+
+  const double a_from_tau_rate = torque_to_accel_gain_ * tau_rate_limit_ * kMinDt;
+  const double a_from_uncertainty = std::max(model_accel_uncertainty_, 0.0);
+
+  return std::max(0.0, a_from_stiffness + a_from_tau_rate + a_from_uncertainty);
+}
+
+double ReachableCartesianImpedanceController::computeConservativeNormalBrakeAccelLowerBound(
+    double m_eff_n,
+    double v_n_abs) const {
+  const double m_safe = std::max(m_eff_n, kSmallPositive);
+
+  const double d_n_low = computeNormalDampingLowerBound();
+  const double a_from_damping = (d_n_low * v_n_abs) / m_safe;
+
+  const double a_tau_loss = 0.5 * torque_to_accel_gain_ * tau_rate_limit_ * kMinDt;
+
+  return std::max(0.0, a_from_damping - a_tau_loss);
+}
+
+double ReachableCartesianImpedanceController::distanceToSweptHandRegion(
+    const Vector3d& x,
+    const Vector3d& /*plane_normal*/,
+    const Vector3d& sphere_center) const {
+  const double sphere_radius = human_motion_radius_ + human_hand_radius_;
+  return std::max((x - sphere_center).norm() - sphere_radius, 0.0);
+}
+
+void ReachableCartesianImpedanceController::publishRvizDiagnostics(
+    double wall_time,
+    const Vector3d& current_position,
+    const Vector3d& desired_position_cur,
+    const Vector6d& ee_twist,
+    const MonitorResult& monitor) {
+  (void)ee_twist;
+
+  if (!rviz_enable_markers_ || !rviz_marker_pub_) {
+    return;
+  }
+
+  ++rviz_publish_counter_;
+  if ((rviz_publish_counter_ % std::max(1, rviz_marker_decimation_)) != 0) {
+    return;
+  }
+
+  MarkerArray arr;
+  const auto stamp = get_node()->now();
+  const std::string& frame_id = rviz_frame_id_;
+  const Vector3d n = human_plane_normal_.normalized();
+
+  auto setupMarker = [&](Marker& m, int id, const std::string& ns, int type) {
+    m.header.frame_id = frame_id;
+    m.header.stamp = stamp;
+    m.ns = ns;
+    m.id = id;
+    m.type = type;
+    m.action = Marker::ADD;
+    m.lifetime = rclcpp::Duration::from_seconds(rviz_marker_lifetime_sec_);
+  };
+
+  const Matrix3d R_plane = makePlaneFrameFromNormal(n);
+  const Quaterniond q_plane = rotationMatrixToQuaternion(R_plane);
+
+  {
+    Marker m;
+    setupMarker(m, 0, "reachable_plane", Marker::CUBE);
+    m.pose.position = toPoint(human_sphere_center_);
+    m.pose.orientation = toQuatMsg(q_plane);
+    m.scale.x = rviz_plane_size_;
+    m.scale.y = rviz_plane_size_;
+    m.scale.z = rviz_plane_thickness_;
+    m.color = makeColor(0.1f, 0.6f, 1.0f, 0.12f);
+    arr.markers.push_back(m);
+  }
+
+  {
+    Marker m;
+    setupMarker(m, 1, "reachable_plane_normal", Marker::ARROW);
+    m.scale.x = rviz_arrow_shaft_diameter_;
+    m.scale.y = rviz_arrow_head_diameter_;
+    m.scale.z = rviz_arrow_head_length_;
+    m.color = makeColor(0.1f, 0.6f, 1.0f, 0.9f);
+
+    const Vector3d p0 = human_sphere_center_;
+    const Vector3d p1 = p0 + rviz_normal_arrow_length_ * n;
+    m.points.push_back(toPoint(p0));
+    m.points.push_back(toPoint(p1));
+    arr.markers.push_back(m);
+  }
+
+  {
+    Marker m;
+    setupMarker(m, 2, "reachable_hand_motion_sphere", Marker::SPHERE);
+    m.pose.position = toPoint(human_sphere_center_);
+    m.pose.orientation.w = 1.0;
+    m.scale.x = 2.0 * human_motion_radius_;
+    m.scale.y = 2.0 * human_motion_radius_;
+    m.scale.z = 2.0 * human_motion_radius_;
+    m.color = makeColor(1.0f, 0.8f, 0.1f, 0.20f);
+    arr.markers.push_back(m);
+  }
+
+  {
+    Marker m;
+    setupMarker(m, 3, "reachable_hand_inflated_sphere", Marker::SPHERE);
+    m.pose.position = toPoint(human_sphere_center_);
+    m.pose.orientation.w = 1.0;
+    const double inflated_radius = human_motion_radius_ + human_hand_radius_;
+    m.scale.x = 2.0 * inflated_radius;
+    m.scale.y = 2.0 * inflated_radius;
+    m.scale.z = 2.0 * inflated_radius;
+    m.color = makeColor(1.0f, 0.3f, 0.2f, 0.10f);
+    arr.markers.push_back(m);
+  }
+
+  {
+    Marker m;
+    setupMarker(m, 4, "reachable_ee_center", Marker::SPHERE);
+    m.pose.position = toPoint(current_position);
+    m.pose.orientation.w = 1.0;
+    m.scale.x = 0.03;
+    m.scale.y = 0.03;
+    m.scale.z = 0.03;
+    m.color = makeColor(0.0f, 1.0f, 0.2f, 0.9f);
+    arr.markers.push_back(m);
+  }
+
+  {
+    Marker m;
+    setupMarker(m, 5, "reachable_ee_radius", Marker::SPHERE);
+    m.pose.position = toPoint(current_position);
+    m.pose.orientation.w = 1.0;
+    m.scale.x = 2.0 * ee_collision_radius_;
+    m.scale.y = 2.0 * ee_collision_radius_;
+    m.scale.z = 2.0 * ee_collision_radius_;
+    m.color = makeColor(0.0f, 1.0f, 0.2f, 0.15f);
+    arr.markers.push_back(m);
+  }
+
+  {
+    Marker m;
+    setupMarker(m, 6, "reachable_desired", Marker::SPHERE);
+    m.pose.position = toPoint(desired_position_cur);
+    m.pose.orientation.w = 1.0;
+    m.scale.x = 0.025;
+    m.scale.y = 0.025;
+    m.scale.z = 0.025;
+    m.color = makeColor(1.0f, 1.0f, 0.0f, 0.85f);
+    arr.markers.push_back(m);
+  }
+
+  {
+    Marker m;
+    setupMarker(m, 7, "reachable_vn_now", Marker::ARROW);
+    m.scale.x = rviz_arrow_shaft_diameter_;
+    m.scale.y = rviz_arrow_head_diameter_;
+    m.scale.z = rviz_arrow_head_length_;
+
+    const double vn = monitor.v_n_now;
+    const Vector3d p0 = current_position;
+    const Vector3d p1 = p0 + rviz_velocity_arrow_scale_ * vn * n;
+
+    m.points.push_back(toPoint(p0));
+    m.points.push_back(toPoint(p1));
+    m.color = (vn >= 0.0) ? makeColor(1.0f, 0.5f, 0.0f, 0.95f)
+                          : makeColor(0.8f, 0.2f, 1.0f, 0.95f);
+    arr.markers.push_back(m);
+  }
+
+  {
+    Marker m;
+    setupMarker(m, 8, "reachable_vn_fs_ub", Marker::ARROW);
+    m.scale.x = rviz_arrow_shaft_diameter_;
+    m.scale.y = rviz_arrow_head_diameter_;
+    m.scale.z = rviz_arrow_head_length_;
+    m.color = makeColor(1.0f, 0.0f, 0.0f, 0.95f);
+
+    const Vector3d p0 = current_position + Vector3d(0.0, 0.0, rviz_ub_arrow_z_offset_);
+    const Vector3d p1 =
+        p0 + rviz_velocity_arrow_scale_ * monitor.worst_case_v_n_fs_ub * n;
+
+    m.points.push_back(toPoint(p0));
+    m.points.push_back(toPoint(p1));
+    arr.markers.push_back(m);
+  }
+
+  {
+    Marker m;
+    setupMarker(m, 9, "reachable_nominal_contact", Marker::SPHERE);
+    if (monitor.nominal_contact_sample_found) {
+      m.pose.position = toPoint(monitor.nominal_contact_point_world);
+      m.pose.orientation.w = 1.0;
+      m.scale.x = 0.035;
+      m.scale.y = 0.035;
+      m.scale.z = 0.035;
+      m.color = makeColor(1.0f, 0.0f, 1.0f, 0.95f);
+      arr.markers.push_back(m);
+    } else {
+      m.action = Marker::DELETE;
+      arr.markers.push_back(m);
+    }
+  }
+
+  {
+    Marker m;
+    setupMarker(m, 10, "reachable_status_text", Marker::TEXT_VIEW_FACING);
+    m.pose.position = toPoint(current_position + Vector3d(0.0, 0.0, rviz_text_z_offset_));
+    m.pose.orientation.w = 1.0;
+    m.scale.z = rviz_text_scale_;
+    m.color = makeColor(1.0f, 1.0f, 1.0f, 0.95f);
+
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(3)
+       << "mode=" << static_cast<int>(mode_)
+       << "  d=" << monitor.plane_distance_now
+       << "  v_safe=" << monitor.v_safe
+       << "  Tn_now=" << monitor.Tn_now
+       << "  Tn_nom=" << monitor.Tn_contact_nominal
+       << "  Tn_fs_ub=" << monitor.worst_case_Tn_fs_ub
+       << "  trig=" << static_cast<int>(monitor.predicted_trigger)
+       << "  wall_t=" << wall_time;
+    m.text = ss.str();
+    arr.markers.push_back(m);
+  }
+
+  rviz_marker_pub_->publish(arr);
+}
+
 controller_interface::InterfaceConfiguration
 ReachableCartesianImpedanceController::command_interface_configuration() const {
   controller_interface::InterfaceConfiguration config;
@@ -314,7 +614,7 @@ void ReachableCartesianImpedanceController::enterFailsafe(
   frozen_desired_orientation_ = desired_orientation_cur;
   frozen_desired_orientation_.normalize();
 
-  prev_V_fs_valid_ = false;
+  prev_Tn_fs_valid_ = false;
 
   RCLCPP_WARN(get_node()->get_logger(),
               "Entering failsafe: reference frozen at t = %.6f s", t_now);
@@ -330,7 +630,7 @@ void ReachableCartesianImpedanceController::leaveFailsafe(double t_now) {
   }
 
   mode_ = SafetyMode::kNominal;
-  prev_V_fs_valid_ = false;
+  prev_Tn_fs_valid_ = false;
   failsafe_enter_wall_time_sec_ = -1.0;
 
   RCLCPP_INFO(get_node()->get_logger(),
@@ -379,19 +679,18 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
     const Matrix7d& inertia,
     const Matrix37d& Jv,
     const Vector3d& plane_normal,
-    const Vector3d& plane_point) {
-  (void)dt;
+    const Vector3d& sphere_center) {
+  (void)desired_linear_velocity_cur;
+  (void)desired_linear_acceleration_cur;
+
   MonitorResult out;
 
   const Vector3d n = plane_normal.normalized();
   const Vector3d x0 = current_position;
   const Vector3d v0 = ee_twist.head<3>();
-  const Vector3d vd = desired_linear_velocity_cur;
-  const Vector3d ad = desired_linear_acceleration_cur;
 
   Matrix3d lambda_v_inv = Jv * inertia.inverse() * Jv.transpose();
   lambda_v_inv.diagonal().array() += kLambdaReg;
-  const Matrix3d lambda_v = lambda_v_inv.inverse();
 
   const double denom = (n.transpose() * lambda_v_inv * n)(0, 0);
   out.m_eff_n = 1.0 / std::max(denom, kSmallPositive);
@@ -401,102 +700,88 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
   out.v_safe = std::sqrt(
       std::max(2.0 * safe_collision_energy_joule_ / std::max(out.m_eff_n, kSmallPositive), 0.0));
 
-  out.plane_distance_now = n.dot(plane_point - x0) - ee_collision_radius_;
+  out.plane_distance_now =
+      distanceToSweptHandRegion(x0, plane_normal, sphere_center) - ee_collision_radius_;
   out.plane_distance_min_nominal = out.plane_distance_now;
 
   const int N = std::max(1, monitor_nominal_steps_);
-  const double h = std::max(monitor_nominal_horizon_sec_ / static_cast<double>(N), kMinDt);
+  const double h = std::max(monitor_nominal_horizon_sec_ / static_cast<double>(N), dt);
 
   Vector3d x_pred = x0;
   Vector3d v_pred = v0;
 
-  double worst_E_fs = -std::numeric_limits<double>::infinity();
-
-  const double k_n_fs =
-      std::max((n.transpose() * K_f_target_.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
-  const double d_n_fs =
-      std::max((n.transpose() * D_f_target_.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
+  double worst_Tn_fs_ub = -std::numeric_limits<double>::infinity();
 
   for (int i = 0; i < N; ++i) {
     const double t_i = t + static_cast<double>(i) * h;
 
     const Vector3d e_nom = desired_position_cur - x_pred;
+    const Matrix3d lambda_v = lambda_v_inv.inverse();
 
     const Vector3d a_pred =
-        ad + lambda_v *
-                 (K_runtime_.topLeftCorner<3, 3>() * e_nom +
-                  D_runtime_.topLeftCorner<3, 3>() * (vd - v_pred));
+        lambda_v *
+        (K_runtime_.topLeftCorner<3, 3>() * e_nom -
+         D_runtime_.topLeftCorner<3, 3>() * v_pred);
 
     const Vector3d x_next = x_pred + v_pred * h + 0.5 * a_pred * h * h;
     const Vector3d v_next = v_pred + a_pred * h;
 
-    const double d_plane_pred = n.dot(plane_point - x_pred) - ee_collision_radius_;
-    const double d_plane_next = n.dot(plane_point - x_next) - ee_collision_radius_;
+    const double d_region_pred =
+        distanceToSweptHandRegion(x_pred, plane_normal, sphere_center) - ee_collision_radius_;
+    const double d_region_next =
+        distanceToSweptHandRegion(x_next, plane_normal, sphere_center) - ee_collision_radius_;
 
-    out.plane_distance_min_nominal = std::min(out.plane_distance_min_nominal, d_plane_next);
+    out.plane_distance_min_nominal = std::min(out.plane_distance_min_nominal, d_region_next);
 
-    // Nominal predicted contact sample
-    if (!out.nominal_contact_sample_found && d_plane_pred > 0.0 && d_plane_next <= 0.0) {
+    if (!out.nominal_contact_sample_found && d_region_pred > 0.0 && d_region_next <= 0.0) {
       const double alpha =
-          std::clamp(d_plane_pred / std::max(d_plane_pred - d_plane_next, kSmallPositive),
+          std::clamp(d_region_pred / std::max(d_region_pred - d_region_next, kSmallPositive),
                      0.0, 1.0);
+
       const Vector3d x_contact = x_pred + alpha * (x_next - x_pred);
       const Vector3d v_contact = v_pred + alpha * (v_next - v_pred);
       const double v_n_contact = n.dot(v_contact);
 
       out.nominal_contact_sample_found = true;
       out.nominal_contact_time = t_i + alpha * h;
-      out.nominal_contact_distance = n.dot(plane_point - x_contact) - ee_collision_radius_;
+      out.nominal_contact_distance =
+          distanceToSweptHandRegion(x_contact, plane_normal, sphere_center) - ee_collision_radius_;
       out.v_n_contact_nominal = v_n_contact;
       out.Tn_contact_nominal = 0.5 * out.m_eff_n * v_n_contact * v_n_contact;
+      out.nominal_contact_point_world = x_contact;
     }
 
-    // Worst-case failsafe energy over horizon
-    const double e_n_i = n.dot(x_pred - desired_position_cur);
-    const double v_n_i = n.dot(v_pred);
+    const double e_n_abs =
+        std::abs(n.dot(x_pred - desired_position_cur)) + stiffness_error_bound_m_;
+    const double v_n_abs = std::abs(n.dot(v_pred));
 
-    const double E_fs_i =
-        0.5 * out.m_eff_n * v_n_i * v_n_i + 0.5 * k_n_fs * e_n_i * e_n_i;
+    const double a_pos =
+        computeConservativeNormalAccelPositiveBound(out.m_eff_n, e_n_abs, v_n_abs);
+    const double a_brake =
+        computeConservativeNormalBrakeAccelLowerBound(out.m_eff_n, v_n_abs);
+    const double a_net = a_pos - a_brake;
 
-    const double c_rate =
-        std::max(d_n_fs / std::max(out.m_eff_n, kSmallPositive), 1e-3);
+    double v_n_fs_ub = v_n_abs + h * a_net;
+    v_n_fs_ub = std::max(0.0, v_n_fs_ub);
 
-    double tau_safe_i = 0.0;
-    double delta_n_fs_i = 0.0;
-
-    if (E_fs_i > safe_collision_energy_joule_) {
-      tau_safe_i = (1.0 / c_rate) *
-                   std::log(std::max(E_fs_i / std::max(safe_collision_energy_joule_, 1e-9), 1.0));
-
-      const double v_bound0_i =
-          std::sqrt(std::max(2.0 * E_fs_i / std::max(out.m_eff_n, kSmallPositive), 0.0));
-
-      delta_n_fs_i =
-          (2.0 / c_rate) * v_bound0_i *
-          (1.0 - std::exp(-0.5 * c_rate * tau_safe_i));
-    }
+    const double Tn_fs_ub = 0.5 * out.m_eff_n * v_n_fs_ub * v_n_fs_ub;
 
     const double nominal_forward_progress = n.dot(x_pred - x0);
-    const double hybrid_forward_reach = nominal_forward_progress + delta_n_fs_i;
-    const double plane_distance_candidate =
-        n.dot(plane_point - x_pred) - ee_collision_radius_;
-    const double plane_margin_after_hybrid =
-        plane_distance_candidate - delta_n_fs_i;
+    const double region_distance_candidate =
+        distanceToSweptHandRegion(x_pred, plane_normal, sphere_center) - ee_collision_radius_;
 
-    if (!out.worst_case_candidate_found || E_fs_i > worst_E_fs) {
+    if (!out.worst_case_candidate_found || Tn_fs_ub > worst_Tn_fs_ub) {
       out.worst_case_candidate_found = true;
-      worst_E_fs = E_fs_i;
+      worst_Tn_fs_ub = Tn_fs_ub;
 
       out.worst_case_candidate_time = t_i;
-      out.worst_case_plane_distance_at_candidate = plane_distance_candidate;
+      out.worst_case_plane_distance_at_candidate = region_distance_candidate;
       out.worst_case_nominal_forward_progress = nominal_forward_progress;
-      out.worst_case_e_n = e_n_i;
-      out.worst_case_v_n = v_n_i;
-      out.worst_case_E_fs_1d = E_fs_i;
-      out.worst_case_tau_safe = tau_safe_i;
-      out.worst_case_delta_n_fs = delta_n_fs_i;
-      out.worst_case_hybrid_forward_reach = hybrid_forward_reach;
-      out.worst_case_plane_margin_after_hybrid = plane_margin_after_hybrid;
+      out.worst_case_v_n_fs_ub = v_n_fs_ub;
+      out.worst_case_Tn_fs_ub = Tn_fs_ub;
+      out.worst_case_a_pos = a_pos;
+      out.worst_case_a_brake = a_brake;
+      out.worst_case_a_net = a_net;
     }
 
     x_pred = x_next;
@@ -505,10 +790,7 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
 
   out.contact_possible_nominal = out.nominal_contact_sample_found;
   out.contact_possible_hybrid = out.worst_case_candidate_found;
-
-  // Geometry is no longer a hard unsafe condition.
-  // Keep it only as diagnostic information.
-  out.h_geom = out.worst_case_plane_margin_after_hybrid;
+  out.h_geom = out.plane_distance_min_nominal;
 
   if (out.nominal_contact_sample_found) {
     out.h_nominal_energy = safe_collision_energy_joule_ - out.Tn_contact_nominal;
@@ -517,12 +799,11 @@ MonitorResult ReachableCartesianImpedanceController::runSafetyMonitor(
   }
 
   if (out.worst_case_candidate_found) {
-    out.h_failsafe_energy = safe_collision_energy_joule_ - out.worst_case_E_fs_1d;
+    out.h_failsafe_energy = safe_collision_energy_joule_ - out.worst_case_Tn_fs_ub;
   } else {
     out.h_failsafe_energy = std::numeric_limits<double>::infinity();
   }
 
-  // Unsafe only by energy, not by geometry.
   out.unsafe_contact_nominal =
       out.nominal_contact_sample_found &&
       (out.h_nominal_energy < 0.0);
@@ -587,93 +868,103 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   error.head<3>() = current_position - desired_position_cur;
   error.tail<3>() = computeOrientationError(current_orientation, desired_orientation_cur);
 
-  MonitorResult monitor;
+  MonitorResult monitor{};
   if (enable_safety_monitor_) {
-    const Matrix37d Jv = J_geo.topRows<3>();
-    monitor = runSafetyMonitor(dt,
-                               wall_time,
-                               current_position,
-                               desired_position_cur,
-                               ee_twist,
-                               desired_linear_velocity_cur,
-                               desired_linear_acceleration_cur,
-                               inertia,
-                               Jv,
-                               human_plane_normal_,
-                               human_plane_point_);
+    ++monitor_counter_;
+    const bool run_monitor_now =
+        (monitor_counter_ % std::max<std::size_t>(1, static_cast<std::size_t>(monitor_decimation_))) == 0;
 
-    if (auto_enter_failsafe_) {
-      if (mode_ == SafetyMode::kNominal) {
-        if (monitor.predicted_trigger) {
-          enterFailsafe(wall_time, desired_position_cur, desired_orientation_cur);
+    if (run_monitor_now) {
+      const Matrix37d Jv = J_geo.topRows<3>();
+      monitor = runSafetyMonitor(dt,
+                                 wall_time,
+                                 current_position,
+                                 desired_position_cur,
+                                 ee_twist,
+                                 desired_linear_velocity_cur,
+                                 desired_linear_acceleration_cur,
+                                 inertia,
+                                 Jv,
+                                 human_plane_normal_,
+                                 human_sphere_center_);
 
-          buildReference(nominal_time,
-                         desired_position_cur,
-                         desired_orientation_cur,
-                         desired_linear_velocity_cur,
-                         desired_linear_acceleration_cur);
+      last_monitor_result_ = monitor;
+      last_monitor_result_valid_ = true;
+      last_monitor_wall_time_ = wall_time;
 
-          error.head<3>() = current_position - desired_position_cur;
-          error.tail<3>() =
-              computeOrientationError(current_orientation, desired_orientation_cur);
-        }
-      } else {
-        const bool can_return_to_nominal =
-            (monitor.h_failsafe_energy > return_to_nominal_energy_margin_) &&
-            (monitor.h_nominal_energy > return_to_nominal_energy_margin_) &&
-            (std::abs(monitor.v_n_now) < return_to_nominal_speed_threshold_) &&
-            (monitor.V_fs_dot_est <= return_to_nominal_vdot_threshold_);
+      if (auto_enter_failsafe_) {
+        if (mode_ == SafetyMode::kNominal) {
+          if (monitor.predicted_trigger) {
+            enterFailsafe(wall_time, desired_position_cur, desired_orientation_cur);
 
-        if (can_return_to_nominal) {
-          leaveFailsafe(wall_time);
+            buildReference(nominal_time,
+                           desired_position_cur,
+                           desired_orientation_cur,
+                           desired_linear_velocity_cur,
+                           desired_linear_acceleration_cur);
 
-          nominal_time = std::max(0.0, wall_time - paused_nominal_time_sec_);
+            error.head<3>() = current_position - desired_position_cur;
+            error.tail<3>() =
+                computeOrientationError(current_orientation, desired_orientation_cur);
+          }
+        } else {
+          const bool can_return_to_nominal =
+              (monitor.h_failsafe_energy > return_to_nominal_energy_margin_) &&
+              (monitor.h_nominal_energy > return_to_nominal_energy_margin_) &&
+              (std::abs(monitor.v_n_now_fs) < return_to_nominal_speed_threshold_) &&
+              (monitor.Tn_dot_est <= return_to_nominal_tndot_threshold_);
 
-          buildReference(nominal_time,
-                         desired_position_cur,
-                         desired_orientation_cur,
-                         desired_linear_velocity_cur,
-                         desired_linear_acceleration_cur);
+          if (can_return_to_nominal) {
+            leaveFailsafe(wall_time);
 
-          error.head<3>() = current_position - desired_position_cur;
-          error.tail<3>() =
-              computeOrientationError(current_orientation, desired_orientation_cur);
+            nominal_time = std::max(0.0, wall_time - paused_nominal_time_sec_);
+
+            buildReference(nominal_time,
+                           desired_position_cur,
+                           desired_orientation_cur,
+                           desired_linear_velocity_cur,
+                           desired_linear_acceleration_cur);
+
+            error.head<3>() = current_position - desired_position_cur;
+            error.tail<3>() =
+                computeOrientationError(current_orientation, desired_orientation_cur);
+          }
         }
       }
+    } else if (last_monitor_result_valid_) {
+      monitor = last_monitor_result_;
     }
   }
 
   {
     const Vector3d n = human_plane_normal_.normalized();
-    const double k_n_fs =
-        std::max((n.transpose() * K_f_target_.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
-
-    const double e_n_now_fs = n.dot(current_position - desired_position_cur);
     const double v_n_now_fs = n.dot(ee_twist.head<3>());
+    const double Tn_now_fs =
+        0.5 * std::max(monitor.m_eff_n, 0.0) * v_n_now_fs * v_n_now_fs;
 
-    const double V_fs_now =
-        0.5 * monitor.m_eff_n * v_n_now_fs * v_n_now_fs +
-        0.5 * k_n_fs * e_n_now_fs * e_n_now_fs;
-
-    monitor.e_n_now_fs = e_n_now_fs;
     monitor.v_n_now_fs = v_n_now_fs;
-    monitor.V_fs_now = V_fs_now;
+    monitor.Tn_now_fs = Tn_now_fs;
 
     if (mode_ == SafetyMode::kFailsafe) {
-      if (prev_V_fs_valid_) {
-        monitor.V_fs_dot_est = (V_fs_now - prev_V_fs_) / std::max(dt, kMinDt);
+      if (prev_Tn_fs_valid_) {
+        monitor.Tn_dot_est = (Tn_now_fs - prev_Tn_fs_) / std::max(dt, kMinDt);
       } else {
-        monitor.V_fs_dot_est = 0.0;
+        monitor.Tn_dot_est = 0.0;
       }
-      prev_V_fs_ = V_fs_now;
-      prev_V_fs_valid_ = true;
+      prev_Tn_fs_ = Tn_now_fs;
+      prev_Tn_fs_valid_ = true;
     } else {
-      monitor.V_fs_dot_est = 0.0;
-      prev_V_fs_valid_ = false;
+      monitor.Tn_dot_est = 0.0;
+      prev_Tn_fs_valid_ = false;
     }
 
-    last_e_n_fs_ = e_n_now_fs;
     last_v_n_fs_ = v_n_now_fs;
+
+    if (enable_safety_monitor_ && last_monitor_result_valid_) {
+      last_monitor_result_.v_n_now_fs = monitor.v_n_now_fs;
+      last_monitor_result_.Tn_now_fs = monitor.Tn_now_fs;
+      last_monitor_result_.Tn_dot_est = monitor.Tn_dot_est;
+    }
   }
 
   updateRuntimeGains(dt);
@@ -700,6 +991,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   for (int i = 0; i < kNumJoints; ++i) {
     command_interfaces_[i].set_value(tau_cmd(i));
   }
+
+  publishRvizDiagnostics(wall_time, current_position, desired_position_cur, ee_twist, monitor);
 
   if (enable_error_logging_ && error_log_file_.is_open()) {
     error_log_file_ << std::fixed << std::setprecision(9)
@@ -740,20 +1033,17 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                     << monitor.worst_case_candidate_time << ","
                     << monitor.worst_case_plane_distance_at_candidate << ","
                     << monitor.worst_case_nominal_forward_progress << ","
-                    << monitor.worst_case_e_n << ","
-                    << monitor.worst_case_v_n << ","
-                    << monitor.worst_case_E_fs_1d << ","
-                    << monitor.worst_case_tau_safe << ","
-                    << monitor.worst_case_delta_n_fs << ","
-                    << monitor.worst_case_hybrid_forward_reach << ","
-                    << monitor.worst_case_plane_margin_after_hybrid << ","
+                    << monitor.worst_case_v_n_fs_ub << ","
+                    << monitor.worst_case_Tn_fs_ub << ","
+                    << monitor.worst_case_a_pos << ","
+                    << monitor.worst_case_a_brake << ","
+                    << monitor.worst_case_a_net << ","
                     << monitor.h_geom << ","
                     << monitor.h_nominal_energy << ","
                     << monitor.h_failsafe_energy << ","
-                    << monitor.e_n_now_fs << ","
                     << monitor.v_n_now_fs << ","
-                    << monitor.V_fs_now << ","
-                    << monitor.V_fs_dot_est << ","
+                    << monitor.Tn_now_fs << ","
+                    << monitor.Tn_dot_est << ","
                     << static_cast<int>(monitor.contact_possible_nominal) << ","
                     << static_cast<int>(monitor.contact_possible_hybrid) << ","
                     << static_cast<int>(monitor.unsafe_contact_nominal) << ","
@@ -779,11 +1069,13 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   if (loop_counter_ >= static_cast<std::size_t>(profiling_stats_print_period_)) {
     const double n = static_cast<double>(loop_counter_);
     RCLCPP_INFO(get_node()->get_logger(),
-                "[reachable_impedance] mode=%d avg_exec=%.6f ms min_exec=%.6f ms max_exec=%.6f ms",
+                "[reachable_impedance] mode=%d avg_exec=%.6f ms min_exec=%.6f ms max_exec=%.6f ms monitor_decim=%d last_monitor_age=%.6f s",
                 static_cast<int>(mode_),
                 exec_sum_ms_ / n,
                 exec_min_ms_,
-                exec_max_ms_);
+                exec_max_ms_,
+                monitor_decimation_,
+                wall_time - last_monitor_wall_time_);
     loop_counter_ = 0;
     exec_sum_ms_ = 0.0;
     exec_min_ms_ = 1e9;
@@ -799,7 +1091,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<bool>("enable_error_logging", true);
     auto_declare<std::string>(
         "error_log_path",
-        "/home/developer/multipanda_ws/src/data_log/cartesian_impedance_failsafe_validation.csv");
+        "/home/developer/multipanda_ws/src/data_log/reachable_cartesian_impedance_validation.csv");
 
     auto_declare<bool>("use_constant_reference", false);
     auto_declare<std::string>("reference_trajectory_type", "lissajous");
@@ -819,20 +1111,45 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
 
     auto_declare<double>("safe_collision_energy_joule", 0.10);
     auto_declare<double>("ee_collision_radius", 0.04);
-    auto_declare<double>("monitor_nominal_horizon_sec", 0.02);
+    auto_declare<double>("monitor_nominal_horizon_sec", 0.03);
     auto_declare<int>("monitor_nominal_steps", 10);
+    auto_declare<int>("monitor_decimation", 10);
 
     auto_declare<std::vector<double>>(
         "human_plane_normal", std::vector<double>{0.0, 0.0, 1.0});
     auto_declare<std::vector<double>>(
-        "human_plane_point", std::vector<double>{0.0, 0.0, 0.2});
+        "human_sphere_center", std::vector<double>{0.0, 0.0, 0.2});
+
+    auto_declare<double>("human_motion_radius", 0.10);
+    auto_declare<double>("human_hand_radius", 0.04);
 
     auto_declare<double>("return_to_nominal_energy_margin", 0.02);
     auto_declare<double>("return_to_nominal_speed_threshold", 0.02);
-    auto_declare<double>("return_to_nominal_vdot_threshold", 0.0);
+    auto_declare<double>("return_to_nominal_tndot_threshold", 0.0);
 
-    // kept only for log compatibility / backward compatibility
     auto_declare<double>("return_to_nominal_geom_margin", 0.005);
+
+    auto_declare<double>("k_rate_limit", 5000.0);
+    auto_declare<double>("d_rate_limit", 500.0);
+    auto_declare<double>("tau_rate_limit", 1000.0);
+    auto_declare<double>("torque_to_accel_gain", 8.0);
+    auto_declare<double>("model_accel_uncertainty", 0.5);
+    auto_declare<double>("stiffness_error_bound_m", 0.02);
+
+    auto_declare<bool>("rviz_enable_markers", true);
+    auto_declare<std::string>("rviz_frame_id", "panda_link0");
+    auto_declare<int>("rviz_marker_decimation", 10);
+    auto_declare<double>("rviz_marker_lifetime_sec", 0.2);
+    auto_declare<double>("rviz_plane_size", 0.8);
+    auto_declare<double>("rviz_plane_thickness", 0.003);
+    auto_declare<double>("rviz_normal_arrow_length", 0.20);
+    auto_declare<double>("rviz_velocity_arrow_scale", 0.25);
+    auto_declare<double>("rviz_arrow_shaft_diameter", 0.01);
+    auto_declare<double>("rviz_arrow_head_diameter", 0.02);
+    auto_declare<double>("rviz_arrow_head_length", 0.03);
+    auto_declare<double>("rviz_text_scale", 0.04);
+    auto_declare<double>("rviz_text_z_offset", 0.12);
+    auto_declare<double>("rviz_ub_arrow_z_offset", 0.05);
 
     auto_declare<int>("profiling_stats_print_period", 1000);
   } catch (const std::exception& e) {
@@ -881,31 +1198,70 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         get_node()->get_parameter("monitor_nominal_horizon_sec").as_double();
     monitor_nominal_steps_ =
         static_cast<int>(get_node()->get_parameter("monitor_nominal_steps").as_int());
+    monitor_decimation_ =
+        std::max(1, static_cast<int>(get_node()->get_parameter("monitor_decimation").as_int()));
 
     return_to_nominal_energy_margin_ =
         get_node()->get_parameter("return_to_nominal_energy_margin").as_double();
     return_to_nominal_speed_threshold_ =
         get_node()->get_parameter("return_to_nominal_speed_threshold").as_double();
-    return_to_nominal_vdot_threshold_ =
-        get_node()->get_parameter("return_to_nominal_vdot_threshold").as_double();
+    return_to_nominal_tndot_threshold_ =
+        get_node()->get_parameter("return_to_nominal_tndot_threshold").as_double();
 
-    // optional backward compatibility parameter
     return_to_nominal_geom_margin_ =
         get_node()->get_parameter("return_to_nominal_geom_margin").as_double();
 
+    k_rate_limit_ = get_node()->get_parameter("k_rate_limit").as_double();
+    d_rate_limit_ = get_node()->get_parameter("d_rate_limit").as_double();
+    tau_rate_limit_ = get_node()->get_parameter("tau_rate_limit").as_double();
+    torque_to_accel_gain_ = get_node()->get_parameter("torque_to_accel_gain").as_double();
+    model_accel_uncertainty_ = get_node()->get_parameter("model_accel_uncertainty").as_double();
+    stiffness_error_bound_m_ = get_node()->get_parameter("stiffness_error_bound_m").as_double();
+
+    rviz_enable_markers_ = get_node()->get_parameter("rviz_enable_markers").as_bool();
+    rviz_frame_id_ = get_node()->get_parameter("rviz_frame_id").as_string();
+    rviz_marker_decimation_ =
+        std::max(1, static_cast<int>(get_node()->get_parameter("rviz_marker_decimation").as_int()));
+    rviz_marker_lifetime_sec_ =
+        get_node()->get_parameter("rviz_marker_lifetime_sec").as_double();
+    rviz_plane_size_ = get_node()->get_parameter("rviz_plane_size").as_double();
+    rviz_plane_thickness_ = get_node()->get_parameter("rviz_plane_thickness").as_double();
+    rviz_normal_arrow_length_ =
+        get_node()->get_parameter("rviz_normal_arrow_length").as_double();
+    rviz_velocity_arrow_scale_ =
+        get_node()->get_parameter("rviz_velocity_arrow_scale").as_double();
+    rviz_arrow_shaft_diameter_ =
+        get_node()->get_parameter("rviz_arrow_shaft_diameter").as_double();
+    rviz_arrow_head_diameter_ =
+        get_node()->get_parameter("rviz_arrow_head_diameter").as_double();
+    rviz_arrow_head_length_ =
+        get_node()->get_parameter("rviz_arrow_head_length").as_double();
+    rviz_text_scale_ = get_node()->get_parameter("rviz_text_scale").as_double();
+    rviz_text_z_offset_ = get_node()->get_parameter("rviz_text_z_offset").as_double();
+    rviz_ub_arrow_z_offset_ = get_node()->get_parameter("rviz_ub_arrow_z_offset").as_double();
+
     const auto normal_vec =
         get_node()->get_parameter("human_plane_normal").as_double_array();
-    const auto point_vec =
-        get_node()->get_parameter("human_plane_point").as_double_array();
+    const auto center_vec =
+        get_node()->get_parameter("human_sphere_center").as_double_array();
 
-    if (normal_vec.size() != 3 || point_vec.size() != 3) {
+    if (normal_vec.size() != 3 || center_vec.size() != 3) {
       RCLCPP_ERROR(get_node()->get_logger(),
-                   "human_plane_normal and human_plane_point must have length 3.");
+                   "human_plane_normal and human_sphere_center must have length 3.");
       return CallbackReturn::ERROR;
     }
 
     human_plane_normal_ = Vector3d(normal_vec[0], normal_vec[1], normal_vec[2]);
-    human_plane_point_ = Vector3d(point_vec[0], point_vec[1], point_vec[2]);
+    human_sphere_center_ = Vector3d(center_vec[0], center_vec[1], center_vec[2]);
+
+    human_motion_radius_ = get_node()->get_parameter("human_motion_radius").as_double();
+    human_hand_radius_ = get_node()->get_parameter("human_hand_radius").as_double();
+
+    if (human_motion_radius_ < 0.0 || human_hand_radius_ < 0.0) {
+      RCLCPP_ERROR(get_node()->get_logger(),
+                   "human_motion_radius and human_hand_radius must be nonnegative.");
+      return CallbackReturn::ERROR;
+    }
 
     if (human_plane_normal_.norm() < 1e-8) {
       RCLCPP_ERROR(get_node()->get_logger(), "human_plane_normal norm too small.");
@@ -947,6 +1303,11 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
             franka_semantic_components::FrankaRobotModel(
                 arm_id_ + "/robot_model", arm_id_));
 
+    if (rviz_enable_markers_) {
+      rviz_marker_pub_ =
+          get_node()->create_publisher<MarkerArray>("reachable_impedance/markers", 10);
+    }
+
   } catch (const std::exception& e) {
     RCLCPP_ERROR(get_node()->get_logger(), "Exception in on_configure: %s", e.what());
     return CallbackReturn::ERROR;
@@ -984,10 +1345,16 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   exec_max_ms_ = 0.0;
   log_write_counter_ = 0;
 
-  prev_V_fs_ = 0.0;
-  prev_V_fs_valid_ = false;
-  last_e_n_fs_ = 0.0;
+  prev_Tn_fs_ = 0.0;
+  prev_Tn_fs_valid_ = false;
   last_v_n_fs_ = 0.0;
+
+  monitor_counter_ = 0;
+  last_monitor_result_valid_ = false;
+  last_monitor_wall_time_ = 0.0;
+  last_monitor_result_ = MonitorResult{};
+
+  rviz_publish_counter_ = 0;
 
   if (enable_error_logging_) {
     error_log_file_.open(error_log_path_, std::ios::out | std::ios::trunc);
@@ -1010,11 +1377,11 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "nominal_contact_sample_found,nominal_contact_time,nominal_contact_distance,"
         << "v_n_contact_nominal,Tn_contact_nominal,"
         << "worst_case_candidate_found,worst_case_candidate_time,worst_case_plane_distance_at_candidate,"
-        << "worst_case_nominal_forward_progress,worst_case_e_n,worst_case_v_n,"
-        << "worst_case_E_fs_1d,worst_case_tau_safe,worst_case_delta_n_fs,"
-        << "worst_case_hybrid_forward_reach,worst_case_plane_margin_after_hybrid,"
+        << "worst_case_nominal_forward_progress,"
+        << "worst_case_v_n_fs_ub,worst_case_Tn_fs_ub,"
+        << "worst_case_a_pos,worst_case_a_brake,worst_case_a_net,"
         << "h_geom,h_nominal_energy,h_failsafe_energy,"
-        << "e_n_now_fs,v_n_now_fs,V_fs_now,V_fs_dot_est,"
+        << "v_n_now_fs,Tn_now_fs,Tn_dot_est,"
         << "contact_possible_nominal,contact_possible_hybrid,"
         << "unsafe_contact_nominal,unsafe_contact_hybrid,predicted_trigger\n";
 

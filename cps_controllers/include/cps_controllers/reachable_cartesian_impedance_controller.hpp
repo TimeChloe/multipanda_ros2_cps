@@ -7,6 +7,7 @@
 #include <Eigen/Dense>
 #include <controller_interface/controller_interface.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include "franka_semantic_components/franka_robot_model.hpp"
 
@@ -47,36 +48,32 @@ struct MonitorResult {
   double Tn_now{0.0};
   double v_safe{0.0};
 
-  // First predicted nominal contact sample
   bool nominal_contact_sample_found{false};
   double nominal_contact_time{0.0};
   double nominal_contact_distance{0.0};
   double v_n_contact_nominal{0.0};
   double Tn_contact_nominal{0.0};
 
-  // Worst-case candidate over the future horizon
   bool worst_case_candidate_found{false};
   double worst_case_candidate_time{0.0};
   double worst_case_plane_distance_at_candidate{0.0};
   double worst_case_nominal_forward_progress{0.0};
-  double worst_case_e_n{0.0};
-  double worst_case_v_n{0.0};
-  double worst_case_E_fs_1d{0.0};
-  double worst_case_tau_safe{0.0};
-  double worst_case_delta_n_fs{0.0};
-  double worst_case_hybrid_forward_reach{0.0};
-  double worst_case_plane_margin_after_hybrid{0.0};
 
-  // Safety-function view
+  double worst_case_v_n_fs_ub{0.0};
+  double worst_case_Tn_fs_ub{0.0};
+  double worst_case_a_pos{0.0};
+  double worst_case_a_brake{0.0};
+  double worst_case_a_net{0.0};
+
   double h_geom{0.0};
   double h_nominal_energy{0.0};
   double h_failsafe_energy{0.0};
 
-  // Current failsafe storage
-  double e_n_now_fs{0.0};
   double v_n_now_fs{0.0};
-  double V_fs_now{0.0};
-  double V_fs_dot_est{0.0};
+  double Tn_now_fs{0.0};
+  double Tn_dot_est{0.0};
+
+  Vector3d nominal_contact_point_world{Vector3d::Zero()};
 };
 
 class ReachableCartesianImpedanceController
@@ -95,9 +92,6 @@ class ReachableCartesianImpedanceController
  private:
   static constexpr int kNumJoints = 7;
 
-  // --------------------------------------------------------------------------
-  // helpers
-  // --------------------------------------------------------------------------
   void updateRuntimeGains(double dt);
 
   void buildReference(double nominal_time,
@@ -122,51 +116,55 @@ class ReachableCartesianImpedanceController
                                  const Matrix7d& inertia,
                                  const Matrix37d& Jv,
                                  const Vector3d& plane_normal,
-                                 const Vector3d& plane_point);
+                                 const Vector3d& sphere_center);
 
-  // --------------------------------------------------------------------------
-  // logging
-  // --------------------------------------------------------------------------
+  double computeNormalStiffnessUpperBound() const;
+  double computeNormalDampingLowerBound() const;
+
+  double computeConservativeNormalAccelPositiveBound(double m_eff_n,
+                                                     double e_n_abs,
+                                                     double v_n_abs) const;
+
+  double computeConservativeNormalBrakeAccelLowerBound(double m_eff_n,
+                                                       double v_n_abs) const;
+
+  double distanceToSweptHandRegion(const Vector3d& x,
+                                   const Vector3d& plane_normal,
+                                   const Vector3d& sphere_center) const;
+
+  void publishRvizDiagnostics(double wall_time,
+                              const Vector3d& current_position,
+                              const Vector3d& desired_position_cur,
+                              const Vector6d& ee_twist,
+                              const MonitorResult& monitor);
+
   bool enable_error_logging_{false};
   std::string error_log_path_{
-      "/home/developer/multipanda_ws/src/data_log/cartesian_impedance_failsafe_validation.csv"};
+      "/home/developer/multipanda_ws/src/data_log/reachable_cartesian_impedance_validation.csv"};
   std::ofstream error_log_file_;
   std::size_t log_write_counter_{0};
 
-  // --------------------------------------------------------------------------
-  // basic configuration
-  // --------------------------------------------------------------------------
   std::string arm_id_;
   std::string reference_trajectory_type_{"line"};
   bool use_constant_reference_{false};
 
-  // --------------------------------------------------------------------------
-  // robot / model handles
-  // --------------------------------------------------------------------------
   std::unique_ptr<franka_semantic_components::FrankaRobotModel> franka_robot_model_;
 
-  // --------------------------------------------------------------------------
-  // runtime state
-  // --------------------------------------------------------------------------
   rclcpp::Time start_time_;
 
   Quaterniond desired_orientation_;
   Vector3d desired_position_;
   Vector7d desired_qn_;
 
-  // frozen reference used in failsafe
   Quaterniond frozen_desired_orientation_;
   Vector3d frozen_desired_position_;
 
-  // mode
   SafetyMode mode_{SafetyMode::kNominal};
   double failsafe_start_time_sec_{-1.0};
 
-  // nominal-time pause bookkeeping
   double failsafe_enter_wall_time_sec_{-1.0};
   double paused_nominal_time_sec_{0.0};
 
-  // gains
   Matrix6d K_nominal_{Matrix6d::Zero()};
   Matrix6d D_nominal_{Matrix6d::Zero()};
   Matrix6d K_f_target_{Matrix6d::Zero()};
@@ -178,43 +176,74 @@ class ReachableCartesianImpedanceController
   double n_stiffness_{0.0};
   bool disable_nullspace_in_failsafe_{true};
 
-  // --------------------------------------------------------------------------
-  // safety monitor configuration
-  // --------------------------------------------------------------------------
   bool enable_safety_monitor_{true};
   bool auto_enter_failsafe_{false};
 
   double safe_collision_energy_joule_{0.10};
   double ee_collision_radius_{0.04};
 
-  double monitor_nominal_horizon_sec_{0.02};
+  double monitor_nominal_horizon_sec_{0.03};
   int monitor_nominal_steps_{10};
+  int monitor_decimation_{10};
 
+  // Projection direction still used for kinetic-energy monitoring
   Vector3d human_plane_normal_{Vector3d(0.0, 0.0, 1.0)};
-  Vector3d human_plane_point_{Vector3d(0.0, 0.0, 0.2)};
 
-  // hysteresis / return conditions
-  // geom margin is kept for backward-compatible parameter parsing / logging
-  double return_to_nominal_geom_margin_{0.005};
+  // Center of spherical human reachable region
+  Vector3d human_sphere_center_{Vector3d(0.0, 0.0, 0.2)};
+
+  // Sphere model:
+  // effective human region radius = human_motion_radius + human_hand_radius
+  double human_motion_radius_{0.10};
+  double human_hand_radius_{0.04};
+
   double return_to_nominal_energy_margin_{0.02};
   double return_to_nominal_speed_threshold_{0.02};
-  double return_to_nominal_vdot_threshold_{0.0};
+  double return_to_nominal_tndot_threshold_{0.0};
 
-  // --------------------------------------------------------------------------
-  // current failsafe storage tracking
-  // --------------------------------------------------------------------------
-  double prev_V_fs_{0.0};
-  bool prev_V_fs_valid_{false};
-  double last_e_n_fs_{0.0};
+  double return_to_nominal_geom_margin_{0.005};
+
+  double k_rate_limit_{5000.0};
+  double d_rate_limit_{500.0};
+  double tau_rate_limit_{1000.0};
+  double torque_to_accel_gain_{8.0};
+  double model_accel_uncertainty_{0.5};
+  double stiffness_error_bound_m_{0.02};
+
+  double prev_Tn_fs_{0.0};
+  bool prev_Tn_fs_valid_{false};
   double last_v_n_fs_{0.0};
 
-  // --------------------------------------------------------------------------
-  // profiling statistics
-  // --------------------------------------------------------------------------
+  std::size_t monitor_counter_{0};
+  bool last_monitor_result_valid_{false};
+  double last_monitor_wall_time_{0.0};
+  MonitorResult last_monitor_result_{};
+
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr rviz_marker_pub_;
+
+  bool rviz_enable_markers_{true};
+  std::string rviz_frame_id_{"panda_link0"};
+  int rviz_marker_decimation_{10};
+  std::size_t rviz_publish_counter_{0};
+
+  double rviz_marker_lifetime_sec_{0.2};
+
+  double rviz_plane_size_{0.8};
+  double rviz_plane_thickness_{0.003};
+  double rviz_normal_arrow_length_{0.20};
+  double rviz_velocity_arrow_scale_{0.25};
+
+  double rviz_arrow_shaft_diameter_{0.01};
+  double rviz_arrow_head_diameter_{0.02};
+  double rviz_arrow_head_length_{0.03};
+
+  double rviz_text_scale_{0.04};
+  double rviz_text_z_offset_{0.12};
+  double rviz_ub_arrow_z_offset_{0.05};
+
   int profiling_stats_print_period_{1000};
 
   std::size_t loop_counter_{0};
-
   double exec_sum_ms_{0.0};
   double exec_min_ms_{1e9};
   double exec_max_ms_{0.0};

@@ -98,7 +98,7 @@ def generate_launch_description():
         # Launch args
         DeclareLaunchArgument(
             use_rviz_param,
-            default_value='false',
+            default_value='true',
             description='Visualize the robot in Rviz'),
         DeclareLaunchArgument(
             arm_id_param,
