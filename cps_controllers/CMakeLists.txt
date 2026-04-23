@@ -28,6 +28,7 @@ add_library(${PROJECT_NAME} SHARED
   src/joint_impedance_energybudget_controller.cpp
   src/nonlinear_impedance_controller.cpp
   src/reachable_cartesian_impedance_controller.cpp
+  src/free_motion_external_wrench_controller.cpp
 )
 
 target_include_directories(${PROJECT_NAME}

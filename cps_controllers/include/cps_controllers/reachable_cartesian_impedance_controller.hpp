@@ -3,6 +3,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <Eigen/Dense>
 #include <controller_interface/controller_interface.hpp>
@@ -73,7 +74,49 @@ struct MonitorResult {
   double Tn_now_fs{0.0};
   double Tn_dot_est{0.0};
 
+  double current_pos_error_radius{0.0};
+  double current_vel_error_radius{0.0};
+  double worst_case_pos_error_radius{0.0};
+  double worst_case_vel_error_radius{0.0};
+
   Vector3d nominal_contact_point_world{Vector3d::Zero()};
+};
+
+struct ImpedanceSample {
+  double t{0.0};
+
+  Vector3d p{Vector3d::Zero()};
+  Vector3d dp{Vector3d::Zero()};
+  Vector3d ddp{Vector3d::Zero()};
+
+  Quaterniond q{Quaterniond::Identity()};
+  Vector3d w{Vector3d::Zero()};
+  Vector3d dw{Vector3d::Zero()};
+
+  Matrix6d K{Matrix6d::Zero()};
+  Matrix6d D{Matrix6d::Zero()};
+
+  bool failsafe{false};
+};
+
+struct VerifiedPlan {
+  bool valid{false};
+
+  ImpedanceSample anchor;
+  std::vector<ImpedanceSample> intended;
+  std::vector<ImpedanceSample> failsafe;
+
+  std::size_t failsafe_exec_index{0};
+  double generated_wall_time{0.0};
+  double nominal_time_anchor{0.0};
+};
+
+struct ShieldDecision {
+  bool candidate_verified{false};
+  bool executing_last_verified_failsafe{false};
+
+  ImpedanceSample command;
+  MonitorResult monitor;
 };
 
 class ReachableCartesianImpedanceController
@@ -92,7 +135,15 @@ class ReachableCartesianImpedanceController
  private:
   static constexpr int kNumJoints = 7;
 
-  void updateRuntimeGains(double dt);
+  struct PathState {
+    double t_path{0.0};
+    double rate{0.0};
+    double accel{0.0};
+  };
+
+  void updateRuntimeGains(const Matrix6d& K_target,
+                          const Matrix6d& D_target,
+                          double dt);
 
   void buildReference(double nominal_time,
                       Vector3d& desired_position_cur,
@@ -118,25 +169,81 @@ class ReachableCartesianImpedanceController
                                  const Vector3d& plane_normal,
                                  const Vector3d& sphere_center);
 
-  double computeNormalStiffnessUpperBound() const;
-  double computeNormalDampingLowerBound() const;
+  double computeNormalStiffnessAlongNormal(const Matrix6d& K) const;
+  double computeNormalDampingAlongNormal(const Matrix6d& D) const;
 
   double computeConservativeNormalAccelPositiveBound(double m_eff_n,
                                                      double e_n_abs,
-                                                     double v_n_abs) const;
+                                                     double v_n_abs,
+                                                     const Matrix6d& K_used) const;
 
   double computeConservativeNormalBrakeAccelLowerBound(double m_eff_n,
-                                                       double v_n_abs) const;
+                                                       double v_n_abs,
+                                                       const Matrix6d& D_used) const;
 
   double distanceToSweptHandRegion(const Vector3d& x,
                                    const Vector3d& plane_normal,
                                    const Vector3d& sphere_center) const;
+
+  double estimatePathParameterTimeFromCurrentState(const Vector3d& current_position,
+                                                   double nominal_guess_time) const;
+
+  double estimatePathTimeRateFromCurrentState(double path_time_anchor,
+                                              const Vector3d& current_linear_velocity) const;
+
+  PathState propagateOnlinePathState(const Vector3d& current_position,
+                                     const Vector3d& current_linear_velocity,
+                                     double nominal_guess_time,
+                                     double dtp) const;
 
   void publishRvizDiagnostics(double wall_time,
                               const Vector3d& current_position,
                               const Vector3d& desired_position_cur,
                               const Vector6d& ee_twist,
                               const MonitorResult& monitor);
+
+  ImpedanceSample makeNominalSample(double nominal_time,
+                                    double path_rate,
+                                    double path_accel,
+                                    const Matrix6d& K_cmd,
+                                    const Matrix6d& D_cmd) const;
+
+  ImpedanceSample makeFrozenFailsafeSample(double nominal_time,
+                                           const ImpedanceSample& freeze_sample,
+                                           const Matrix6d& K_cmd,
+                                           const Matrix6d& D_cmd) const;
+
+  VerifiedPlan buildCandidatePlan(double wall_time,
+                                  double nominal_guess_time,
+                                  const Vector3d& current_position,
+                                  const Quaterniond& current_orientation,
+                                  const Vector6d& ee_twist) const;
+
+  MonitorResult verifyCandidatePlan(const VerifiedPlan& plan,
+                                    const Vector3d& current_position,
+                                    const Vector6d& ee_twist,
+                                    const Matrix7d& inertia,
+                                    const Matrix37d& Jv,
+                                    const Vector3d& plane_normal,
+                                    const Vector3d& sphere_center) const;
+
+  ShieldDecision computeShieldDecision(double wall_time,
+                                       double nominal_guess_time,
+                                       const Vector3d& current_position,
+                                       const Quaterniond& current_orientation,
+                                       const Vector6d& ee_twist,
+                                       const Matrix7d& inertia,
+                                       const Matrix37d& Jv);
+
+  Vector7d computeImpedanceTorque(const Vector7d& q,
+                                  const Vector7d& dq,
+                                  const Matrix7d& inertia,
+                                  const Vector7d& coriolis,
+                                  const Matrix67d& J_geo,
+                                  const Vector3d& current_position,
+                                  const Quaterniond& current_orientation,
+                                  const ImpedanceSample& cmd,
+                                  double dt);
 
   bool enable_error_logging_{false};
   std::string error_log_path_{
@@ -177,7 +284,6 @@ class ReachableCartesianImpedanceController
   bool disable_nullspace_in_failsafe_{true};
 
   bool enable_safety_monitor_{true};
-  bool auto_enter_failsafe_{false};
 
   double safe_collision_energy_joule_{0.10};
   double ee_collision_radius_{0.04};
@@ -186,29 +292,40 @@ class ReachableCartesianImpedanceController
   int monitor_nominal_steps_{10};
   int monitor_decimation_{10};
 
-  // Projection direction still used for kinetic-energy monitoring
   Vector3d human_plane_normal_{Vector3d(0.0, 0.0, 1.0)};
-
-  // Center of spherical human reachable region
   Vector3d human_sphere_center_{Vector3d(0.0, 0.0, 0.2)};
 
-  // Sphere model:
-  // effective human region radius = human_motion_radius + human_hand_radius
   double human_motion_radius_{0.10};
   double human_hand_radius_{0.04};
 
   double return_to_nominal_energy_margin_{0.02};
   double return_to_nominal_speed_threshold_{0.02};
   double return_to_nominal_tndot_threshold_{0.0};
-
   double return_to_nominal_geom_margin_{0.005};
 
   double k_rate_limit_{5000.0};
   double d_rate_limit_{500.0};
   double tau_rate_limit_{1000.0};
   double torque_to_accel_gain_{8.0};
-  double model_accel_uncertainty_{0.5};
-  double stiffness_error_bound_m_{0.02};
+  double model_accel_uncertainty_{0.05};
+  double stiffness_error_bound_m_{0.01};
+
+  double error_pos_gain_alpha_{60.0};
+  double error_vel_gain_beta_{20.0};
+  double error_acc_disturbance_gamma_{0.20};
+
+  int shield_horizon_steps_{20};
+  double shield_plan_dt_{0.01};
+
+  double path_retiming_search_window_sec_{0.25};
+  int path_retiming_search_steps_{41};
+  double path_time_rate_min_{0.0};
+  double path_time_rate_max_{1.5};
+  double path_time_acc_limit_{3.0};
+  double path_time_rate_target_{1.0};
+
+  bool use_dynamic_consistent_impedance_{true};
+  double torque_rate_limit_{1000.0};
 
   double prev_Tn_fs_{0.0};
   bool prev_Tn_fs_valid_{false};
@@ -218,6 +335,16 @@ class ReachableCartesianImpedanceController
   bool last_monitor_result_valid_{false};
   double last_monitor_wall_time_{0.0};
   MonitorResult last_monitor_result_{};
+
+  double last_path_anchor_time_{0.0};
+  double last_path_rate_{1.0};
+  double last_intended_path_time_{0.0};
+
+  bool last_shield_decision_valid_{false};
+  ShieldDecision last_shield_decision_{};
+
+  VerifiedPlan last_verified_plan_{};
+  Vector7d tau_cmd_prev_{Vector7d::Zero()};
 
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr rviz_marker_pub_;
 

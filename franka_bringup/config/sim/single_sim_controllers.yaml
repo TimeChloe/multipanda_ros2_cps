@@ -32,8 +32,11 @@ controller_manager:
         type: cps_controllers/JointImpedanceEnergyBudgetController
       nonlinear_impedance_controller:
         type: cps_controllers/NonlinearImpedanceController
+      free_motion_external_wrench_controller:
+        type: cps_controllers/FreeMotionExternalWrenchController
       reachable_cartesian_impedance_controller:
         type: cps_controllers/ReachableCartesianImpedanceController
+
 franka_robot_state_broadcaster:
   ros__parameters:
     arm_id: panda
@@ -127,6 +130,58 @@ nonlinear_impedance_controller:
     friction_offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     profiling_stats_print_period: 1000
 
+
+free_motion_external_wrench_controller:
+  ros__parameters:
+    type: cps_controllers/FreeMotionExternalWrenchController
+    arm_id: panda
+
+    joint_damping: [0.12, 0.12, 0.10, 0.08, 0.05, 0.05, 0.04]
+    velocity_filter_alpha: 0.99
+
+    estimate_bias: true
+    bias_estimation_duration: 3.0
+    bias_velocity_threshold: 0.02
+
+    publish_rate: 100.0
+
+    enable_csv_logging: true
+    csv_log_path: "/home/developer/multipanda_ws/src/data_log/free_motion_external_wrench_auto.csv"
+
+    auto_run_experiments: true
+
+    baseline_duration: 10.0
+    joint_sine_duration: 30.0
+    cartesian_line_duration: 30.0
+    cartesian_lissajous_duration: 60.0
+
+    joint_sine_indices: [3, 4, 5]
+
+    default_joint_amplitude: 0.15
+    default_joint_frequency: 0.30
+    default_joint_track_stiffness: 25.0
+
+    default_cartesian_amplitude_x: 0.08
+    default_cartesian_amplitude_y: 0.08
+    default_cartesian_amplitude_z: 0.05
+    default_cartesian_frequency: 0.25
+    default_cartesian_track_stiffness: 120.0
+    default_cartesian_track_damping: 16.0
+
+    # 手动模式参数。只有 auto_run_experiments: false 时才会用到
+    trajectory_type: "constant"
+    traj_joint_amplitude: 0.05
+    traj_joint_frequency: 0.2
+    traj_joint_index: 0
+    traj_cartesian_amplitude_x: 0.03
+    traj_cartesian_amplitude_y: 0.03
+    traj_cartesian_amplitude_z: 0.02
+    traj_cartesian_frequency: 0.2
+    joint_track_stiffness: 5.0
+    cartesian_track_stiffness: 20.0
+    cartesian_track_damping: 8.0
+
+
 reachable_cartesian_impedance_controller:
   ros__parameters:
     arm_id: panda
@@ -137,11 +192,11 @@ reachable_cartesian_impedance_controller:
     use_constant_reference: false
     reference_trajectory_type: line
 
-    nominal_pos_stiffness: 400.0
-    nominal_rot_stiffness: 20.0
+    nominal_pos_stiffness: 800.0
+    nominal_rot_stiffness: 40.0
 
-    failsafe_pos_stiffness: 50.0
-    failsafe_rot_stiffness: 5.0
+    failsafe_pos_stiffness: 200.0
+    failsafe_rot_stiffness: 20.0
     failsafe_pos_damping_scale: 2.5
     failsafe_rot_damping_scale: 2.5
 
@@ -150,37 +205,52 @@ reachable_cartesian_impedance_controller:
     disable_nullspace_in_failsafe: true
 
     enable_safety_monitor: true
-    auto_enter_failsafe: true
 
     safe_collision_energy_joule: 0.13
-    ee_collision_radius: 0.10
+    ee_collision_radius: 0.04
 
     monitor_decimation: 5
-    monitor_nominal_horizon_sec: 0.01
-    monitor_nominal_steps: 10
+    monitor_nominal_horizon_sec: 0.005
+    monitor_nominal_steps: 5
 
-    # still used as projection direction for normal kinetic energy
     human_plane_normal: [0.0, 0.0, -1.0]
-
-    # center of spherical human reachable region
     human_sphere_center: [0.3, 0.0, 0.3]
 
-    # effective sphere radius = human_motion_radius + human_hand_radius
     human_motion_radius: 0.08
     human_hand_radius: 0.04
 
     return_to_nominal_energy_margin: 0.02
     return_to_nominal_speed_threshold: 0.02
     return_to_nominal_tndot_threshold: 0.0
-
     return_to_nominal_geom_margin: 0.005
 
-    k_rate_limit: 5000.0
-    d_rate_limit: 500.0
-    tau_rate_limit: 200.0
-    torque_to_accel_gain: 8.0
-    model_accel_uncertainty: 0.5
+    k_rate_limit: 500000.0
+    d_rate_limit: 50000.0
+    tau_rate_limit: 1000.0
+    torque_to_accel_gain: 2.0
+    model_accel_uncertainty: 0.05
     stiffness_error_bound_m: 0.00
+
+    # Local error-tube dynamics:
+    #   r_p_dot <= r_v
+    #   r_v_dot <= alpha * r_p - beta * r_v + gamma
+    error_pos_gain_alpha: 20.0
+    error_vel_gain_beta: 10.0
+    error_acc_disturbance_gamma: 0.05
+
+    shield_horizon_steps: 5
+    shield_plan_dt: 0.001
+
+    # Online intended generation along the same geometric path
+    path_retiming_search_window_sec: 0.25
+    path_retiming_search_steps: 41
+    path_time_rate_min: 0.0
+    path_time_rate_max: 1.5
+    path_time_acc_limit: 3.0
+    path_time_rate_target: 1.0
+
+    use_dynamic_consistent_impedance: true
+    torque_rate_limit: 1000.0
 
     rviz_enable_markers: true
     rviz_frame_id: panda_link0

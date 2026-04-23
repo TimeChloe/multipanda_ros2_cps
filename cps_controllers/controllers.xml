@@ -24,4 +24,13 @@
       reference freezing, safety monitor, and logging.
     </description>
   </class>
+
+  <class name="cps_controllers/FreeMotionExternalWrenchController"
+         type="cps_controllers::FreeMotionExternalWrenchController"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Cartesian impedance controller that applies a constant wrench in free-motion.
+    </description>
+  </class>
+  
 </library>
