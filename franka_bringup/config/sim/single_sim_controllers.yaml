@@ -192,12 +192,12 @@ reachable_cartesian_impedance_controller:
     use_constant_reference: false
     reference_trajectory_type: line
 
-    nominal_pos_stiffness: 400.0
-    nominal_rot_stiffness: 20.0
+    nominal_pos_stiffness: 800.0
+    nominal_rot_stiffness: 40.0
 
     # Failsafe 建议比 nominal 更软，但阻尼更大，用于安全吸收动能。
-    failsafe_pos_stiffness: 50.0
-    failsafe_rot_stiffness: 5.0
+    failsafe_pos_stiffness: 100.0
+    failsafe_rot_stiffness: 20.0
     failsafe_pos_damping_scale: 3.0
     failsafe_rot_damping_scale: 3.0
 
@@ -206,7 +206,7 @@ reachable_cartesian_impedance_controller:
 
     enable_safety_monitor: true
 
-    safe_collision_energy_joule: 0.13
+    safe_collision_energy_joule: 0.05
     ee_collision_radius: 0.04
     monitor_decimation: 1
 
@@ -222,25 +222,25 @@ reachable_cartesian_impedance_controller:
 
     tau_rate_limit: 1000.0
     torque_to_accel_gain: 2.0
-    model_accel_uncertainty: 0.05
-    stiffness_error_bound_m: 0.005
+    model_accel_uncertainty: 0.00
+    stiffness_error_bound_m: 0.000
 
     # 误差管道 (tracking error tube) 边界：替代旧的不稳定 ODE 动态参数
-    tracking_pos_error_bound: 0.005     # 5 mm，可标定
-    tracking_vel_error_bound: 0.05      # 5 cm/s，可标定
+    tracking_pos_error_bound: 0.000     # 5 mm，可标定
+    tracking_vel_error_bound: 0.00      # 5 cm/s，可标定
 
     # monitored trajectory = intended + failsafe
     # 100 * 0.01 = 1.0s，覆盖 Failsafe 阻抗控制器切换时的失稳态收敛过程。
-    shield_horizon_steps: 100
-    shield_plan_dt: 0.01
+    shield_horizon_steps: 20
+    shield_plan_dt: 0.001
 
     # Ruckig 局部重规划与意图缓存参数
     local_replan_horizon_steps: 200     # 硬上限，防止 buffer 中生成超过 7000 步引起爆炸
     local_replan_dt: 0.001
-    local_path_lookahead_sec: 0.08      # 局部 lookahead，line 还有 t_goal≤1.5 兜底
-    local_replan_max_velocity: 0.08
-    local_replan_max_acceleration: 0.4
-    local_replan_max_jerk: 2.0
+    local_path_lookahead_sec: 0.20      # 局部 lookahead，line 还有 t_goal≤1.5 兜底
+    local_replan_max_velocity: 0.30
+    local_replan_max_acceleration: 0.5
+    local_replan_max_jerk: 1.0
 
     path_retiming_search_window_sec: 0.25
     path_retiming_search_steps: 41

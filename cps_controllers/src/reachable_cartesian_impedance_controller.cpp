@@ -167,6 +167,48 @@ inline SmoothStartProfile makeSmoothStartProfile(double t, double T) {
   return out;
 }
 
+inline double invertSmoothStartS(double s_target) {
+  s_target = std::clamp(s_target, 0.0, 1.0);
+
+  double lo = 0.0;
+  double hi = 1.0;
+
+  for (int i = 0; i < 40; ++i) {
+    const double x = 0.5 * (lo + hi);
+    const double x2 = x * x;
+    const double x3 = x2 * x;
+    const double x4 = x3 * x;
+    const double x5 = x4 * x;
+    const double s = 10.0 * x3 - 15.0 * x4 + 6.0 * x5;
+
+    if (s < s_target) {
+      lo = x;
+    } else {
+      hi = x;
+    }
+  }
+
+  return 0.5 * (lo + hi);
+}
+
+inline double estimateLinePathTimeFromZ(
+    double z,
+    double z_start,
+    double z_final,
+    double T_move) {
+  const double denom = z_final - z_start;
+
+  if (std::abs(denom) < 1e-9) {
+    return 0.0;
+  }
+
+  const double s = std::clamp((z - z_start) / denom, 0.0, 1.0);
+  const double x = invertSmoothStartS(s);
+
+  return std::clamp(x * T_move, 0.0, T_move);
+}
+
+
 inline TaskRefPose makeReferenceLine(double t, const Vector3d& p0, const Matrix3d& R0) {
   TaskRefPose ref;
   constexpr double T_move = 1.5;
@@ -585,11 +627,7 @@ ImpedanceSample ReachableCartesianImpedanceController::getNextFailsafeCommandFro
 // ============================================================================
 bool ReachableCartesianImpedanceController::refillRuckigIntendedBuffer(
     double nominal_guess_time,
-    const Vector3d& current_position,
-    const Vector3d& current_linear_velocity,
-    const Quaterniond& current_orientation) {
-  (void)current_orientation;
-
+    const ImpedanceSample& planning_start_command) {
   intended_buffer_.clear();
   intended_buffer_index_ = 0;
   intended_buffer_valid_ = false;
@@ -597,52 +635,218 @@ bool ReachableCartesianImpedanceController::refillRuckigIntendedBuffer(
   const double dtp = std::max(local_replan_dt_, kMinDt);
   const Vector3d p0 = desired_position_;
   const Matrix3d R0 = desired_orientation_.toRotationMatrix();
-  const auto traj_type = parseTrajectoryTypeOrDefault(use_constant_reference_, reference_trajectory_type_);
+  const auto traj_type =
+      parseTrajectoryTypeOrDefault(use_constant_reference_, reference_trajectory_type_);
 
-  const double t_near = estimatePathParameterTimeFromCurrentState(current_position, nominal_guess_time);
+  // --------------------------------------------------------------------------
+  // LINE MODE:
+  // Use 1D Ruckig only along z.
+  // This guarantees the commanded path stays vertical.
+  // --------------------------------------------------------------------------
+  if (traj_type == ReferenceTrajectoryType::kLine) {
+    constexpr double T_move = 1.5;
+    constexpr double dz = -0.55;
 
-  double t_goal = t_near;
-  switch (traj_type) {
-    case ReferenceTrajectoryType::kLine:
-      // SARA-CHANGE: cap line lookahead too, do not aim at the global goal
-      t_goal = std::min(1.5, t_near + std::max(local_path_lookahead_sec_, dtp));
-      break;
-    case ReferenceTrajectoryType::kConstant:
-      t_goal = t_near + dtp;
-      break;
-    case ReferenceTrajectoryType::kLissajous:
-    default:
-      t_goal = t_near + std::max(local_path_lookahead_sec_, dtp);
-      break;
+    const double z_start = p0.z();
+    const double z_final = p0.z() + dz;
+
+    const double q0_raw = planning_start_command.p.z();
+    const double q0 = std::clamp(q0_raw, z_final, z_start);
+
+    // Path time is estimated from the actual commanded/planning-start z.
+    // Do not trust commanded_path_time_ alone, because it may keep advancing
+    // while the robot is stopped in failsafe.
+    const double t_near = estimateLinePathTimeFromZ(q0, z_start, z_final, T_move);
+
+    double t_goal = t_near + std::max(local_path_lookahead_sec_, dtp);
+    t_goal = std::clamp(t_goal, 0.0, T_move);
+
+    // Only freeze at the final point if the planning state is already physically
+    // close to the final point. Never jump directly to z_final merely because
+    // t_near reached T_move.
+    const bool near_final_position = std::abs(q0 - z_final) < 1e-3;
+    const bool near_zero_velocity = std::abs(planning_start_command.dp.z()) < 1e-3;
+
+    if (near_final_position && near_zero_velocity) {
+      const int n_steps = std::max(1, local_replan_horizon_steps_);
+      intended_buffer_.reserve(static_cast<std::size_t>(n_steps));
+
+      for (int i = 0; i < n_steps; ++i) {
+        ImpedanceSample s;
+        s.t = static_cast<double>(i + 1) * dtp;
+        s.p = Vector3d(p0.x(), p0.y(), z_final);
+        s.dp.setZero();
+        s.ddp.setZero();
+        s.q = desired_orientation_;
+        s.q.normalize();
+        s.w.setZero();
+        s.dw.setZero();
+        s.K = K_nominal_;
+        s.D = D_nominal_;
+        s.failsafe = false;
+        intended_buffer_.push_back(s);
+      }
+
+      intended_buffer_valid_ = true;
+      return true;
+    }
+
+    const TaskRefPose goal_ref = makeReferenceLine(t_goal, p0, R0);
+
+    // q0 has already been computed above from planning_start_command.
+    const double v0 = std::min(planning_start_command.dp.z(), 0.0);
+    const double a0 = planning_start_command.ddp.z();
+
+    // Target is only allowed to move downward along the line.
+    // Since dz < 0, z_final <= q1 <= q0.
+    const double q1 = std::clamp(goal_ref.p.z(), z_final, q0);
+
+    // Use zero terminal velocity for local line goals.
+    // This avoids overshoot and final upward rebound.
+    const double v1 = 0.0;
+    const double a1 = 0.0;
+
+    ruckig::Ruckig<1> otg;
+    ruckig::InputParameter<1> input;
+    ruckig::Trajectory<1> trajectory;
+
+    input.current_position = {q0};
+    input.current_velocity = {v0};
+    input.current_acceleration = {a0};
+
+    input.target_position = {q1};
+    input.target_velocity = {v1};
+    input.target_acceleration = {a1};
+
+    input.max_velocity = {local_replan_max_velocity_};
+    input.max_acceleration = {local_replan_max_acceleration_};
+    input.max_jerk = {local_replan_max_jerk_};
+
+    const auto result = otg.calculate(input, trajectory);
+    if (result < ruckig::Result::Working) {
+      return false;
+    }
+
+    const double duration = std::max(trajectory.get_duration(), dtp);
+    const int n_steps = std::min(
+        local_replan_horizon_steps_,
+        std::max(1, static_cast<int>(std::ceil(duration / dtp))));
+
+    intended_buffer_.reserve(static_cast<std::size_t>(n_steps));
+
+    double previous_z = q0;
+
+    for (int i = 0; i < n_steps; ++i) {
+      const double tau = std::min(static_cast<double>(i + 1) * dtp, duration);
+
+      std::array<double, 1> p{}, v{}, a{};
+      trajectory.at_time(tau, p, v, a);
+
+      double z_cmd = p[0];
+      double dz_cmd = v[0];
+      double ddz_cmd = a[0];
+
+      // Hard geometric path protection:
+      // command must not move upward and must not go below the final endpoint.
+      z_cmd = std::min(z_cmd, previous_z);
+      z_cmd = std::max(z_cmd, z_final);
+
+      dz_cmd = std::min(dz_cmd, 0.0);
+
+      if (z_cmd <= z_final + 1e-6) {
+        z_cmd = z_final;
+        dz_cmd = 0.0;
+        ddz_cmd = 0.0;
+      }
+
+      ImpedanceSample s;
+      s.t = tau;
+      s.p = Vector3d(p0.x(), p0.y(), z_cmd);
+      s.dp = Vector3d(0.0, 0.0, dz_cmd);
+      s.ddp = Vector3d(0.0, 0.0, ddz_cmd);
+      s.q = desired_orientation_;
+      s.q.normalize();
+      s.w.setZero();
+      s.dw.setZero();
+      s.K = K_nominal_;
+      s.D = D_nominal_;
+      s.failsafe = false;
+
+      intended_buffer_.push_back(s);
+      previous_z = z_cmd;
+    }
+
+    intended_buffer_valid_ = !intended_buffer_.empty();
+    return intended_buffer_valid_;
   }
-  if (t_goal <= t_near + dtp) t_goal = t_near + dtp;
+
+  // --------------------------------------------------------------------------
+  // NON-LINE MODE:
+  // Keep 3D Ruckig, but still start from the last commanded state.
+  // --------------------------------------------------------------------------
+  const double t_near = std::max(0.0, nominal_guess_time);
+  double t_goal = t_near + std::max(local_path_lookahead_sec_, dtp);
 
   const TaskRefPose goal_ref = makeReferencePose(t_goal, p0, R0, traj_type);
 
   Vector3d target_velocity = goal_ref.dp;
   const double v_norm = target_velocity.norm();
-  if (v_norm > local_replan_max_velocity_)
+  if (v_norm > local_replan_max_velocity_) {
     target_velocity *= local_replan_max_velocity_ / std::max(v_norm, kSmallPositive);
+  }
 
   ruckig::Ruckig<3> otg;
   ruckig::InputParameter<3> input;
   ruckig::Trajectory<3> trajectory;
 
-  input.current_position     = {current_position.x(), current_position.y(), current_position.z()};
-  input.current_velocity     = {current_linear_velocity.x(), current_linear_velocity.y(), current_linear_velocity.z()};
-  input.current_acceleration = {0.0, 0.0, 0.0};
-  input.target_position      = {goal_ref.p.x(), goal_ref.p.y(), goal_ref.p.z()};
-  input.target_velocity      = {target_velocity.x(), target_velocity.y(), target_velocity.z()};
-  input.target_acceleration  = {0.0, 0.0, 0.0};
-  input.max_velocity     = {local_replan_max_velocity_, local_replan_max_velocity_, local_replan_max_velocity_};
-  input.max_acceleration = {local_replan_max_acceleration_, local_replan_max_acceleration_, local_replan_max_acceleration_};
-  input.max_jerk         = {local_replan_max_jerk_, local_replan_max_jerk_, local_replan_max_jerk_};
+  input.current_position = {
+      planning_start_command.p.x(),
+      planning_start_command.p.y(),
+      planning_start_command.p.z()};
+
+  input.current_velocity = {
+      planning_start_command.dp.x(),
+      planning_start_command.dp.y(),
+      planning_start_command.dp.z()};
+
+  input.current_acceleration = {
+      planning_start_command.ddp.x(),
+      planning_start_command.ddp.y(),
+      planning_start_command.ddp.z()};
+
+  input.target_position = {
+      goal_ref.p.x(),
+      goal_ref.p.y(),
+      goal_ref.p.z()};
+
+  input.target_velocity = {
+      target_velocity.x(),
+      target_velocity.y(),
+      target_velocity.z()};
+
+  input.target_acceleration = {0.0, 0.0, 0.0};
+
+  input.max_velocity = {
+      local_replan_max_velocity_,
+      local_replan_max_velocity_,
+      local_replan_max_velocity_};
+
+  input.max_acceleration = {
+      local_replan_max_acceleration_,
+      local_replan_max_acceleration_,
+      local_replan_max_acceleration_};
+
+  input.max_jerk = {
+      local_replan_max_jerk_,
+      local_replan_max_jerk_,
+      local_replan_max_jerk_};
 
   const auto result = otg.calculate(input, trajectory);
-  if (result < ruckig::Result::Working) return false;
+  if (result < ruckig::Result::Working) {
+    return false;
+  }
 
   const double duration = std::max(trajectory.get_duration(), dtp);
-  // SARA-CHANGE: cap n_steps so even worst-case Ruckig does not blow the buffer
   const int n_steps = std::min(
       local_replan_horizon_steps_,
       std::max(1, static_cast<int>(std::ceil(duration / dtp))));
@@ -651,17 +855,23 @@ bool ReachableCartesianImpedanceController::refillRuckigIntendedBuffer(
 
   for (int i = 0; i < n_steps; ++i) {
     const double tau = std::min(static_cast<double>(i + 1) * dtp, duration);
+
     std::array<double, 3> p{}, v{}, a{};
     trajectory.at_time(tau, p, v, a);
+
     ImpedanceSample s;
-    s.t = tau;          // relative time within the buffer
+    s.t = tau;
     s.p = Vector3d(p[0], p[1], p[2]);
     s.dp = Vector3d(v[0], v[1], v[2]);
     s.ddp = Vector3d(a[0], a[1], a[2]);
-    s.q = Quaterniond(goal_ref.R); s.q.normalize();
-    s.w.setZero(); s.dw.setZero();
-    s.K = K_nominal_; s.D = D_nominal_;
+    s.q = Quaterniond(goal_ref.R);
+    s.q.normalize();
+    s.w.setZero();
+    s.dw.setZero();
+    s.K = K_nominal_;
+    s.D = D_nominal_;
     s.failsafe = false;
+
     intended_buffer_.push_back(s);
   }
 
@@ -913,6 +1123,21 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     const Vector6d& ee_twist, const Matrix7d& inertia, const Matrix37d& Jv) {
   ShieldDecision dec;
 
+  if (parseTrajectoryTypeOrDefault(use_constant_reference_, reference_trajectory_type_) ==
+      ReferenceTrajectoryType::kLine) {
+    constexpr double T_move = 1.5;
+    constexpr double dz = -0.55;
+
+    const double z_start = desired_position_.z();
+    const double z_final = desired_position_.z() + dz;
+
+    commanded_path_time_ = estimateLinePathTimeFromZ(
+        current_position.z(),
+        z_start,
+        z_final,
+        T_move);
+  }
+
   auto verify_plan = [&](const VerifiedPlan& plan) {
     return verifyCandidatePlan(plan, current_position, ee_twist, inertia, Jv,
                                human_plane_normal_, human_sphere_center_);
@@ -937,9 +1162,41 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
   auto try_one_verification_with_fresh_buffer_if_needed = [&]() -> bool {
     // Refill buffer if empty/exhausted
     if (!intended_buffer_valid_ || intended_buffer_index_ >= intended_buffer_.size()) {
-      const bool ok = refillRuckigIntendedBuffer(
-          nominal_guess_time, current_position, ee_twist.head<3>(), current_orientation);
-      if (!ok) return false;
+    ImpedanceSample planning_start_command;
+
+    planning_start_command.t = wall_time;
+
+    // Position must stay command-continuous and path-monotone.
+    // Use the last commanded position if available.
+    if (last_commanded_sample_valid_) {
+      planning_start_command.p = last_commanded_sample_.p;
+      planning_start_command.q = last_commanded_sample_.q;
+    } else {
+      planning_start_command.p = current_position;
+      planning_start_command.q = current_orientation;
+    }
+    planning_start_command.q.normalize();
+
+    // Velocity should reflect the measured robot motion, not the previous failsafe command.
+    // Otherwise after failsafe, Ruckig restarts from v=0 while the robot may still be moving.
+    planning_start_command.dp = ee_twist.head<3>();
+    planning_start_command.w = ee_twist.tail<3>();
+
+    // Use zero unless you have a filtered measured acceleration estimate.
+    planning_start_command.ddp.setZero();
+    planning_start_command.dw.setZero();
+
+    planning_start_command.K = K_nominal_;
+    planning_start_command.D = D_nominal_;
+    planning_start_command.failsafe = false;
+
+    const bool ok = refillRuckigIntendedBuffer(
+        nominal_guess_time,
+        planning_start_command);
+
+      if (!ok) {
+        return false;
+      }
     }
 
     // Pick next intended step
@@ -962,7 +1219,12 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
   if (!first_attempt) {
     // Buffer refill failed: emergency stop
     mode_ = SafetyMode::kFailsafe;
-    execute_emergency();
+
+    intended_buffer_valid_ = false;
+    intended_buffer_index_ = 0;
+    intended_buffer_.clear();
+
+    execute_last_verified_failsafe();
     return dec;
   }
 
@@ -974,7 +1236,27 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     last_verified_plan_.failsafe_exec_index = 0;
     candidate_plan_valid_ = false;
 
-    ++intended_buffer_index_;     // consume one cached step
+    ++intended_buffer_index_;
+
+    if (parseTrajectoryTypeOrDefault(use_constant_reference_, reference_trajectory_type_) ==
+        ReferenceTrajectoryType::kLine) {
+      constexpr double T_move = 1.5;
+      constexpr double dz = -0.55;
+
+      const double z_start = desired_position_.z();
+      const double z_final = desired_position_.z() + dz;
+
+      const double z_for_path_time =
+          last_commanded_sample_valid_ ? last_commanded_sample_.p.z()
+                                      : current_position.z();
+
+      commanded_path_time_ = estimateLinePathTimeFromZ(
+          z_for_path_time,
+          z_start,
+          z_final,
+          T_move);
+    }
+
     mode_ = SafetyMode::kNominal;
 
     dec.executing_last_verified_failsafe = false;
@@ -997,6 +1279,22 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     candidate_plan_valid_ = false;
 
     ++intended_buffer_index_;
+
+    if (parseTrajectoryTypeOrDefault(use_constant_reference_, reference_trajectory_type_) ==
+        ReferenceTrajectoryType::kLine) {
+      constexpr double T_move = 1.5;
+      constexpr double dz = -0.55;
+
+      const double z_start = desired_position_.z();
+      const double z_final = desired_position_.z() + dz;
+
+      commanded_path_time_ = estimateLinePathTimeFromZ(
+          last_verified_plan_.intended.front().p.z(),
+          z_start,
+          z_final,
+          T_move);
+    }
+
     mode_ = SafetyMode::kNominal;
 
     dec.executing_last_verified_failsafe = false;
@@ -1172,6 +1470,9 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     last_monitor_wall_time_ = wall_time;
   }
 
+  last_commanded_sample_ = shield_dec.command;
+  last_commanded_sample_valid_ = true;
+
   const Vector7d tau_cmd = computeImpedanceTorque(
       q, dq, inertia, coriolis, J_geo,
       current_position, current_orientation,
@@ -1260,9 +1561,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<bool>("disable_nullspace_in_failsafe", true);
     auto_declare<bool>("enable_safety_monitor", true);
 
-    auto_declare<double>("safe_collision_energy_joule", 0.20);
+    auto_declare<double>("safe_collision_energy_joule", 0.05);
     auto_declare<double>("ee_collision_radius", 0.04);
-    auto_declare<int>("monitor_decimation", 10);
+    auto_declare<int>("monitor_decimation", 1);
 
     auto_declare<std::vector<double>>("human_plane_normal", std::vector<double>{0.0, 0.0, 1.0});
     auto_declare<std::vector<double>>("human_sphere_center", std::vector<double>{0.0, 0.0, 0.2});
@@ -1468,6 +1769,20 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   desired_orientation_ = Quaterniond(pose.block<3, 3>(0, 0));
   desired_orientation_.normalize();
 
+  last_commanded_sample_ = ImpedanceSample{};
+  last_commanded_sample_.t = 0.0;
+  last_commanded_sample_.p = desired_position_;
+  last_commanded_sample_.dp.setZero();
+  last_commanded_sample_.ddp.setZero();
+  last_commanded_sample_.q = desired_orientation_;
+  last_commanded_sample_.q.normalize();
+  last_commanded_sample_.w.setZero();
+  last_commanded_sample_.dw.setZero();
+  last_commanded_sample_.K = K_nominal_;
+  last_commanded_sample_.D = D_nominal_;
+  last_commanded_sample_.failsafe = false;
+  last_commanded_sample_valid_ = true;
+
   mode_ = SafetyMode::kNominal;
   failsafe_start_time_sec_ = -1.0;
   failsafe_enter_wall_time_sec_ = -1.0;
@@ -1486,6 +1801,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   last_verified_plan_ = VerifiedPlan{};
   candidate_plan_ = VerifiedPlan{};
   candidate_plan_valid_ = false;
+
+  commanded_path_time_ = 0.0;
 
   // SARA-CHANGE: reset Ruckig buffer
   intended_buffer_.clear();

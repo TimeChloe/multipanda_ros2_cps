@@ -215,10 +215,9 @@ class ReachableCartesianImpedanceController
       double wall_time) const;
 
   // 新增：重新填充 Ruckig intended 缓冲
-  bool refillRuckigIntendedBuffer(double nominal_guess_time,
-                                  const Vector3d& current_position,
-                                  const Vector3d& current_linear_velocity,
-                                  const Quaterniond& current_orientation);
+  bool refillRuckigIntendedBuffer(
+      double nominal_guess_time,
+      const ImpedanceSample& planning_start_command);
 
   // 新增：构建单步执行且 path-consistent 锚点的备选计划
   VerifiedPlan buildSingleStepCandidatePlan(
@@ -293,7 +292,7 @@ class ReachableCartesianImpedanceController
 
   bool enable_safety_monitor_{true};
 
-  double safe_collision_energy_joule_{0.10};
+  double safe_collision_energy_joule_{0.05};
   double ee_collision_radius_{0.04};
   int monitor_decimation_{1};
 
@@ -308,11 +307,11 @@ class ReachableCartesianImpedanceController
   double tau_rate_limit_{1000.0};
   double torque_to_accel_gain_{8.0};
   double model_accel_uncertainty_{0.05};
-  double stiffness_error_bound_m_{0.01};
+  double stiffness_error_bound_m_{0.00};
 
   // 替换了旧的 error_pos_gain_alpha_ 等常数，改用固定的误差管道边界
-  double tracking_pos_error_bound_{0.005};
-  double tracking_vel_error_bound_{0.05};
+  double tracking_pos_error_bound_{0.000};
+  double tracking_vel_error_bound_{0.00};
 
   int shield_horizon_steps_{100};
   double shield_plan_dt_{0.01};
@@ -354,6 +353,13 @@ class ReachableCartesianImpedanceController
   std::vector<ImpedanceSample> intended_buffer_;
   std::size_t intended_buffer_index_{0};
   bool intended_buffer_valid_{false};
+
+  // Last command actually sent to impedance controller.
+  // Used as Ruckig replanning start position to avoid discontinuous replans
+  // from noisy or lagged measured EE position.
+  ImpedanceSample last_commanded_sample_{};
+  bool last_commanded_sample_valid_{false};
+  double commanded_path_time_{0.0};
 
   Vector7d tau_cmd_prev_{Vector7d::Zero()};
 
