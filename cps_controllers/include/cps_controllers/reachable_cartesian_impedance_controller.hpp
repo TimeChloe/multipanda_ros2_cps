@@ -79,6 +79,12 @@ struct MonitorResult {
   double current_vel_error_radius{0.0};
   double worst_case_pos_error_radius{0.0};
   double worst_case_vel_error_radius{0.0};
+
+  double worst_case_V_potential_ub{0.0};
+  double h_clamping_energy{std::numeric_limits<double>::infinity()};
+  bool clamping_energy_unsafe{false};
+  bool collision_energy_unsafe{false};
+
 };
 
 struct ImpedanceSample {
@@ -225,6 +231,8 @@ class ReachableCartesianImpedanceController
       const Vector3d& current_position,
       const Quaterniond& current_orientation,
       const Vector6d& ee_twist,
+      const Matrix7d& inertia,
+      const Matrix37d& Jv,
       const ImpedanceSample& next_intended) const;
 
   MonitorResult verifyCandidatePlan(const VerifiedPlan& plan,
@@ -256,6 +264,19 @@ class ReachableCartesianImpedanceController
   ImpedanceSample getNextIntendedCommandFromCache(bool advance_index);
 
   ImpedanceSample getNextFailsafeCommandFromCache(bool advance_index);
+
+  Matrix6d computeEnergyBudgetedFailsafeStiffness(
+      const Vector3d& x,
+      const Vector3d& v,
+      const Vector3d& x_star,
+      const Matrix6d& K_des,
+      const Matrix7d& inertia,
+      const Matrix37d& Jv) const;
+
+  Matrix6d computeDampingFromStiffness(
+      const Matrix6d& K,
+      double pos_damping_scale,
+      double rot_damping_scale) const;
 
   bool enable_error_logging_{false};
   std::string error_log_path_{
@@ -391,6 +412,13 @@ class ReachableCartesianImpedanceController
   double exec_sum_ms_{0.0};
   double exec_min_ms_{1e9};
   double exec_max_ms_{0.0};
+
+  double clamping_energy_budget_joule_{0.05};
+  double energy_budget_margin_joule_{0.005};
+  double failsafe_min_pos_stiffness_{5.0};
+
+  double failsafe_pos_damping_scale_{2.5};
+  double failsafe_rot_damping_scale_{2.5};
 };
 
 }  // namespace cps_controllers

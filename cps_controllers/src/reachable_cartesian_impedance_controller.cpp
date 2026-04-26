@@ -321,6 +321,73 @@ void ReachableCartesianImpedanceController::updateRuntimeGains(const Matrix6d& K
   D_runtime_ = applyMatrixRateLimit(D_runtime_, D_target, d_rate_limit_, dt);
 }
 
+Matrix6d ReachableCartesianImpedanceController::computeDampingFromStiffness(
+    const Matrix6d& K,
+    double pos_damping_scale,
+    double rot_damping_scale) const {
+  Matrix6d D = Matrix6d::Zero();
+
+  const Matrix3d Kp = K.topLeftCorner<3, 3>();
+  const Matrix3d Kr = K.bottomRightCorner<3, 3>();
+
+  for (int i = 0; i < 3; ++i) {
+    D(i, i) = pos_damping_scale *
+              2.0 * std::sqrt(std::max(Kp(i, i), 0.0));
+    D(i + 3, i + 3) = rot_damping_scale *
+                      2.0 * std::sqrt(std::max(Kr(i, i), 0.0));
+  }
+
+  return D;
+}
+
+Matrix6d ReachableCartesianImpedanceController::computeEnergyBudgetedFailsafeStiffness(
+    const Vector3d& x,
+    const Vector3d& v,
+    const Vector3d& x_star,
+    const Matrix6d& K_des,
+    const Matrix7d& inertia,
+    const Matrix37d& Jv) const {
+  Matrix6d K_safe = K_des;
+
+  Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
+  task_inertia_inv.diagonal().array() += kLambdaReg;
+
+  Matrix3d M_task = task_inertia_inv.inverse();
+
+  Eigen::SelfAdjointEigenSolver<Matrix3d> eig(M_task);
+  const double m_max = std::max(eig.eigenvalues().maxCoeff(), kSmallPositive);
+
+  const double v_ub = v.norm() + std::max(0.0, tracking_vel_error_bound_);
+  const double E_kin_ub = 0.5 * m_max * v_ub * v_ub;
+
+  const double E_pot_allow = std::max(
+      0.0,
+      clamping_energy_budget_joule_ - E_kin_ub - energy_budget_margin_joule_);
+
+  const double e_ub = (x - x_star).norm() +
+                      std::max(0.0, tracking_pos_error_bound_) +
+                      std::max(0.0, stiffness_error_bound_m_);
+
+  const double k_des = std::max(
+      K_des.topLeftCorner<3, 3>().diagonal().minCoeff(),
+      0.0);
+
+  double k_safe = k_des;
+
+  if (e_ub > 1e-6) {
+    k_safe = 2.0 * E_pot_allow / (e_ub * e_ub);
+  }
+
+  k_safe = std::clamp(
+      k_safe,
+      std::max(0.0, failsafe_min_pos_stiffness_),
+      k_des);
+
+  K_safe.topLeftCorner<3, 3>() = k_safe * Matrix3d::Identity();
+
+  return K_safe;
+}
+
 double ReachableCartesianImpedanceController::computeNormalStiffnessAlongNormal(
     const Matrix6d& K) const {
   const Vector3d n = human_plane_normal_.normalized();
@@ -509,6 +576,8 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
        << "  rv=" << monitor.current_vel_error_radius
        << "  Tn_nom=" << monitor.Tn_contact_nominal
        << "  Tn_ub=" << monitor.worst_case_Tn_ub
+       << "  V_ub=" << monitor.worst_case_V_potential_ub
+       << "  hV=" << monitor.h_clamping_energy
        << "  trig=" << static_cast<int>(monitor.predicted_trigger)
        << "  wall_t=" << wall_time;
     m.text = ss.str();
@@ -890,6 +959,8 @@ VerifiedPlan ReachableCartesianImpedanceController::buildSingleStepCandidatePlan
     const Vector3d& current_position,
     const Quaterniond& current_orientation,
     const Vector6d& ee_twist,
+    const Matrix7d& inertia,
+    const Matrix37d& Jv,
     const ImpedanceSample& next_intended) const {
   VerifiedPlan plan;
   plan.valid = false;
@@ -925,9 +996,25 @@ VerifiedPlan ReachableCartesianImpedanceController::buildSingleStepCandidatePlan
   for (int i = 0; i < N_fs; ++i) {
     const double tk = freeze_anchor.t + static_cast<double>(i + 1) * dtp_fs;
     const double s_blend = static_cast<double>(i + 1) / static_cast<double>(N_fs);
-    const Matrix6d K_sched = (1.0 - s_blend) * K_nominal_ + s_blend * K_f_target_;
-    const Matrix6d D_sched = (1.0 - s_blend) * D_nominal_ + s_blend * D_f_target_;
-    plan.failsafe.push_back(makeFrozenFailsafeSample(tk, freeze_anchor, K_sched, D_sched));
+
+    Matrix6d K_sched =
+        (1.0 - s_blend) * K_nominal_ + s_blend * K_f_target_;
+
+    K_sched = computeEnergyBudgetedFailsafeStiffness(
+        current_position,
+        ee_twist.head<3>(),
+        freeze_anchor.p,
+        K_sched,
+        inertia,
+        Jv);
+
+    const Matrix6d D_sched = computeDampingFromStiffness(
+        K_sched,
+        failsafe_pos_damping_scale_,
+        failsafe_rot_damping_scale_);
+
+    plan.failsafe.push_back(
+        makeFrozenFailsafeSample(tk, freeze_anchor, K_sched, D_sched));
   }
 
   plan.valid = true;
@@ -985,6 +1072,7 @@ MonitorResult ReachableCartesianImpedanceController::verifyCandidatePlan(
   out.plane_distance_min = out.plane_distance_now;
 
   double worst_Tn_contact_ub = -std::numeric_limits<double>::infinity();
+  double worst_V_potential_ub = 0.0;
 
   Matrix6d K_exec = K_runtime_;
   Matrix6d D_exec = D_runtime_;
@@ -998,6 +1086,22 @@ MonitorResult ReachableCartesianImpedanceController::verifyCandidatePlan(
 
     const Matrix3d Kp = K_exec.topLeftCorner<3, 3>();
     const Matrix3d Dp = D_exec.topLeftCorner<3, 3>();
+
+    const Vector3d e_potential = x_pred - s.p;
+    const double e_potential_ub =
+        e_potential.norm() +
+        r_p_const +
+        std::max(stiffness_error_bound_m_, 0.0);
+
+    Eigen::SelfAdjointEigenSolver<Matrix3d> Kp_eig(Kp);
+    const double k_p_max =
+        std::max(Kp_eig.eigenvalues().maxCoeff(), 0.0);
+
+    const double V_potential_ub =
+        0.5 * k_p_max * e_potential_ub * e_potential_ub;
+
+    worst_V_potential_ub =
+        std::max(worst_V_potential_ub, V_potential_ub);
 
     const Vector3d pos_error_des_minus_cur = s.p - x_pred;
     const Vector3d vel_error_cur_minus_des = v_pred - s.dp;
@@ -1102,14 +1206,29 @@ MonitorResult ReachableCartesianImpedanceController::verifyCandidatePlan(
   }
 
   out.h_geom = out.plane_distance_min;
-  if (out.worst_case_contact_found)
-    out.h_monitored_energy = safe_collision_energy_joule_ - out.worst_case_Tn_ub;
-  else
-    out.h_monitored_energy = std::numeric_limits<double>::infinity();
 
-  out.monitored_unsafe = out.monitored_contact_possible &&
-                         out.worst_case_contact_found &&
-                         (out.h_monitored_energy < 0.0);
+  out.worst_case_V_potential_ub = worst_V_potential_ub;
+  out.h_clamping_energy =
+      clamping_energy_budget_joule_ - out.worst_case_V_potential_ub;
+
+  if (out.worst_case_contact_found) {
+    out.h_monitored_energy =
+        safe_collision_energy_joule_ - out.worst_case_Tn_ub;
+  } else {
+    out.h_monitored_energy = std::numeric_limits<double>::infinity();
+  }
+
+  out.collision_energy_unsafe =
+      out.monitored_contact_possible &&
+      out.worst_case_contact_found &&
+      out.h_monitored_energy < 0.0;
+
+  out.clamping_energy_unsafe =
+      out.h_clamping_energy < 0.0;
+
+  out.monitored_unsafe =
+      out.collision_energy_unsafe || out.clamping_energy_unsafe;
+
   out.predicted_trigger = out.monitored_unsafe;
   return out;
 }
@@ -1204,7 +1323,13 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
 
     // Build single-step candidate (1 intended + N_fs failsafe)
     candidate_plan_ = buildSingleStepCandidatePlan(
-        wall_time, current_position, current_orientation, ee_twist, next_step);
+        wall_time,
+        current_position,
+        current_orientation,
+        ee_twist,
+        inertia,
+        Jv,
+        next_step);
     candidate_plan_valid_ = candidate_plan_.valid;
     if (!candidate_plan_valid_) return false;
 
@@ -1507,10 +1632,13 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << monitor.worst_case_v_n_ub << "," << monitor.worst_case_Tn_ub << ","
         << monitor.worst_case_a_pos << "," << monitor.worst_case_a_brake << "," << monitor.worst_case_a_net << ","
         << monitor.h_geom << "," << monitor.h_monitored_energy << ","
+        << monitor.h_clamping_energy << "," << monitor.worst_case_V_potential_ub << ","
         << monitor.v_n_now_tube << "," << monitor.Tn_now_tube << "," << monitor.Tn_dot_est << ","
         << monitor.current_pos_error_radius << "," << monitor.current_vel_error_radius << ","
         << monitor.worst_case_pos_error_radius << "," << monitor.worst_case_vel_error_radius << ","
         << static_cast<int>(monitor.monitored_contact_possible) << ","
+        << static_cast<int>(monitor.collision_energy_unsafe) << ","
+        << static_cast<int>(monitor.clamping_energy_unsafe) << ","
         << static_cast<int>(monitor.monitored_unsafe) << ","
         << static_cast<int>(monitor.predicted_trigger) << "\n";
     ++log_write_counter_;
@@ -1562,6 +1690,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<bool>("enable_safety_monitor", true);
 
     auto_declare<double>("safe_collision_energy_joule", 0.05);
+    auto_declare<double>("clamping_energy_budget_joule", 0.05);
+    auto_declare<double>("energy_budget_margin_joule", 0.005);
+    auto_declare<double>("failsafe_min_pos_stiffness", 5.0);
     auto_declare<double>("ee_collision_radius", 0.04);
     auto_declare<int>("monitor_decimation", 1);
 
@@ -1644,14 +1775,25 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     const double nominal_rot_stiffness = get_node()->get_parameter("nominal_rot_stiffness").as_double();
     const double failsafe_pos_stiffness = get_node()->get_parameter("failsafe_pos_stiffness").as_double();
     const double failsafe_rot_stiffness = get_node()->get_parameter("failsafe_rot_stiffness").as_double();
-    const double failsafe_pos_damping_scale = get_node()->get_parameter("failsafe_pos_damping_scale").as_double();
-    const double failsafe_rot_damping_scale = get_node()->get_parameter("failsafe_rot_damping_scale").as_double();
+    failsafe_pos_damping_scale_ =
+        get_node()->get_parameter("failsafe_pos_damping_scale").as_double();
+
+    failsafe_rot_damping_scale_ =
+        get_node()->get_parameter("failsafe_rot_damping_scale").as_double();
 
     n_stiffness_ = get_node()->get_parameter("n_stiffness").as_double();
     disable_nullspace_in_failsafe_ = get_node()->get_parameter("disable_nullspace_in_failsafe").as_bool();
     enable_safety_monitor_ = get_node()->get_parameter("enable_safety_monitor").as_bool();
 
     safe_collision_energy_joule_ = get_node()->get_parameter("safe_collision_energy_joule").as_double();
+    clamping_energy_budget_joule_ =
+        std::max(0.0, get_node()->get_parameter("clamping_energy_budget_joule").as_double());
+
+    energy_budget_margin_joule_ =
+        std::max(0.0, get_node()->get_parameter("energy_budget_margin_joule").as_double());
+
+    failsafe_min_pos_stiffness_ =
+        std::max(0.0, get_node()->get_parameter("failsafe_min_pos_stiffness").as_double());
     ee_collision_radius_ = get_node()->get_parameter("ee_collision_radius").as_double();
     monitor_decimation_ = std::max(1, static_cast<int>(get_node()->get_parameter("monitor_decimation").as_int()));
 
@@ -1734,10 +1876,15 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     D_nominal_.bottomRightCorner<3, 3>() = 0.8 * 2.0 * std::sqrt(std::max(nominal_rot_stiffness, 0.0)) * Matrix3d::Identity();
     K_f_target_.topLeftCorner<3, 3>() = failsafe_pos_stiffness * Matrix3d::Identity();
     K_f_target_.bottomRightCorner<3, 3>() = failsafe_rot_stiffness * Matrix3d::Identity();
-    D_f_target_.topLeftCorner<3, 3>() = failsafe_pos_damping_scale * 2.0 *
-                                        std::sqrt(std::max(failsafe_pos_stiffness, 0.0)) * Matrix3d::Identity();
-    D_f_target_.bottomRightCorner<3, 3>() = failsafe_rot_damping_scale * 2.0 *
-                                            std::sqrt(std::max(failsafe_rot_stiffness, 0.0)) * Matrix3d::Identity();
+    D_f_target_.topLeftCorner<3, 3>() =
+        failsafe_pos_damping_scale_ * 2.0 *
+        std::sqrt(std::max(failsafe_pos_stiffness, 0.0)) *
+        Matrix3d::Identity();
+
+    D_f_target_.bottomRightCorner<3, 3>() =
+        failsafe_rot_damping_scale_ * 2.0 *
+        std::sqrt(std::max(failsafe_rot_stiffness, 0.0)) *
+        Matrix3d::Identity();
     K_runtime_ = K_nominal_; D_runtime_ = D_nominal_;
 
     franka_robot_model_ = std::make_unique<franka_semantic_components::FrankaRobotModel>(
@@ -1834,11 +1981,12 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "worst_case_nominal_forward_progress,"
         << "worst_case_v_n_ub,worst_case_Tn_ub,"
         << "worst_case_a_pos,worst_case_a_brake,worst_case_a_net,"
-        << "h_geom,h_monitored_energy,"
+        << "h_geom,h_monitored_energy,h_clamping_energy,worst_case_V_potential_ub,"
         << "v_n_now_tube,Tn_now_tube,Tn_dot_est,"
         << "current_pos_error_radius,current_vel_error_radius,"
         << "worst_case_pos_error_radius,worst_case_vel_error_radius,"
-        << "monitored_contact_possible,monitored_unsafe,predicted_trigger\n";
+        << "monitored_contact_possible,collision_energy_unsafe,clamping_energy_unsafe,"
+        << "monitored_unsafe,predicted_trigger\n";
     RCLCPP_INFO(get_node()->get_logger(), "Validation log enabled: %s", error_log_path_.c_str());
   }
   return CallbackReturn::SUCCESS;
