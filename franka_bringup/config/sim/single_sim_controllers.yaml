@@ -192,15 +192,15 @@ reachable_cartesian_impedance_controller:
     use_constant_reference: false
     reference_trajectory_type: line
 
-    nominal_pos_stiffness: 800.0
-    nominal_rot_stiffness: 40.0
+    nominal_pos_stiffness: 400.0
+    nominal_rot_stiffness: 20.0
 
-    failsafe_pos_stiffness: 200.0
-    failsafe_rot_stiffness: 20.0
-    failsafe_pos_damping_scale: 2.5
-    failsafe_rot_damping_scale: 2.5
+    # Failsafe 建议比 nominal 更软，但阻尼更大，用于安全吸收动能。
+    failsafe_pos_stiffness: 50.0
+    failsafe_rot_stiffness: 5.0
+    failsafe_pos_damping_scale: 3.0
+    failsafe_rot_damping_scale: 3.0
 
-    gain_filter_tau: 0.03
     n_stiffness: 0.0
     disable_nullspace_in_failsafe: true
 
@@ -208,49 +208,49 @@ reachable_cartesian_impedance_controller:
 
     safe_collision_energy_joule: 0.13
     ee_collision_radius: 0.04
+    monitor_decimation: 1
 
-    monitor_decimation: 5
-    monitor_nominal_horizon_sec: 0.005
-    monitor_nominal_steps: 5
-
+    # 当前设置表示人手可达区域在 z 方向向下接近机器人。
     human_plane_normal: [0.0, 0.0, -1.0]
     human_sphere_center: [0.3, 0.0, 0.3]
 
     human_motion_radius: 0.08
     human_hand_radius: 0.04
 
-    return_to_nominal_energy_margin: 0.02
-    return_to_nominal_speed_threshold: 0.02
-    return_to_nominal_tndot_threshold: 0.0
-    return_to_nominal_geom_margin: 0.005
+    k_rate_limit: 50000.0
+    d_rate_limit: 5000.0
 
-    k_rate_limit: 500000.0
-    d_rate_limit: 50000.0
     tau_rate_limit: 1000.0
     torque_to_accel_gain: 2.0
     model_accel_uncertainty: 0.05
-    stiffness_error_bound_m: 0.00
+    stiffness_error_bound_m: 0.005
 
-    # Local error-tube dynamics:
-    #   r_p_dot <= r_v
-    #   r_v_dot <= alpha * r_p - beta * r_v + gamma
-    error_pos_gain_alpha: 20.0
-    error_vel_gain_beta: 10.0
-    error_acc_disturbance_gamma: 0.05
+    # 误差管道 (tracking error tube) 边界：替代旧的不稳定 ODE 动态参数
+    tracking_pos_error_bound: 0.005     # 5 mm，可标定
+    tracking_vel_error_bound: 0.05      # 5 cm/s，可标定
 
-    shield_horizon_steps: 5
-    shield_plan_dt: 0.001
+    # monitored trajectory = intended + failsafe
+    # 100 * 0.01 = 1.0s，覆盖 Failsafe 阻抗控制器切换时的失稳态收敛过程。
+    shield_horizon_steps: 100
+    shield_plan_dt: 0.01
 
-    # Online intended generation along the same geometric path
+    # Ruckig 局部重规划与意图缓存参数
+    local_replan_horizon_steps: 200     # 硬上限，防止 buffer 中生成超过 7000 步引起爆炸
+    local_replan_dt: 0.001
+    local_path_lookahead_sec: 0.08      # 局部 lookahead，line 还有 t_goal≤1.5 兜底
+    local_replan_max_velocity: 0.08
+    local_replan_max_acceleration: 0.4
+    local_replan_max_jerk: 2.0
+
     path_retiming_search_window_sec: 0.25
     path_retiming_search_steps: 41
     path_time_rate_min: 0.0
-    path_time_rate_max: 1.5
-    path_time_acc_limit: 3.0
+    path_time_rate_max: 1.0
+    path_time_acc_limit: 0.5
     path_time_rate_target: 1.0
 
-    use_dynamic_consistent_impedance: true
-    torque_rate_limit: 1000.0
+    use_dynamic_consistent_impedance: false
+    torque_rate_limit: 600.0
 
     rviz_enable_markers: true
     rviz_frame_id: panda_link0

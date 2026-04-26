@@ -18,6 +18,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(franka_msgs REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(ruckig REQUIRED)
 
 pluginlib_export_plugin_description_file(
   controller_interface
@@ -49,9 +50,13 @@ ament_target_dependencies(${PROJECT_NAME}
   geometry_msgs
   franka_msgs
   visualization_msgs
+  ruckig
 )
 
-target_link_libraries(${PROJECT_NAME} pinocchio::pinocchio)
+target_link_libraries(${PROJECT_NAME}
+  pinocchio::pinocchio
+  ruckig::ruckig
+)
 
 install(
   TARGETS ${PROJECT_NAME}
@@ -85,6 +90,8 @@ ament_export_dependencies(
   geometry_msgs
   franka_msgs
   pinocchio
+  visualization_msgs
+  ruckig
 )
 
 if(BUILD_TESTING)
