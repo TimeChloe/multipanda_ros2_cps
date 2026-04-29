@@ -1,12 +1,12 @@
 <mujoco model="panda scene">
 
   <include file="panda_ng.xml"/>
-  
+  <include file="table.xml"/>
 
   <statistic center="0.3 0 0.4" extent="1"/>
 
   <visual>
-    <headlight diffuse="0.6 0.6 0.6"  ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
     <rgba haze="0.15 0.25 0.35 1"/>
     <global azimuth="120" elevation="-20"/>
   </visual>

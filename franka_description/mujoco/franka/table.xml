@@ -1,0 +1,163 @@
+<mujoco model="table">
+  <worldbody>
+    <body name="table" pos="-0.50 0 0.18">
+      <!-- table top -->
+      <geom
+        name="table_top"
+        type="box"
+        size="0.30 0.20 0.025"
+        rgba="0.55 0.35 0.20 1"
+        contype="1"
+        conaffinity="1"
+        friction="1.0 0.005 0.0001"/>
+
+      <!-- table legs -->
+      <geom
+        name="table_leg_fl"
+        type="box"
+        pos="0.23 0.15 -0.09"
+        size="0.02 0.02 0.09"
+        rgba="0.35 0.22 0.12 1"/>
+
+      <geom
+        name="table_leg_fr"
+        type="box"
+        pos="0.23 -0.15 -0.09"
+        size="0.02 0.02 0.09"
+        rgba="0.35 0.22 0.12 1"/>
+
+      <geom
+        name="table_leg_rl"
+        type="box"
+        pos="-0.23 0.15 -0.09"
+        size="0.02 0.02 0.09"
+        rgba="0.35 0.22 0.12 1"/>
+
+      <geom
+        name="table_leg_rr"
+        type="box"
+        pos="-0.23 -0.15 -0.09"
+        size="0.02 0.02 0.09"
+        rgba="0.35 0.22 0.12 1"/>
+    </body>
+
+    <!-- visual helical spring, display only, no collision -->
+    <body name="hand_surface_spring_visual" pos="-0.30 0 0.210">
+      <geom
+        name="spring_seg_01"
+        type="capsule"
+        fromto="0.018 0.000 0.000  0.013 0.013 0.004"
+        size="0.002"
+        rgba="0.1 0.1 0.1 1"
+        contype="0"
+        conaffinity="0"/>
+
+      <geom
+        name="spring_seg_02"
+        type="capsule"
+        fromto="0.013 0.013 0.004  0.000 0.018 0.008"
+        size="0.002"
+        rgba="0.1 0.1 0.1 1"
+        contype="0"
+        conaffinity="0"/>
+
+      <geom
+        name="spring_seg_03"
+        type="capsule"
+        fromto="0.000 0.018 0.008  -0.013 0.013 0.012"
+        size="0.002"
+        rgba="0.1 0.1 0.1 1"
+        contype="0"
+        conaffinity="0"/>
+
+      <geom
+        name="spring_seg_04"
+        type="capsule"
+        fromto="-0.013 0.013 0.012  -0.018 0.000 0.016"
+        size="0.002"
+        rgba="0.1 0.1 0.1 1"
+        contype="0"
+        conaffinity="0"/>
+
+      <geom
+        name="spring_seg_05"
+        type="capsule"
+        fromto="-0.018 0.000 0.016  -0.013 -0.013 0.020"
+        size="0.002"
+        rgba="0.1 0.1 0.1 1"
+        contype="0"
+        conaffinity="0"/>
+
+      <geom
+        name="spring_seg_06"
+        type="capsule"
+        fromto="-0.013 -0.013 0.020  0.000 -0.018 0.024"
+        size="0.002"
+        rgba="0.1 0.1 0.1 1"
+        contype="0"
+        conaffinity="0"/>
+
+      <geom
+        name="spring_seg_07"
+        type="capsule"
+        fromto="0.000 -0.018 0.024  0.013 -0.013 0.028"
+        size="0.002"
+        rgba="0.1 0.1 0.1 1"
+        contype="0"
+        conaffinity="0"/>
+
+      <geom
+        name="spring_seg_08"
+        type="capsule"
+        fromto="0.013 -0.013 0.028  0.018 0.000 0.032"
+        size="0.002"
+        rgba="0.1 0.1 0.1 1"
+        contype="0"
+        conaffinity="0"/>
+
+      <geom
+        name="spring_seg_09"
+        type="capsule"
+        fromto="0.018 0.000 0.032  0.013 0.013 0.036"
+        size="0.002"
+        rgba="0.1 0.1 0.1 1"
+        contype="0"
+        conaffinity="0"/>
+
+      <geom
+        name="spring_seg_10"
+        type="capsule"
+        fromto="0.013 0.013 0.036  0.000 0.018 0.040"
+        size="0.002"
+        rgba="0.1 0.1 0.1 1"
+        contype="0"
+        conaffinity="0"/>
+    </body>
+
+    <!-- spring-supported compliant pad simulating human hand surface -->
+    <!-- table top upper surface: z = 0.18 + 0.025 = 0.205 m -->
+    <body name="human_hand_surface" pos="-0.30 0 0.250">
+      <joint
+        name="hand_surface_spring_z"
+        type="slide"
+        axis="0 0 1"
+        limited="true"
+        range="-0.02 0.002"
+        stiffness="70000"
+        damping="50"
+        springref="0"/>
+
+      <geom
+        name="hand_surface_pad"
+        type="cylinder"
+        size="0.05 0.005"
+        rgba="0.9 0.65 0.55 1"
+        mass="0.02"
+        contype="1"
+        conaffinity="1"
+        friction="1.2 0.01 0.0001"
+        solref="0.005 1"
+        solimp="0.9 0.95 0.001"/>
+    </body>
+  </worldbody>
+</mujoco>
