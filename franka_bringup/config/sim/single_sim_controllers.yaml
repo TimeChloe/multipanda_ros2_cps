@@ -206,10 +206,10 @@ reachable_cartesian_impedance_controller:
 
     enable_safety_monitor: true
 
-    safe_collision_energy_joule: 0.05
-    clamping_energy_budget_joule: 0.05
+    safe_collision_energy_joule: 0.13
+    clamping_energy_budget_joule: 0.035
     energy_budget_margin_joule: 0.005
-    failsafe_min_pos_stiffness: 5.0
+    failsafe_min_pos_stiffness: 50.0
 
 
     ee_collision_radius: 0.04
@@ -222,8 +222,8 @@ reachable_cartesian_impedance_controller:
     human_motion_radius: 0.08
     human_hand_radius: 0.04
 
-    k_rate_limit: 50000.0
-    d_rate_limit: 5000.0
+    k_rate_limit: 500000.0
+    d_rate_limit: 50000.0
 
     tau_rate_limit: 1000.0
     torque_to_accel_gain: 2.0
@@ -254,7 +254,7 @@ reachable_cartesian_impedance_controller:
     path_time_acc_limit: 0.5
     path_time_rate_target: 1.0
 
-    use_dynamic_consistent_impedance: false
+    use_dynamic_consistent_impedance: true
     torque_rate_limit: 600.0
 
     rviz_enable_markers: true
@@ -273,3 +273,7 @@ reachable_cartesian_impedance_controller:
     rviz_ub_arrow_z_offset: 0.05
 
     profiling_stats_print_period: 1000
+
+    dynamic_lambda_regularization: 1.0e-6
+    jdot_dq_filter_alpha: 0.15
+    jdot_dq_max_norm: 5.0
