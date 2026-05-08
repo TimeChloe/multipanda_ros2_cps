@@ -352,54 +352,6 @@ Matrix6d ReachableCartesianImpedanceController::computeDampingFromStiffness(
   return D;
 }
 
-Matrix6d ReachableCartesianImpedanceController::computeEnergyBudgetedFailsafeStiffness(
-    const Vector3d& x,
-    const Vector3d& v,
-    const Vector3d& x_star,
-    const Matrix6d& K_des,
-    const Matrix7d& inertia,
-    const Matrix37d& Jv) const {
-  Matrix6d K_safe = K_des;
-
-  Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
-  task_inertia_inv.diagonal().array() += kLambdaReg;
-
-  Matrix3d M_task = task_inertia_inv.inverse();
-
-  Eigen::SelfAdjointEigenSolver<Matrix3d> eig(M_task);
-  const double m_max = std::max(eig.eigenvalues().maxCoeff(), kSmallPositive);
-
-  const double v_ub = v.norm() + std::max(0.0, tracking_vel_error_bound_);
-  const double E_kin_ub = 0.5 * m_max * v_ub * v_ub;
-
-  const double E_pot_allow = std::max(
-      0.0,
-      clamping_energy_budget_joule_ - E_kin_ub - energy_budget_margin_joule_);
-
-  const double e_ub = (x - x_star).norm() +
-                      std::max(0.0, tracking_pos_error_bound_) +
-                      std::max(0.0, stiffness_error_bound_m_);
-
-  const double k_des = std::max(
-      K_des.topLeftCorner<3, 3>().diagonal().minCoeff(),
-      0.0);
-
-  double k_safe = k_des;
-
-  if (e_ub > 1e-6) {
-    k_safe = 2.0 * E_pot_allow / (e_ub * e_ub);
-  }
-
-  k_safe = std::clamp(
-      k_safe,
-      std::max(0.0, failsafe_min_pos_stiffness_),
-      k_des);
-
-  K_safe.topLeftCorner<3, 3>() = k_safe * Matrix3d::Identity();
-
-  return K_safe;
-}
-
 
 double ReachableCartesianImpedanceController::computeNormalStiffnessAlongNormal(
     const Matrix6d& K) const {
@@ -938,6 +890,9 @@ bool ReachableCartesianImpedanceController::refillRuckigIntendedBuffer(
 // ============================================================================
 // Build a single-step candidate plan
 // ============================================================================
+// ============================================================================
+// Build a single-step candidate plan
+// ============================================================================
 VerifiedPlan ReachableCartesianImpedanceController::buildSingleStepCandidatePlan(
     double wall_time,
     const Vector3d& current_position,
@@ -946,6 +901,9 @@ VerifiedPlan ReachableCartesianImpedanceController::buildSingleStepCandidatePlan
     const Matrix7d& inertia,
     const Matrix37d& Jv,
     const ImpedanceSample& next_intended) const {
+  (void)inertia;
+  (void)Jv;
+
   VerifiedPlan plan;
   plan.valid = false;
   plan.generated_wall_time = wall_time;
@@ -977,162 +935,37 @@ VerifiedPlan ReachableCartesianImpedanceController::buildSingleStepCandidatePlan
   const int N_fs = std::max(1, shield_horizon_steps_);
   const double dtp_fs = std::max(shield_plan_dt_, kMinDt);
 
-  auto fill_failsafe_prefix =
-      [&](const Matrix6d& K_terminal, bool skeleton_nominal_gains) {
-        plan.failsafe.clear();
-        plan.failsafe.reserve(static_cast<std::size_t>(N_fs));
+  auto fill_failsafe_prefix = [&](const Matrix6d& K_terminal) {
+    plan.failsafe.clear();
+    plan.failsafe.reserve(static_cast<std::size_t>(N_fs));
 
-        for (int i = 0; i < N_fs; ++i) {
-          const double tk =
-              freeze_anchor.t + static_cast<double>(i + 1) * dtp_fs;
+    for (int i = 0; i < N_fs; ++i) {
+      const double tk =
+          freeze_anchor.t + static_cast<double>(i + 1) * dtp_fs;
 
-          Matrix6d K_sched = K_nominal_;
-          Matrix6d D_sched = D_nominal_;
+      const double s_blend =
+          static_cast<double>(i + 1) / static_cast<double>(N_fs);
 
-          if (!skeleton_nominal_gains) {
-            const double s_blend =
-                static_cast<double>(i + 1) / static_cast<double>(N_fs);
+      const Matrix6d K_sched =
+          (1.0 - s_blend) * K_nominal_ + s_blend * K_terminal;
 
-            K_sched =
-                (1.0 - s_blend) * K_nominal_ + s_blend * K_terminal;
+      const Matrix6d D_sched =
+          computeDampingFromStiffness(
+              K_sched,
+              failsafe_pos_damping_scale_,
+              failsafe_rot_damping_scale_);
 
-            D_sched = computeDampingFromStiffness(
-                K_sched,
-                failsafe_pos_damping_scale_,
-                failsafe_rot_damping_scale_);
-          }
-
-          plan.failsafe.push_back(
-              makeFrozenFailsafeSample(tk, freeze_anchor, K_sched, D_sched));
-        }
-      };
-
-  // First pass: propagate skeleton chi_M = chi_I o chi_F with nominal gains
-  // along failsafe. Record e_bar_max over contact-possible constrained samples.
-  fill_failsafe_prefix(K_nominal_, true);
-
-  Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
-  task_inertia_inv.diagonal().array() += kLambdaReg;
-
-  const Vector3d n = human_plane_normal_.normalized();
-  const double rho_p = std::max(0.0, tracking_pos_error_bound_);
-
-  const double inflated_contact_radius =
-      human_motion_radius_ +
-      human_hand_radius_ +
-      ee_collision_radius_ +
-      rho_p;
-
-  Vector3d x_pred = current_position;
-  Vector3d v_pred = ee_twist.head<3>();
-
-  Matrix6d K_exec = K_runtime_;
-  Matrix6d D_exec = D_runtime_;
-
-  double e_n_max = 0.0;
-  bool constrained_contact_found = false;
-
-  auto propagate_for_emax = [&](const ImpedanceSample& s, double dtp) {
-    K_exec = applyMatrixRateLimit(K_exec, s.K, k_rate_limit_, dtp);
-    D_exec = applyMatrixRateLimit(D_exec, s.D, d_rate_limit_, dtp);
-
-    const Matrix3d Kp = K_exec.topLeftCorner<3, 3>();
-    const Matrix3d Dp = D_exec.topLeftCorner<3, 3>();
-
-    const Vector3d force_pred =
-        Kp * (s.p - x_pred) - Dp * (v_pred - s.dp);
-
-    Vector3d a_pred = Vector3d::Zero();
-
-    if (use_dynamic_consistent_impedance_) {
-      // K/D are physical gains in this implementation.
-      // Therefore Lambda^{-1} maps impedance force to acceleration.
-      a_pred = s.ddp + task_inertia_inv * force_pred;
-    } else {
-      a_pred = task_inertia_inv * force_pred;
+      plan.failsafe.push_back(
+          makeFrozenFailsafeSample(tk, freeze_anchor, K_sched, D_sched));
     }
-
-    const Vector3d x_next =
-        x_pred + v_pred * dtp + 0.5 * a_pred * dtp * dtp;
-
-    const Vector3d v_next =
-        v_pred + a_pred * dtp;
-
-    const double d_segment =
-        signedDistanceSegmentToInflatedSphere(
-            x_pred,
-            x_next,
-            human_sphere_center_,
-            inflated_contact_radius);
-
-    if (d_segment <= 0.0) {
-      constrained_contact_found = true;
-
-      const double e_n =
-          std::abs(n.dot(x_next - s.p)) + rho_p;
-
-      e_n_max = std::max(e_n_max, e_n);
-    }
-
-    x_pred = x_next;
-    v_pred = v_next;
   };
 
-  double t_prev = plan.anchor.t;
+  // Unified fail-safe stiffness policy:
+  // The terminal stiffness is exactly the configured failsafe stiffness.
+  // No online k_budget / k_selected update is performed here.
+  fill_failsafe_prefix(K_f_target_);
 
-  for (const auto& s : plan.intended) {
-    const double dtp = std::max(s.t - t_prev, kMinDt);
-    propagate_for_emax(s, dtp);
-    t_prev = s.t;
-  }
-
-  for (const auto& s : plan.failsafe) {
-    const double dtp = std::max(s.t - t_prev, kMinDt);
-    propagate_for_emax(s, dtp);
-    t_prev = s.t;
-  }
-
-  const double L_QS_eff =
-      std::max(0.0, clamping_energy_budget_joule_ - energy_budget_margin_joule_);
-
-  const double k_min =
-      std::max(0.0, failsafe_min_pos_stiffness_);
-
-  const double k_nom_n =
-      std::max(
-          (n.transpose() * K_nominal_.topLeftCorner<3, 3>() * n)(0, 0),
-          0.0);
-
-  const double k_cfg_n =
-      std::max(
-          (n.transpose() * K_f_target_.topLeftCorner<3, 3>() * n)(0, 0),
-          0.0);
-
-  double k_selected =
-      std::max(k_min, std::min(k_nom_n, k_cfg_n));
-
-  if (constrained_contact_found && e_n_max > 1e-9) {
-    const double k_budget =
-        2.0 * L_QS_eff / std::max(e_n_max * e_n_max, kSmallPositive);
-
-    if (k_min > k_budget + 1e-9) {
-      plan.valid = false;
-      return plan;
-    }
-
-    const double k_upper =
-        std::min(k_nom_n, std::min(k_cfg_n, k_budget));
-
-    k_selected = std::max(k_min, k_upper);
-  }
-
-  Matrix6d K_terminal = K_f_target_;
-  K_terminal.topLeftCorner<3, 3>() =
-      k_selected * Matrix3d::Identity();
-
-  fill_failsafe_prefix(K_terminal, false);
-
-  plan.valid = true;
+  plan.valid = !plan.intended.empty() && !plan.failsafe.empty();
   return plan;
 }
 
@@ -1933,7 +1766,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("safe_collision_energy_joule", 0.05);
     auto_declare<double>("clamping_energy_budget_joule", 0.05);
     auto_declare<double>("energy_budget_margin_joule", 0.005);
-    auto_declare<double>("failsafe_min_pos_stiffness", 5.0);
     auto_declare<double>("ee_collision_radius", 0.04);
     auto_declare<int>("monitor_decimation", 1);
 
@@ -2034,8 +1866,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     energy_budget_margin_joule_ =
         std::max(0.0, get_node()->get_parameter("energy_budget_margin_joule").as_double());
 
-    failsafe_min_pos_stiffness_ =
-        std::max(0.0, get_node()->get_parameter("failsafe_min_pos_stiffness").as_double());
     ee_collision_radius_ = get_node()->get_parameter("ee_collision_radius").as_double();
     monitor_decimation_ = std::max(1, static_cast<int>(get_node()->get_parameter("monitor_decimation").as_int()));
 

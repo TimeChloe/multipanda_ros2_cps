@@ -268,14 +268,6 @@ class ReachableCartesianImpedanceController
 
   ImpedanceSample getNextFailsafeCommandFromCache(bool advance_index);
 
-  Matrix6d computeEnergyBudgetedFailsafeStiffness(
-      const Vector3d& x,
-      const Vector3d& v,
-      const Vector3d& x_star,
-      const Matrix6d& K_des,
-      const Matrix7d& inertia,
-      const Matrix37d& Jv) const;
-
   Matrix6d computeDampingFromStiffness(
       const Matrix6d& K,
       double pos_damping_scale,

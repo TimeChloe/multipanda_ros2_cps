@@ -198,8 +198,8 @@ reachable_cartesian_impedance_controller:
     # Failsafe 建议比 nominal 更软，但阻尼更大，用于安全吸收动能。
     failsafe_pos_stiffness: 100.0
     failsafe_rot_stiffness: 20.0
-    failsafe_pos_damping_scale: 2.5
-    failsafe_rot_damping_scale: 3.0
+    failsafe_pos_damping_scale: 1.1
+    failsafe_rot_damping_scale: 1.1
 
     n_stiffness: 0.0
     disable_nullspace_in_failsafe: true
@@ -209,7 +209,6 @@ reachable_cartesian_impedance_controller:
     safe_collision_energy_joule: 0.13
     clamping_energy_budget_joule: 0.035
     energy_budget_margin_joule: 0.005
-    failsafe_min_pos_stiffness: 50.0
 
     ee_collision_radius: 0.04
     monitor_decimation: 1
@@ -231,7 +230,7 @@ reachable_cartesian_impedance_controller:
     stiffness_error_bound_m: 0.00
 
     # 误差管道 tracking error tube 边界
-    tracking_pos_error_bound: 0.002
+    tracking_pos_error_bound: 0.005
     tracking_vel_error_bound: 0.01
 
     # monitored trajectory = intended + failsafe
