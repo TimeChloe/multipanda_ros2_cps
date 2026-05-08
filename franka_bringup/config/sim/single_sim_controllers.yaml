@@ -211,7 +211,6 @@ reachable_cartesian_impedance_controller:
     energy_budget_margin_joule: 0.005
     failsafe_min_pos_stiffness: 50.0
 
-
     ee_collision_radius: 0.04
     monitor_decimation: 1
 
@@ -225,24 +224,24 @@ reachable_cartesian_impedance_controller:
     k_rate_limit: 500000.0
     d_rate_limit: 50000.0
 
+    # torque-rate / conservative monitor fallback terms
     tau_rate_limit: 1000.0
-    torque_to_accel_gain: 2.0
+    torque_to_accel_gain: 8.0
     model_accel_uncertainty: 0.00
-    stiffness_error_bound_m: 0.000
+    stiffness_error_bound_m: 0.00
 
-    # 误差管道 (tracking error tube) 边界：替代旧的不稳定 ODE 动态参数
-    tracking_pos_error_bound: 0.000     # 5 mm，可标定
-    tracking_vel_error_bound: 0.00      # 5 cm/s，可标定
+    # 误差管道 tracking error tube 边界
+    tracking_pos_error_bound: 0.002
+    tracking_vel_error_bound: 0.01
 
     # monitored trajectory = intended + failsafe
-    # 100 * 0.01 = 1.0s，覆盖 Failsafe 阻抗控制器切换时的失稳态收敛过程。
-    shield_horizon_steps: 20
+    shield_horizon_steps: 5
     shield_plan_dt: 0.001
 
     # Ruckig 局部重规划与意图缓存参数
-    local_replan_horizon_steps: 200     # 硬上限，防止 buffer 中生成超过 7000 步引起爆炸
+    local_replan_horizon_steps: 200
     local_replan_dt: 0.001
-    local_path_lookahead_sec: 0.20      # 局部 lookahead，line 还有 t_goal≤1.5 兜底
+    local_path_lookahead_sec: 0.20
     local_replan_max_velocity: 0.30
     local_replan_max_acceleration: 0.5
     local_replan_max_jerk: 1.0
@@ -256,6 +255,10 @@ reachable_cartesian_impedance_controller:
 
     use_dynamic_consistent_impedance: true
     torque_rate_limit: 600.0
+
+    dynamic_lambda_regularization: 1.0e-6
+    jdot_dq_filter_alpha: 0.15
+    jdot_dq_max_norm: 5.0
 
     rviz_enable_markers: true
     rviz_frame_id: panda_link0
@@ -273,7 +276,3 @@ reachable_cartesian_impedance_controller:
     rviz_ub_arrow_z_offset: 0.05
 
     profiling_stats_print_period: 1000
-
-    dynamic_lambda_regularization: 1.0e-6
-    jdot_dq_filter_alpha: 0.15
-    jdot_dq_max_norm: 5.0

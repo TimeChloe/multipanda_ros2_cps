@@ -282,6 +282,30 @@ inline Vector7d arrayToVector7d(const std::array<double, 7>& data) {
   return out;
 }
 
+inline Vector3d closestPointOnSegment(
+    const Vector3d& a,
+    const Vector3d& b,
+    const Vector3d& p) {
+  const Vector3d ab = b - a;
+  const double denom = ab.squaredNorm();
+
+  if (denom < 1e-12) {
+    return a;
+  }
+
+  const double alpha = std::clamp((p - a).dot(ab) / denom, 0.0, 1.0);
+  return a + alpha * ab;
+}
+
+inline double signedDistanceSegmentToInflatedSphere(
+    const Vector3d& a,
+    const Vector3d& b,
+    const Vector3d& center,
+    double inflated_radius) {
+  const Vector3d c = closestPointOnSegment(a, b, center);
+  return (c - center).norm() - inflated_radius;
+}
+
 }  // namespace
 
 namespace cps_controllers {
@@ -375,6 +399,7 @@ Matrix6d ReachableCartesianImpedanceController::computeEnergyBudgetedFailsafeSti
 
   return K_safe;
 }
+
 
 double ReachableCartesianImpedanceController::computeNormalStiffnessAlongNormal(
     const Matrix6d& K) const {
@@ -567,6 +592,8 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
        << "  V_ub=" << monitor.worst_case_V_potential_ub
        << "  hV=" << monitor.h_clamping_energy
        << "  trig=" << static_cast<int>(monitor.predicted_trigger)
+       << "  EF=" << monitor.terminal_energy_ub
+       << "  hF=" << monitor.h_terminal_energy
        << "  wall_t=" << wall_time;
     m.text = ss.str();
     arr.markers.push_back(m); }
@@ -689,9 +716,6 @@ bool ReachableCartesianImpedanceController::refillRuckigIntendedBuffer(
   const auto traj_type =
       parseTrajectoryTypeOrDefault(use_constant_reference_, reference_trajectory_type_);
 
-  // --------------------------------------------------------------------------
-  // LINE MODE
-  // --------------------------------------------------------------------------
   if (traj_type == ReferenceTrajectoryType::kLine) {
     constexpr double T_move = 1.5;
     constexpr double dz = -0.55;
@@ -816,9 +840,6 @@ bool ReachableCartesianImpedanceController::refillRuckigIntendedBuffer(
     return intended_buffer_valid_;
   }
 
-  // --------------------------------------------------------------------------
-  // NON-LINE MODE
-  // --------------------------------------------------------------------------
   const double t_near = std::max(0.0, nominal_guess_time);
   double t_goal = t_near + std::max(local_path_lookahead_sec_, dtp);
 
@@ -931,18 +952,24 @@ VerifiedPlan ReachableCartesianImpedanceController::buildSingleStepCandidatePlan
   plan.intended_exec_index = 0;
   plan.failsafe_exec_index = 0;
 
-  plan.anchor.t  = 0.0;
-  plan.anchor.p  = current_position;
+  plan.anchor.t = 0.0;
+  plan.anchor.p = current_position;
   plan.anchor.dp = ee_twist.head<3>();
   plan.anchor.ddp.setZero();
-  plan.anchor.q  = current_orientation; plan.anchor.q.normalize();
-  plan.anchor.w.setZero(); plan.anchor.dw.setZero();
-  plan.anchor.K  = K_runtime_; plan.anchor.D = D_runtime_;
+  plan.anchor.q = current_orientation;
+  plan.anchor.q.normalize();
+  plan.anchor.w.setZero();
+  plan.anchor.dw.setZero();
+  plan.anchor.K = K_runtime_;
+  plan.anchor.D = D_runtime_;
   plan.anchor.failsafe = false;
 
   ImpedanceSample step = next_intended;
   step.t = plan.anchor.t + std::max(local_replan_dt_, kMinDt);
-  step.K = K_nominal_; step.D = D_nominal_;
+  step.K = K_nominal_;
+  step.D = D_nominal_;
+  step.failsafe = false;
+
   plan.intended.clear();
   plan.intended.push_back(step);
 
@@ -950,31 +977,160 @@ VerifiedPlan ReachableCartesianImpedanceController::buildSingleStepCandidatePlan
   const int N_fs = std::max(1, shield_horizon_steps_);
   const double dtp_fs = std::max(shield_plan_dt_, kMinDt);
 
-  plan.failsafe.clear();
-  plan.failsafe.reserve(static_cast<std::size_t>(N_fs));
-  for (int i = 0; i < N_fs; ++i) {
-    const double tk = freeze_anchor.t + static_cast<double>(i + 1) * dtp_fs;
-    const double s_blend = static_cast<double>(i + 1) / static_cast<double>(N_fs);
+  auto fill_failsafe_prefix =
+      [&](const Matrix6d& K_terminal, bool skeleton_nominal_gains) {
+        plan.failsafe.clear();
+        plan.failsafe.reserve(static_cast<std::size_t>(N_fs));
 
-    Matrix6d K_sched =
-        (1.0 - s_blend) * K_nominal_ + s_blend * K_f_target_;
+        for (int i = 0; i < N_fs; ++i) {
+          const double tk =
+              freeze_anchor.t + static_cast<double>(i + 1) * dtp_fs;
 
-    K_sched = computeEnergyBudgetedFailsafeStiffness(
-        current_position,
-        ee_twist.head<3>(),
-        freeze_anchor.p,
-        K_sched,
-        inertia,
-        Jv);
+          Matrix6d K_sched = K_nominal_;
+          Matrix6d D_sched = D_nominal_;
 
-    const Matrix6d D_sched = computeDampingFromStiffness(
-        K_sched,
-        failsafe_pos_damping_scale_,
-        failsafe_rot_damping_scale_);
+          if (!skeleton_nominal_gains) {
+            const double s_blend =
+                static_cast<double>(i + 1) / static_cast<double>(N_fs);
 
-    plan.failsafe.push_back(
-        makeFrozenFailsafeSample(tk, freeze_anchor, K_sched, D_sched));
+            K_sched =
+                (1.0 - s_blend) * K_nominal_ + s_blend * K_terminal;
+
+            D_sched = computeDampingFromStiffness(
+                K_sched,
+                failsafe_pos_damping_scale_,
+                failsafe_rot_damping_scale_);
+          }
+
+          plan.failsafe.push_back(
+              makeFrozenFailsafeSample(tk, freeze_anchor, K_sched, D_sched));
+        }
+      };
+
+  // First pass: propagate skeleton chi_M = chi_I o chi_F with nominal gains
+  // along failsafe. Record e_bar_max over contact-possible constrained samples.
+  fill_failsafe_prefix(K_nominal_, true);
+
+  Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
+  task_inertia_inv.diagonal().array() += kLambdaReg;
+
+  const Vector3d n = human_plane_normal_.normalized();
+  const double rho_p = std::max(0.0, tracking_pos_error_bound_);
+
+  const double inflated_contact_radius =
+      human_motion_radius_ +
+      human_hand_radius_ +
+      ee_collision_radius_ +
+      rho_p;
+
+  Vector3d x_pred = current_position;
+  Vector3d v_pred = ee_twist.head<3>();
+
+  Matrix6d K_exec = K_runtime_;
+  Matrix6d D_exec = D_runtime_;
+
+  double e_n_max = 0.0;
+  bool constrained_contact_found = false;
+
+  auto propagate_for_emax = [&](const ImpedanceSample& s, double dtp) {
+    K_exec = applyMatrixRateLimit(K_exec, s.K, k_rate_limit_, dtp);
+    D_exec = applyMatrixRateLimit(D_exec, s.D, d_rate_limit_, dtp);
+
+    const Matrix3d Kp = K_exec.topLeftCorner<3, 3>();
+    const Matrix3d Dp = D_exec.topLeftCorner<3, 3>();
+
+    const Vector3d force_pred =
+        Kp * (s.p - x_pred) - Dp * (v_pred - s.dp);
+
+    Vector3d a_pred = Vector3d::Zero();
+
+    if (use_dynamic_consistent_impedance_) {
+      // K/D are physical gains in this implementation.
+      // Therefore Lambda^{-1} maps impedance force to acceleration.
+      a_pred = s.ddp + task_inertia_inv * force_pred;
+    } else {
+      a_pred = task_inertia_inv * force_pred;
+    }
+
+    const Vector3d x_next =
+        x_pred + v_pred * dtp + 0.5 * a_pred * dtp * dtp;
+
+    const Vector3d v_next =
+        v_pred + a_pred * dtp;
+
+    const double d_segment =
+        signedDistanceSegmentToInflatedSphere(
+            x_pred,
+            x_next,
+            human_sphere_center_,
+            inflated_contact_radius);
+
+    if (d_segment <= 0.0) {
+      constrained_contact_found = true;
+
+      const double e_n =
+          std::abs(n.dot(x_next - s.p)) + rho_p;
+
+      e_n_max = std::max(e_n_max, e_n);
+    }
+
+    x_pred = x_next;
+    v_pred = v_next;
+  };
+
+  double t_prev = plan.anchor.t;
+
+  for (const auto& s : plan.intended) {
+    const double dtp = std::max(s.t - t_prev, kMinDt);
+    propagate_for_emax(s, dtp);
+    t_prev = s.t;
   }
+
+  for (const auto& s : plan.failsafe) {
+    const double dtp = std::max(s.t - t_prev, kMinDt);
+    propagate_for_emax(s, dtp);
+    t_prev = s.t;
+  }
+
+  const double L_QS_eff =
+      std::max(0.0, clamping_energy_budget_joule_ - energy_budget_margin_joule_);
+
+  const double k_min =
+      std::max(0.0, failsafe_min_pos_stiffness_);
+
+  const double k_nom_n =
+      std::max(
+          (n.transpose() * K_nominal_.topLeftCorner<3, 3>() * n)(0, 0),
+          0.0);
+
+  const double k_cfg_n =
+      std::max(
+          (n.transpose() * K_f_target_.topLeftCorner<3, 3>() * n)(0, 0),
+          0.0);
+
+  double k_selected =
+      std::max(k_min, std::min(k_nom_n, k_cfg_n));
+
+  if (constrained_contact_found && e_n_max > 1e-9) {
+    const double k_budget =
+        2.0 * L_QS_eff / std::max(e_n_max * e_n_max, kSmallPositive);
+
+    if (k_min > k_budget + 1e-9) {
+      plan.valid = false;
+      return plan;
+    }
+
+    const double k_upper =
+        std::min(k_nom_n, std::min(k_cfg_n, k_budget));
+
+    k_selected = std::max(k_min, k_upper);
+  }
+
+  Matrix6d K_terminal = K_f_target_;
+  K_terminal.topLeftCorner<3, 3>() =
+      k_selected * Matrix3d::Identity();
+
+  fill_failsafe_prefix(K_terminal, false);
 
   plan.valid = true;
   return plan;
@@ -994,199 +1150,239 @@ MonitorResult ReachableCartesianImpedanceController::verifyCandidatePlan(
   MonitorResult out;
 
   const Vector3d n = plane_normal.normalized();
+
   Vector3d x_pred = current_position;
   Vector3d v_pred = ee_twist.head<3>();
 
   Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
   task_inertia_inv.diagonal().array() += kLambdaReg;
 
-  const double denom0 = (n.transpose() * task_inertia_inv * n)(0, 0);
-  out.m_eff_n = 1.0 / std::max(denom0, kSmallPositive);
+  const double denom0 =
+      (n.transpose() * task_inertia_inv * n)(0, 0);
 
-  const double v_n_now = n.dot(v_pred);
-  out.v_n_now = v_n_now;
-  out.Tn_now  = 0.5 * out.m_eff_n * v_n_now * v_n_now;
-  out.v_safe  = std::sqrt(std::max(2.0 * safe_collision_energy_joule_ /
-                                      std::max(out.m_eff_n, kSmallPositive), 0.0));
+  out.m_eff_n =
+      1.0 / std::max(denom0, kSmallPositive);
 
-  const double r_p_const = std::max(0.0, tracking_pos_error_bound_);
-  const double r_v_const = std::max(0.0, tracking_vel_error_bound_);
+  const double rho_p =
+      std::max(0.0, tracking_pos_error_bound_);
 
-  out.current_pos_error_radius   = r_p_const;
-  out.current_vel_error_radius   = r_v_const;
-  out.worst_case_pos_error_radius = r_p_const;
-  out.worst_case_vel_error_radius = r_v_const;
+  const double rho_v =
+      std::max(0.0, tracking_vel_error_bound_);
 
-  const double inflated_r_now = ee_collision_radius_ + r_p_const;
+  out.current_pos_error_radius = rho_p;
+  out.current_vel_error_radius = rho_v;
+  out.worst_case_pos_error_radius = rho_p;
+  out.worst_case_vel_error_radius = rho_v;
+
+  const double v_n_now_raw = n.dot(v_pred);
+  out.v_n_now = v_n_now_raw;
+  out.Tn_now =
+      0.5 * out.m_eff_n * v_n_now_raw * v_n_now_raw;
+
+  out.v_safe =
+      std::sqrt(
+          std::max(
+              2.0 * safe_collision_energy_joule_ /
+                  std::max(out.m_eff_n, kSmallPositive),
+              0.0));
+
+  const double inflated_contact_radius =
+      human_motion_radius_ +
+      human_hand_radius_ +
+      ee_collision_radius_ +
+      rho_p;
+
   out.plane_distance_now =
-      distanceToSweptHandRegion(x_pred, plane_normal, sphere_center) - inflated_r_now;
-  out.plane_distance_min = out.plane_distance_now;
+      (current_position - sphere_center).norm() - inflated_contact_radius;
 
-  double worst_Tn_contact_ub = -std::numeric_limits<double>::infinity();
-  double worst_V_potential_ub = 0.0;
+  out.plane_distance_min = out.plane_distance_now;
 
   Matrix6d K_exec = K_runtime_;
   Matrix6d D_exec = D_runtime_;
+
+  double T_n_max = 0.0;
+  double V_n_max = 0.0;
+
+  double terminal_T_ub = 0.0;
+  double terminal_V_ub = 0.0;
+  bool terminal_sample_found = false;
 
   auto eval_sample = [&](const ImpedanceSample& s, double dtp) {
     K_exec = applyMatrixRateLimit(K_exec, s.K, k_rate_limit_, dtp);
     D_exec = applyMatrixRateLimit(D_exec, s.D, d_rate_limit_, dtp);
 
-    const double denom_step = (n.transpose() * task_inertia_inv * n)(0, 0);
-    const double m_eff_step_n = 1.0 / std::max(denom_step, kSmallPositive);
-
     const Matrix3d Kp = K_exec.topLeftCorner<3, 3>();
     const Matrix3d Dp = D_exec.topLeftCorner<3, 3>();
 
-    const Vector3d e_potential = x_pred - s.p;
-    const double e_potential_ub =
-        e_potential.norm() +
-        r_p_const +
-        std::max(stiffness_error_bound_m_, 0.0);
-
-    Eigen::SelfAdjointEigenSolver<Matrix3d> Kp_eig(Kp);
-    const double k_p_max =
-        std::max(Kp_eig.eigenvalues().maxCoeff(), 0.0);
-
-    const double V_potential_ub =
-        0.5 * k_p_max * e_potential_ub * e_potential_ub;
-
-    worst_V_potential_ub =
-        std::max(worst_V_potential_ub, V_potential_ub);
-
-    const Vector3d pos_error_des_minus_cur = s.p - x_pred;
-    const Vector3d vel_error_cur_minus_des = v_pred - s.dp;
-
     const Vector3d force_pred =
-        Kp * pos_error_des_minus_cur - Dp * vel_error_cur_minus_des;
+        Kp * (s.p - x_pred) - Dp * (v_pred - s.dp);
 
     Vector3d a_pred = Vector3d::Zero();
+
     if (use_dynamic_consistent_impedance_) {
-      // Corrected true-branch model:
-      //   F = Lambda*xddot_des + physical impedance force
-      // => xddot = xddot_des + Lambda^{-1}*F_imp
+      // Consistent with the implemented torque law:
+      // w = Lambda*xddot_des - K*e - D*edot,
+      // with K/D as physical Cartesian gains.
       a_pred = s.ddp + task_inertia_inv * force_pred;
     } else {
       a_pred = task_inertia_inv * force_pred;
     }
 
-    const Vector3d a_pred_bounded = a_pred + std::max(model_accel_uncertainty_, 0.0) * n;
+    const Vector3d x_next =
+        x_pred + v_pred * dtp + 0.5 * a_pred * dtp * dtp;
 
-    const Vector3d x_next = x_pred + v_pred * dtp + 0.5 * a_pred_bounded * dtp * dtp;
-    const Vector3d v_next = v_pred + a_pred_bounded * dtp;
+    const Vector3d v_next =
+        v_pred + a_pred * dtp;
 
-    const double inflated_r = ee_collision_radius_ + r_p_const;
-    const double d_region_pred = distanceToSweptHandRegion(x_pred, plane_normal, sphere_center) - inflated_r;
-    const double d_region_next = distanceToSweptHandRegion(x_next, plane_normal, sphere_center) - inflated_r;
+    const double d_pred =
+        (x_pred - sphere_center).norm() - inflated_contact_radius;
 
-    out.plane_distance_min = std::min(out.plane_distance_min, d_region_next);
+    const double d_next =
+        (x_next - sphere_center).norm() - inflated_contact_radius;
 
-    if (!s.failsafe && !out.nominal_contact_sample_found &&
-        d_region_pred > 0.0 && d_region_next <= 0.0) {
-      const double alpha = std::clamp(
-          d_region_pred / std::max(d_region_pred - d_region_next, kSmallPositive), 0.0, 1.0);
-      const Vector3d x_contact = x_pred + alpha * (x_next - x_pred);
-      const Vector3d v_contact = v_pred + alpha * (v_next - v_pred);
-      const double v_n_contact = std::abs(n.dot(v_contact)) + r_v_const;
+    const double d_segment =
+        signedDistanceSegmentToInflatedSphere(
+            x_pred,
+            x_next,
+            sphere_center,
+            inflated_contact_radius);
 
-      out.nominal_contact_sample_found = true;
-      out.nominal_contact_time = s.t;
-      out.nominal_contact_distance =
-          distanceToSweptHandRegion(x_contact, plane_normal, sphere_center) - inflated_r;
-      out.v_n_contact_nominal = v_n_contact;
-      out.Tn_contact_nominal = 0.5 * m_eff_step_n * v_n_contact * v_n_contact;
-      out.nominal_contact_point_world = x_contact;
-    }
-
-    const double e_n_abs = std::abs(n.dot(x_pred - s.p)) + r_p_const +
-                           std::max(stiffness_error_bound_m_, 0.0);
-    const double v_n_abs = std::abs(n.dot(v_pred)) + r_v_const;
-
-    // K_exec and D_exec are physical stiffness/damping in both branches after
-    // correcting the true branch. Therefore both bounds use m_eff_n.
-    double a_pos = computeConservativeNormalAccelPositiveBound(
-        m_eff_step_n,
-        e_n_abs,
-        v_n_abs,
-        K_exec);
-
-    double a_brake_raw = computeConservativeNormalBrakeAccelLowerBound(
-        m_eff_step_n,
-        v_n_abs,
-        D_exec);
-
-    a_pos = std::max(0.0, a_pos);
-    a_brake_raw = std::max(0.0, a_brake_raw);
-    const double brake_credit_scale = s.failsafe ? 1.0 : 0.35;
-    const double a_brake = brake_credit_scale * a_brake_raw;
-    const double a_net = a_pos - a_brake;
-
-    double v_n_ub = std::abs(n.dot(v_next)) + r_v_const;
-    v_n_ub += dtp * std::max(a_net, 0.0);
-    v_n_ub = std::max(0.0, v_n_ub);
-
-    const double Tn_ub = 0.5 * m_eff_step_n * v_n_ub * v_n_ub;
+    out.plane_distance_min =
+        std::min(out.plane_distance_min, d_segment);
 
     const bool contact_possible_step =
-        (d_region_pred <= 0.0) || (d_region_next <= 0.0) ||
-        (d_region_pred > 0.0 && d_region_next <= 0.0);
+        d_segment <= 0.0;
+
+    const double k_n =
+        std::max(
+            (n.transpose() * Kp * n)(0, 0),
+            0.0);
+
+    const double e_n =
+        std::abs(n.dot(x_next - s.p)) + rho_p;
+
+    const double v_n =
+        std::abs(n.dot(v_next)) + rho_v;
+
+    const double T_n_ub =
+        0.5 * out.m_eff_n * v_n * v_n;
+
+    const double V_n_ub =
+        0.5 * k_n * e_n * e_n;
 
     if (contact_possible_step) {
       out.monitored_contact_possible = true;
-      if (!out.worst_case_contact_found || Tn_ub > worst_Tn_contact_ub) {
+
+      if (T_n_ub > T_n_max) {
+        T_n_max = T_n_ub;
+
         out.worst_case_contact_found = true;
-        worst_Tn_contact_ub = Tn_ub;
         out.worst_case_contact_time = s.t;
-        out.worst_case_plane_distance_at_candidate = std::min(d_region_pred, d_region_next);
-        out.worst_case_nominal_forward_progress = n.dot(x_pred - current_position);
-        out.worst_case_v_n_ub = v_n_ub;
-        out.worst_case_Tn_ub  = Tn_ub;
-        out.worst_case_a_pos  = a_pos;
-        out.worst_case_a_brake = a_brake;
-        out.worst_case_a_net  = a_net;
+        out.worst_case_plane_distance_at_candidate =
+            std::min(d_pred, d_next);
+        out.worst_case_nominal_forward_progress =
+            n.dot(x_next - current_position);
+        out.worst_case_v_n_ub = v_n;
+        out.worst_case_Tn_ub = T_n_ub;
+
+        out.worst_case_a_pos = 0.0;
+        out.worst_case_a_brake = 0.0;
+        out.worst_case_a_net = 0.0;
+      }
+
+      if (V_n_ub > V_n_max) {
+        V_n_max = V_n_ub;
+        out.worst_case_V_potential_ub = V_n_ub;
+      }
+
+      if (!s.failsafe && !out.nominal_contact_sample_found) {
+        const Vector3d x_contact =
+            closestPointOnSegment(x_pred, x_next, sphere_center);
+
+        out.nominal_contact_sample_found = true;
+        out.nominal_contact_time = s.t;
+        out.nominal_contact_distance = d_segment;
+        out.v_n_contact_nominal = v_n;
+        out.Tn_contact_nominal = T_n_ub;
+        out.nominal_contact_point_world = x_contact;
       }
     }
+
+    if (s.failsafe) {
+      terminal_T_ub = T_n_ub;
+      terminal_V_ub = V_n_ub;
+      terminal_sample_found = true;
+    }
+
     x_pred = x_next;
     v_pred = v_next;
   };
 
   double t_prev = plan.anchor.t;
+
   for (const auto& s : plan.intended) {
-    const double dtp = std::max(s.t - t_prev, kMinDt);
+    const double dtp =
+        std::max(s.t - t_prev, kMinDt);
+
     eval_sample(s, dtp);
     t_prev = s.t;
   }
+
   for (const auto& s : plan.failsafe) {
-    const double dtp = std::max(s.t - t_prev, kMinDt);
+    const double dtp =
+        std::max(s.t - t_prev, kMinDt);
+
     eval_sample(s, dtp);
     t_prev = s.t;
+  }
+
+  if (!terminal_sample_found) {
+    terminal_T_ub = 0.0;
+    terminal_V_ub = 0.0;
   }
 
   out.h_geom = out.plane_distance_min;
 
-  out.worst_case_V_potential_ub = worst_V_potential_ub;
-  out.h_clamping_energy =
-      clamping_energy_budget_joule_ - out.worst_case_V_potential_ub;
+  out.worst_case_Tn_ub = T_n_max;
+  out.worst_case_V_potential_ub = V_n_max;
 
-  if (out.worst_case_contact_found) {
-    out.h_monitored_energy =
-        safe_collision_energy_joule_ - out.worst_case_Tn_ub;
-  } else {
-    out.h_monitored_energy = std::numeric_limits<double>::infinity();
-  }
+  out.terminal_energy_ub =
+      terminal_T_ub + terminal_V_ub;
+
+  const double L_TF_eff =
+      std::max(0.0, safe_collision_energy_joule_ - energy_budget_margin_joule_);
+
+  const double L_QS_eff =
+      std::max(0.0, clamping_energy_budget_joule_ - energy_budget_margin_joule_);
+
+  const double L_F_eff =
+      std::min(L_TF_eff, L_QS_eff);
+
+  out.h_monitored_energy =
+      L_TF_eff - out.worst_case_Tn_ub;
+
+  out.h_clamping_energy =
+      L_QS_eff - out.worst_case_V_potential_ub;
+
+  out.h_terminal_energy =
+      L_F_eff - out.terminal_energy_ub;
 
   out.collision_energy_unsafe =
-      out.monitored_contact_possible &&
-      out.worst_case_contact_found &&
-      out.h_monitored_energy < 0.0;
+      out.worst_case_Tn_ub > L_TF_eff;
 
   out.clamping_energy_unsafe =
-      out.h_clamping_energy < 0.0;
+      out.worst_case_V_potential_ub > L_QS_eff;
+
+  out.terminal_energy_unsafe =
+      out.terminal_energy_ub > L_F_eff;
 
   out.monitored_unsafe =
-      out.collision_energy_unsafe || out.clamping_energy_unsafe;
+      out.collision_energy_unsafe ||
+      out.clamping_energy_unsafe ||
+      out.terminal_energy_unsafe;
 
   out.predicted_trigger = out.monitored_unsafe;
+
   return out;
 }
 
@@ -1672,7 +1868,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << monitor.worst_case_v_n_ub << "," << monitor.worst_case_Tn_ub << ","
         << monitor.worst_case_a_pos << "," << monitor.worst_case_a_brake << "," << monitor.worst_case_a_net << ","
         << monitor.h_geom << "," << monitor.h_monitored_energy << ","
-        << monitor.h_clamping_energy << "," << monitor.worst_case_V_potential_ub << ","
+        << monitor.h_clamping_energy << "," << monitor.h_terminal_energy << ","
+        << monitor.worst_case_V_potential_ub << "," << monitor.terminal_energy_ub << ","
         << robot_potential_energy << ","
         << robot_potential_energy_pos << ","
         << robot_potential_energy_rot << ","
@@ -1682,6 +1879,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << static_cast<int>(monitor.monitored_contact_possible) << ","
         << static_cast<int>(monitor.collision_energy_unsafe) << ","
         << static_cast<int>(monitor.clamping_energy_unsafe) << ","
+        << static_cast<int>(monitor.terminal_energy_unsafe) << ","
         << static_cast<int>(monitor.monitored_unsafe) << ","
         << static_cast<int>(monitor.predicted_trigger) << "\n";
     ++log_write_counter_;
@@ -2038,13 +2236,14 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "worst_case_nominal_forward_progress,"
         << "worst_case_v_n_ub,worst_case_Tn_ub,"
         << "worst_case_a_pos,worst_case_a_brake,worst_case_a_net,"
-        << "h_geom,h_monitored_energy,h_clamping_energy,worst_case_V_potential_ub,"
+        << "h_geom,h_monitored_energy,h_clamping_energy,h_terminal_energy,"
+        << "worst_case_V_potential_ub,terminal_energy_ub,"
         << "robot_potential_energy,robot_potential_energy_pos,robot_potential_energy_rot,"
         << "v_n_now_tube,Tn_now_tube,Tn_dot_est,"
         << "current_pos_error_radius,current_vel_error_radius,"
         << "worst_case_pos_error_radius,worst_case_vel_error_radius,"
         << "monitored_contact_possible,collision_energy_unsafe,clamping_energy_unsafe,"
-        << "monitored_unsafe,predicted_trigger\n";
+        << "terminal_energy_unsafe,monitored_unsafe,predicted_trigger\n";
     RCLCPP_INFO(get_node()->get_logger(), "Validation log enabled: %s", error_log_path_.c_str());
   }
   return CallbackReturn::SUCCESS;

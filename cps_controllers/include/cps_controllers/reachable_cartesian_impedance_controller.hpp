@@ -85,6 +85,9 @@ struct MonitorResult {
   bool clamping_energy_unsafe{false};
   bool collision_energy_unsafe{false};
 
+  double terminal_energy_ub{0.0};
+  double h_terminal_energy{std::numeric_limits<double>::infinity()};
+  bool terminal_energy_unsafe{false};
 };
 
 struct ImpedanceSample {

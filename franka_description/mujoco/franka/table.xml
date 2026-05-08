@@ -136,7 +136,7 @@
 
     <!-- spring-supported compliant pad simulating human hand surface -->
     <!-- table top upper surface: z = 0.18 + 0.025 = 0.205 m -->
-    <body name="human_hand_surface" pos="-0.30 0 0.40">
+    <body name="human_hand_surface" pos="-0.30 0 0.28">
       <joint
         name="hand_surface_spring_z"
         type="slide"
