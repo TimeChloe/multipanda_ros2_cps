@@ -8,3 +8,7 @@ franka_multi_mode_controller/mm_demo_scripts/*
 log/*
 build/*
 install/*
+
+# data
+data_log/*
+backup/*
