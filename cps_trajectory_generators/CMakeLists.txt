@@ -7,6 +7,7 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(ruckig REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
   src/reachable_cartesian_trajectory.cpp
@@ -19,7 +20,10 @@ target_include_directories(${PROJECT_NAME}
 )
 
 target_link_libraries(${PROJECT_NAME}
-  Eigen3::Eigen
+  PUBLIC
+    Eigen3::Eigen
+  PRIVATE
+    ruckig::ruckig
 )
 
 install(
@@ -38,7 +42,7 @@ install(
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME})
 ament_export_targets(export_${PROJECT_NAME})
-ament_export_dependencies(Eigen3)
+ament_export_dependencies(Eigen3 ruckig)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)

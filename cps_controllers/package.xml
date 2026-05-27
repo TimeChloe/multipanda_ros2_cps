@@ -21,7 +21,6 @@
   <depend>franka_msgs</depend>
   <depend>pinocchio</depend>
   <depend>visualization_msgs</depend>
-  <depend>ruckig</depend>
   <depend>cps_human_workspace</depend>
   <depend>cps_trajectory_generators</depend>
 

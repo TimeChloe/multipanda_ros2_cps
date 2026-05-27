@@ -23,7 +23,6 @@ find_package(geometry_msgs REQUIRED)
 find_package(franka_msgs REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(visualization_msgs REQUIRED)
-find_package(ruckig REQUIRED)
 find_package(cps_human_workspace REQUIRED)
 find_package(cps_trajectory_generators REQUIRED)
 
@@ -57,14 +56,12 @@ ament_target_dependencies(${PROJECT_NAME}
   geometry_msgs
   franka_msgs
   visualization_msgs
-  ruckig
   cps_human_workspace
   cps_trajectory_generators
 )
 
 target_link_libraries(${PROJECT_NAME}
   pinocchio::pinocchio
-  ruckig::ruckig
 )
 
 install(
@@ -100,7 +97,6 @@ ament_export_dependencies(
   franka_msgs
   pinocchio
   visualization_msgs
-  ruckig
   cps_human_workspace
   cps_trajectory_generators
 )

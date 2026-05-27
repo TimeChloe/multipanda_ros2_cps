@@ -216,8 +216,7 @@ class ReachableCartesianImpedanceController
       const Quaterniond& current_orientation,
       double wall_time) const;
 
-  // 新增：重新填充 Ruckig intended 缓冲
-  bool refillRuckigIntendedBuffer(
+  bool refillIntendedBufferFromReplanner(
       double nominal_guess_time,
       const ImpedanceSample& planning_start_command);
 
@@ -361,13 +360,12 @@ class ReachableCartesianImpedanceController
   VerifiedPlan candidate_plan_{};
   bool candidate_plan_valid_{false};
 
-  // 新增：用于缓存 Ruckig 轨迹输出的 buffer
   std::vector<ImpedanceSample> intended_buffer_;
   std::size_t intended_buffer_index_{0};
   bool intended_buffer_valid_{false};
 
   // Last command actually sent to impedance controller.
-  // Used as Ruckig replanning start position to avoid discontinuous replans
+  // Used as replanning start position to avoid discontinuous replans
   // from noisy or lagged measured EE position.
   ImpedanceSample last_commanded_sample_{};
   bool last_commanded_sample_valid_{false};
