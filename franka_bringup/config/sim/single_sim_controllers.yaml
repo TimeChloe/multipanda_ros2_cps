@@ -187,7 +187,8 @@ reachable_cartesian_impedance_controller:
     arm_id: panda
 
     enable_error_logging: true
-    error_log_path: /home/developer/multipanda_ws/src/data_log/reachable_cartesian_impedance_validation.csv
+    error_log_root_dir: /home/developer/multipanda_ws/src/data_log
+    error_log_file_name: reachable_cartesian_impedance_validation.csv
 
     use_constant_reference: false
     reference_trajectory_type: line
@@ -212,13 +213,6 @@ reachable_cartesian_impedance_controller:
 
     ee_collision_radius: 0.04
     monitor_decimation: 1
-
-    # 当前设置表示人手可达区域在 z 方向向下接近机器人。
-    human_plane_normal: [0.0, 0.0, -1.0]
-    human_sphere_center: [0.3, 0.0, 0.3]
-
-    human_motion_radius: 0.08
-    human_hand_radius: 0.04
 
     k_rate_limit: 500000.0
     d_rate_limit: 50000.0

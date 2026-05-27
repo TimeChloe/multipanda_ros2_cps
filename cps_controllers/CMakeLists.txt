@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.8)
 project(cps_controllers)
 
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+endif()
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -19,6 +24,8 @@ find_package(franka_msgs REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(ruckig REQUIRED)
+find_package(cps_human_workspace REQUIRED)
+find_package(cps_trajectory_generators REQUIRED)
 
 pluginlib_export_plugin_description_file(
   controller_interface
@@ -51,6 +58,8 @@ ament_target_dependencies(${PROJECT_NAME}
   franka_msgs
   visualization_msgs
   ruckig
+  cps_human_workspace
+  cps_trajectory_generators
 )
 
 target_link_libraries(${PROJECT_NAME}
@@ -92,6 +101,8 @@ ament_export_dependencies(
   pinocchio
   visualization_msgs
   ruckig
+  cps_human_workspace
+  cps_trajectory_generators
 )
 
 if(BUILD_TESTING)

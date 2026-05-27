@@ -1,29 +1,24 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>cps_controllers</name>
+  <name>cps_human_workspace</name>
   <version>0.0.1</version>
-  <description>Custom controllers for Franka-based CPS research.</description>
+  <description>Human workspace geometry and ROS parameter integration for CPS safety monitoring.</description>
   <maintainer email="yue22.zhang@tum.de">yue</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <depend>pluginlib</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>
-  <depend>controller_interface</depend>
-  <depend>hardware_interface</depend>
-  <depend>realtime_tools</depend>
-  <depend>franka_semantic_components</depend>
-  <depend>std_msgs</depend>
+  <depend>eigen</depend>
+  <depend>ament_index_cpp</depend>
   <depend>geometry_msgs</depend>
-  <depend>franka_msgs</depend>
-  <depend>pinocchio</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
   <depend>visualization_msgs</depend>
-  <depend>ruckig</depend>
-  <depend>cps_human_workspace</depend>
-  <depend>cps_trajectory_generators</depend>
+  <depend>yaml-cpp</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

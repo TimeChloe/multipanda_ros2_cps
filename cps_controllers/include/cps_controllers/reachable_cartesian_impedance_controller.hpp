@@ -13,6 +13,7 @@
 #include <rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
+#include "cps_human_workspace/human_workspace.hpp"
 #include "franka_semantic_components/franka_robot_model.hpp"
 
 using CallbackReturn =
@@ -168,10 +169,6 @@ class ReachableCartesianImpedanceController
                           const Matrix6d& D_target,
                           double dt);
 
-  double computeNormalStiffnessAlongNormal(const Matrix6d& K) const;
-
-  double computeNormalDampingAlongNormal(const Matrix6d& D) const;
-
   double computeConservativeNormalAccelPositiveBound(
       double m_eff_n,
       double e_n_abs,
@@ -182,10 +179,6 @@ class ReachableCartesianImpedanceController
       double m_eff_n,
       double v_n_abs,
       const Matrix6d& D_used) const;
-
-  double distanceToSweptHandRegion(const Vector3d& x,
-                                   const Vector3d& plane_normal,
-                                   const Vector3d& sphere_center) const;
 
   double estimatePathParameterTimeFromCurrentState(
       const Vector3d& current_position,
@@ -242,9 +235,7 @@ class ReachableCartesianImpedanceController
                                     const Vector3d& current_position,
                                     const Vector6d& ee_twist,
                                     const Matrix7d& inertia,
-                                    const Matrix37d& Jv,
-                                    const Vector3d& plane_normal,
-                                    const Vector3d& sphere_center) const;
+                                    const Matrix37d& Jv) const;
 
   ShieldDecision computeShieldDecision(double wall_time,
                                        double nominal_guess_time,
@@ -274,8 +265,11 @@ class ReachableCartesianImpedanceController
       double rot_damping_scale) const;
 
   bool enable_error_logging_{false};
-  std::string error_log_path_{
-      "/home/developer/multipanda_ws/src/data_log/reachable_cartesian_impedance_validation.csv"};
+  std::string error_log_root_dir_{"/home/developer/multipanda_ws/src/data_log"};
+  std::string error_log_file_name_{"reachable_cartesian_impedance_validation.csv"};
+  std::string legacy_error_log_path_;
+  std::string error_log_run_dir_;
+  std::string error_log_file_path_;
   std::ofstream error_log_file_;
   std::size_t log_write_counter_{0};
 
@@ -312,11 +306,7 @@ class ReachableCartesianImpedanceController
   double ee_collision_radius_{0.04};
   int monitor_decimation_{1};
 
-  Vector3d human_plane_normal_{Vector3d(0.0, 0.0, 1.0)};
-  Vector3d human_sphere_center_{Vector3d(0.0, 0.0, 0.2)};
-
-  double human_motion_radius_{0.10};
-  double human_hand_radius_{0.04};
+  cps_human_workspace::HumanWorkspace human_workspace_;
 
   double k_rate_limit_{5000.0};
   double d_rate_limit_{500.0};
@@ -348,6 +338,12 @@ class ReachableCartesianImpedanceController
 
   bool use_dynamic_consistent_impedance_{true};
   double torque_rate_limit_{1000.0};
+  double dynamic_lambda_regularization_{1.0e-6};
+  double jdot_dq_filter_alpha_{0.15};
+  double jdot_dq_max_norm_{5.0};
+  Matrix67d J_geo_prev_{Matrix67d::Zero()};
+  Vector6d Jdot_dq_filtered_{Vector6d::Zero()};
+  bool J_geo_prev_valid_{false};
 
   double prev_Tn_fs_{0.0};
   bool prev_Tn_fs_valid_{false};

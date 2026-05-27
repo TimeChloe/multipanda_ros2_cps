@@ -89,6 +89,24 @@ def generate_launch_description():
                  'rate': 30}],
     )
 
+    node_human_workspace_visualizer = Node(
+        package='cps_human_workspace',
+        executable='human_workspace_visualizer',
+        name='human_workspace_visualizer',
+        output='screen',
+        parameters=[
+            {
+                'use_sim_time': True,
+                'frame_id': 'panda_link0',
+                'marker_topic': 'human_workspace/markers',
+                'ee_frame_id': 'panda_link8',
+                'ee_collision_radius': 0.04,
+                'tracking_pos_error_bound': 0.005,
+                'visualize_ee_collision_area': True,
+            }
+        ],
+    )
+
     # Others
     rviz_file = os.path.join(get_package_share_directory('franka_description'), 'rviz',
                              'visualize_franka.rviz')
@@ -127,6 +145,7 @@ def generate_launch_description():
         # Miscellaneous
         node_robot_state_publisher,
         node_joint_state_publisher,
+        node_human_workspace_visualizer,
 
         Node( # RVIZ dependency
             package='controller_manager',

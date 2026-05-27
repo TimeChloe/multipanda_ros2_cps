@@ -13,22 +13,19 @@
 //   - Updates monitor prediction so true branch remains consistent with physical K/D.
 //
 // NOTE:
-//   This file is cpp-only compatible with the current header by storing the new
-//   Jdot*dq runtime state in this translation unit. For multi-controller or
-//   multi-arm deployments, move g_J_geo_prev, g_Jdot_dq_filtered, and
-//   g_J_geo_prev_valid into class members instead.
-
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -49,13 +46,18 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include <cps_controllers/reachable_cartesian_impedance_controller.hpp>
+#include <cps_controllers/reachable_cartesian_math.hpp>
+#include <cps_trajectory_generators/reachable_cartesian_trajectory.hpp>
 
 namespace {
 
 constexpr double kMinDt = 1e-6;
-constexpr double kSmoothStartDuration = 2.0;
 constexpr double kLambdaReg = 1e-9;
 constexpr double kSmallPositive = 1e-9;
+constexpr const char* kDefaultErrorLogRootDir =
+    "/home/developer/multipanda_ws/src/data_log";
+constexpr const char* kDefaultErrorLogFileName =
+    "reachable_cartesian_impedance_validation.csv";
 
 using Vector7d = Eigen::Matrix<double, 7, 1>;
 using Matrix7d = Eigen::Matrix<double, 7, 7>;
@@ -69,35 +71,97 @@ using Vector3d = Eigen::Vector3d;
 using Quaterniond = Eigen::Quaterniond;
 using Marker = visualization_msgs::msg::Marker;
 using MarkerArray = visualization_msgs::msg::MarkerArray;
+using ReferenceTrajectoryType = cps_trajectory_generators::ReferenceTrajectoryType;
+using TaskRefPose = cps_trajectory_generators::TaskRefPose;
+using cps_trajectory_generators::estimateLinePathTimeFromZ;
+using cps_trajectory_generators::makeReferenceLine;
+using cps_trajectory_generators::makeReferencePose;
+using cps_trajectory_generators::parseTrajectoryTypeOrDefault;
 
-// cpp-only runtime state for the corrected dynamic-consistent branch.
-// For multi-controller deployments, move these to class members in the header.
-Matrix67d g_J_geo_prev = Matrix67d::Zero();
-Vector6d g_Jdot_dq_filtered = Vector6d::Zero();
-bool g_J_geo_prev_valid = false;
+inline int daysInMonth(int year, int month) {
+  static constexpr int kDaysByMonth[] = {
+      31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (month == 2) {
+    const bool leap_year =
+        ((year % 4 == 0) && (year % 100 != 0)) || (year % 400 == 0);
+    return leap_year ? 29 : 28;
+  }
+  return kDaysByMonth[month - 1];
+}
 
-double g_dynamic_lambda_regularization = 1e-6;
-double g_jdot_dq_filter_alpha = 0.15;
-double g_jdot_dq_max_norm = 5.0;
+inline int weekdayUtc(int year, int month, int day) {
+  std::tm tm{};
+  tm.tm_year = year - 1900;
+  tm.tm_mon = month - 1;
+  tm.tm_mday = day;
+  tm.tm_hour = 12;
+  time_t t = timegm(&tm);
+  std::tm out{};
+  gmtime_r(&t, &out);
+  return out.tm_wday;
+}
 
-enum class ReferenceTrajectoryType {
-  kLine,
-  kLissajous,
-  kConstant
-};
+inline int lastSundayOfMonth(int year, int month) {
+  int day = daysInMonth(year, month);
+  while (weekdayUtc(year, month, day) != 0) {
+    --day;
+  }
+  return day;
+}
 
-struct SmoothStartProfile {
-  double s{0.0};
-  double ds{0.0};
-  double dds{0.0};
-};
+inline time_t utcTime(int year, int month, int day, int hour) {
+  std::tm tm{};
+  tm.tm_year = year - 1900;
+  tm.tm_mon = month - 1;
+  tm.tm_mday = day;
+  tm.tm_hour = hour;
+  return timegm(&tm);
+}
 
-struct TaskRefPose {
-  Vector3d p{Vector3d::Zero()};
-  Vector3d dp{Vector3d::Zero()};
-  Vector3d ddp{Vector3d::Zero()};
-  Matrix3d R{Matrix3d::Identity()};
-};
+inline int berlinUtcOffsetMinutes(std::chrono::system_clock::time_point now) {
+  const time_t now_time_t = std::chrono::system_clock::to_time_t(now);
+  std::tm utc_tm{};
+  gmtime_r(&now_time_t, &utc_tm);
+  const int year = utc_tm.tm_year + 1900;
+
+  const time_t dst_start =
+      utcTime(year, 3, lastSundayOfMonth(year, 3), 1);
+  const time_t dst_end =
+      utcTime(year, 10, lastSundayOfMonth(year, 10), 1);
+
+  return (now_time_t >= dst_start && now_time_t < dst_end) ? 120 : 60;
+}
+
+inline std::string makeBerlinTimestampForDirectoryName() {
+  const auto now = std::chrono::system_clock::now();
+  const int utc_offset_minutes = berlinUtcOffsetMinutes(now);
+  const auto adjusted_now = now + std::chrono::minutes(utc_offset_minutes);
+  const auto adjusted_time_t = std::chrono::system_clock::to_time_t(adjusted_now);
+  const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                          now.time_since_epoch())
+                          .count() %
+                      1000000;
+
+  std::tm tm{};
+  gmtime_r(&adjusted_time_t, &tm);
+
+  std::ostringstream ss;
+  ss << std::put_time(&tm, "%Y%m%d_%H%M%S")
+     << "_" << std::setw(6) << std::setfill('0') << micros;
+  return ss.str();
+}
+
+inline std::string sanitizedFileNameOrDefault(
+    const std::string& file_name,
+    const std::string& default_file_name) {
+  if (file_name.empty()) {
+    return default_file_name;
+  }
+
+  const std::filesystem::path path(file_name);
+  const std::string sanitized = path.filename().string();
+  return sanitized.empty() ? default_file_name : sanitized;
+}
 
 inline std_msgs::msg::ColorRGBA makeColor(float r, float g, float b, float a) {
   std_msgs::msg::ColorRGBA c;
@@ -130,180 +194,6 @@ inline Matrix3d makePlaneFrameFromNormal(const Vector3d& n_in) {
   Matrix3d R;
   R.col(0) = x; R.col(1) = y; R.col(2) = n;
   return R;
-}
-
-inline ReferenceTrajectoryType parseReferenceTrajectoryType(const std::string& name) {
-  if (name == "lissajous") return ReferenceTrajectoryType::kLissajous;
-  if (name == "constant")  return ReferenceTrajectoryType::kConstant;
-  return ReferenceTrajectoryType::kLine;
-}
-
-inline ReferenceTrajectoryType parseTrajectoryTypeOrDefault(bool use_constant_reference,
-                                                            const std::string& name) {
-  if (use_constant_reference) return ReferenceTrajectoryType::kConstant;
-  return parseReferenceTrajectoryType(name);
-}
-
-inline SmoothStartProfile makeSmoothStartProfile(double t, double T) {
-  SmoothStartProfile out{};
-  if (t <= 0.0) return out;
-  if (t >= T) { out.s = 1.0; return out; }
-  const double x = t / T;
-  const double x2 = x*x, x3 = x2*x, x4 = x3*x, x5 = x4*x;
-  out.s   = 10.0*x3 - 15.0*x4 + 6.0*x5;
-  out.ds  = (30.0*x2 - 60.0*x3 + 30.0*x4) / T;
-  out.dds = (60.0*x  - 180.0*x2 + 120.0*x3) / (T*T);
-  return out;
-}
-
-inline double invertSmoothStartS(double s_target) {
-  s_target = std::clamp(s_target, 0.0, 1.0);
-
-  double lo = 0.0;
-  double hi = 1.0;
-
-  for (int i = 0; i < 40; ++i) {
-    const double x = 0.5 * (lo + hi);
-    const double x2 = x * x;
-    const double x3 = x2 * x;
-    const double x4 = x3 * x;
-    const double x5 = x4 * x;
-    const double s = 10.0 * x3 - 15.0 * x4 + 6.0 * x5;
-
-    if (s < s_target) {
-      lo = x;
-    } else {
-      hi = x;
-    }
-  }
-
-  return 0.5 * (lo + hi);
-}
-
-inline double estimateLinePathTimeFromZ(
-    double z,
-    double z_start,
-    double z_final,
-    double T_move) {
-  const double denom = z_final - z_start;
-
-  if (std::abs(denom) < 1e-9) {
-    return 0.0;
-  }
-
-  const double s = std::clamp((z - z_start) / denom, 0.0, 1.0);
-  const double x = invertSmoothStartS(s);
-
-  return std::clamp(x * T_move, 0.0, T_move);
-}
-
-inline TaskRefPose makeReferenceLine(double t, const Vector3d& p0, const Matrix3d& R0) {
-  TaskRefPose ref;
-  constexpr double T_move = 1.5;
-  constexpr double dz = -0.55;
-  const SmoothStartProfile ramp = makeSmoothStartProfile(t, T_move);
-  ref.p   = p0 + Vector3d(0.0, 0.0, dz * ramp.s);
-  ref.dp  = Vector3d(0.0, 0.0, dz * ramp.ds);
-  ref.ddp = Vector3d(0.0, 0.0, dz * ramp.dds);
-  ref.R   = R0;
-  return ref;
-}
-
-inline TaskRefPose makeReferenceLissajous(double t, const Vector3d& p0, const Matrix3d& R0) {
-  TaskRefPose ref;
-  const double wt = 2.0 * M_PI * 0.25;
-  const SmoothStartProfile ramp = makeSmoothStartProfile(t, kSmoothStartDuration);
-  constexpr double Ax = 0.08, Ay = 0.08, Az = 0.04;
-  const double ph_px = 0.0, ph_py = M_PI/2.0, ph_pz = 0.0;
-
-  const Vector3d p_base(
-      Ax * (std::sin(wt*t + ph_px) - std::sin(ph_px)),
-      Ay * (std::sin(wt*t + ph_py) - std::sin(ph_py)),
-      Az * (std::sin(0.5*wt*t + ph_pz) - std::sin(ph_pz)));
-  const Vector3d dp_base(
-      Ax * wt * std::cos(wt*t + ph_px),
-      Ay * wt * std::cos(wt*t + ph_py),
-      Az * 0.5 * wt * std::cos(0.5*wt*t + ph_pz));
-  const Vector3d ddp_base(
-      -Ax * wt*wt * std::sin(wt*t + ph_px),
-      -Ay * wt*wt * std::sin(wt*t + ph_py),
-      -Az * 0.25 * wt*wt * std::sin(0.5*wt*t + ph_pz));
-
-  ref.p   = p0 + ramp.s * p_base;
-  ref.dp  = ramp.ds * p_base + ramp.s * dp_base;
-  ref.ddp = ramp.dds * p_base + 2.0 * ramp.ds * dp_base + ramp.s * ddp_base;
-  ref.R   = R0;
-  return ref;
-}
-
-inline TaskRefPose makeReferencePose(double t, const Vector3d& p0, const Matrix3d& R0,
-                                     ReferenceTrajectoryType traj_type) {
-  switch (traj_type) {
-    case ReferenceTrajectoryType::kLissajous: return makeReferenceLissajous(t, p0, R0);
-    case ReferenceTrajectoryType::kConstant: {
-      TaskRefPose ref;
-      ref.p = p0; ref.dp.setZero(); ref.ddp.setZero(); ref.R = R0;
-      return ref;
-    }
-    case ReferenceTrajectoryType::kLine:
-    default:
-      return makeReferenceLine(t, p0, R0);
-  }
-}
-
-inline Eigen::MatrixXd dampedPseudoInverse(const Eigen::MatrixXd& M, double lambda = 0.2) {
-  Eigen::JacobiSVD<Eigen::MatrixXd> svd(M, Eigen::ComputeFullU | Eigen::ComputeFullV);
-  const auto s = svd.singularValues();
-  Eigen::MatrixXd S = Eigen::MatrixXd::Zero(svd.matrixV().cols(), svd.matrixU().cols());
-  for (int i = 0; i < s.size(); ++i) S(i, i) = s(i) / (s(i)*s(i) + lambda*lambda);
-  return svd.matrixV() * S * svd.matrixU().transpose();
-}
-
-inline Vector3d computeOrientationError(const Quaterniond& current, const Quaterniond& desired) {
-  Quaterniond q_curr = current;
-  Quaterniond q_des = desired;
-  if (q_des.coeffs().dot(q_curr.coeffs()) < 0.0) q_curr.coeffs() << -q_curr.coeffs();
-  const Quaterniond q_err(q_curr * q_des.inverse());
-  Eigen::AngleAxisd aa(q_err);
-  return aa.axis() * aa.angle();
-}
-
-inline Matrix7d arrayToMatrix7d(const std::array<double, 49>& data) {
-  Matrix7d out;
-  for (size_t i = 0; i < 7; ++i)
-    for (size_t j = 0; j < 7; ++j)
-      out(static_cast<int>(i), static_cast<int>(j)) = data[i*7 + j];
-  return out;
-}
-
-inline Vector7d arrayToVector7d(const std::array<double, 7>& data) {
-  Vector7d out;
-  for (size_t i = 0; i < 7; ++i) out(static_cast<int>(i)) = data[i];
-  return out;
-}
-
-inline Vector3d closestPointOnSegment(
-    const Vector3d& a,
-    const Vector3d& b,
-    const Vector3d& p) {
-  const Vector3d ab = b - a;
-  const double denom = ab.squaredNorm();
-
-  if (denom < 1e-12) {
-    return a;
-  }
-
-  const double alpha = std::clamp((p - a).dot(ab) / denom, 0.0, 1.0);
-  return a + alpha * ab;
-}
-
-inline double signedDistanceSegmentToInflatedSphere(
-    const Vector3d& a,
-    const Vector3d& b,
-    const Vector3d& center,
-    double inflated_radius) {
-  const Vector3d c = closestPointOnSegment(a, b, center);
-  return (c - center).norm() - inflated_radius;
 }
 
 }  // namespace
@@ -353,22 +243,10 @@ Matrix6d ReachableCartesianImpedanceController::computeDampingFromStiffness(
 }
 
 
-double ReachableCartesianImpedanceController::computeNormalStiffnessAlongNormal(
-    const Matrix6d& K) const {
-  const Vector3d n = human_plane_normal_.normalized();
-  return std::max((n.transpose() * K.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
-}
-
-double ReachableCartesianImpedanceController::computeNormalDampingAlongNormal(
-    const Matrix6d& D) const {
-  const Vector3d n = human_plane_normal_.normalized();
-  return std::max((n.transpose() * D.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
-}
-
 double ReachableCartesianImpedanceController::computeConservativeNormalAccelPositiveBound(
     double m_eff_n, double e_n_abs, double /*v_n_abs*/, const Matrix6d& K_used) const {
   const double m_safe = std::max(m_eff_n, kSmallPositive);
-  const double k_n_up = computeNormalStiffnessAlongNormal(K_used);
+  const double k_n_up = human_workspace_.normalStiffness(K_used);
   const double a_from_stiffness = (k_n_up * e_n_abs) / m_safe;
   const double a_from_tau_rate = torque_to_accel_gain_ * tau_rate_limit_ * kMinDt;
   const double a_from_uncertainty = std::max(model_accel_uncertainty_, 0.0);
@@ -378,16 +256,10 @@ double ReachableCartesianImpedanceController::computeConservativeNormalAccelPosi
 double ReachableCartesianImpedanceController::computeConservativeNormalBrakeAccelLowerBound(
     double m_eff_n, double v_n_abs, const Matrix6d& D_used) const {
   const double m_safe = std::max(m_eff_n, kSmallPositive);
-  const double d_n_low = computeNormalDampingAlongNormal(D_used);
+  const double d_n_low = human_workspace_.normalDamping(D_used);
   const double a_from_damping = (d_n_low * v_n_abs) / m_safe;
   const double a_tau_loss = 0.5 * torque_to_accel_gain_ * tau_rate_limit_ * kMinDt;
   return std::max(0.0, a_from_damping - a_tau_loss);
-}
-
-double ReachableCartesianImpedanceController::distanceToSweptHandRegion(
-    const Vector3d& x, const Vector3d& /*plane_normal*/, const Vector3d& sphere_center) const {
-  const double sphere_radius = human_motion_radius_ + human_hand_radius_;
-  return std::max((x - sphere_center).norm() - sphere_radius, 0.0);
 }
 
 // path retiming helpers ------------------------------------------------------
@@ -456,7 +328,7 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
   MarkerArray arr;
   const auto stamp = get_node()->now();
   const std::string& frame_id = rviz_frame_id_;
-  const Vector3d n = human_plane_normal_.normalized();
+  const Vector3d n = human_workspace_.normal();
   auto setupMarker = [&](Marker& m, int id, const std::string& ns, int type) {
     m.header.frame_id = frame_id; m.header.stamp = stamp;
     m.ns = ns; m.id = id; m.type = type; m.action = Marker::ADD;
@@ -467,7 +339,7 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
   const Quaterniond q_plane = rotationMatrixToQuaternion(R_plane);
 
   { Marker m; setupMarker(m, 0, "reachable_plane", Marker::CUBE);
-    m.pose.position = toPoint(human_sphere_center_);
+    m.pose.position = toPoint(human_workspace_.center());
     m.pose.orientation = toQuatMsg(q_plane);
     m.scale.x = rviz_plane_size_; m.scale.y = rviz_plane_size_; m.scale.z = rviz_plane_thickness_;
     m.color = makeColor(0.1f, 0.6f, 1.0f, 0.12f);
@@ -475,18 +347,18 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
   { Marker m; setupMarker(m, 1, "reachable_plane_normal", Marker::ARROW);
     m.scale.x = rviz_arrow_shaft_diameter_; m.scale.y = rviz_arrow_head_diameter_; m.scale.z = rviz_arrow_head_length_;
     m.color = makeColor(0.1f, 0.6f, 1.0f, 0.9f);
-    const Vector3d p0 = human_sphere_center_;
+    const Vector3d p0 = human_workspace_.center();
     const Vector3d p1 = p0 + rviz_normal_arrow_length_ * n;
     m.points.push_back(toPoint(p0)); m.points.push_back(toPoint(p1));
     arr.markers.push_back(m); }
   { Marker m; setupMarker(m, 2, "reachable_hand_motion_sphere", Marker::SPHERE);
-    m.pose.position = toPoint(human_sphere_center_); m.pose.orientation.w = 1.0;
-    m.scale.x = m.scale.y = m.scale.z = 2.0 * human_motion_radius_;
+    m.pose.position = toPoint(human_workspace_.center()); m.pose.orientation.w = 1.0;
+    m.scale.x = m.scale.y = m.scale.z = 2.0 * human_workspace_.motionRadius();
     m.color = makeColor(1.0f, 0.8f, 0.1f, 0.20f);
     arr.markers.push_back(m); }
   { Marker m; setupMarker(m, 3, "reachable_hand_inflated_sphere", Marker::SPHERE);
-    m.pose.position = toPoint(human_sphere_center_); m.pose.orientation.w = 1.0;
-    const double inflated_radius = human_motion_radius_ + human_hand_radius_;
+    m.pose.position = toPoint(human_workspace_.center()); m.pose.orientation.w = 1.0;
+    const double inflated_radius = human_workspace_.inflatedHandRadius();
     m.scale.x = m.scale.y = m.scale.z = 2.0 * inflated_radius;
     m.color = makeColor(1.0f, 0.3f, 0.2f, 0.10f);
     arr.markers.push_back(m); }
@@ -890,9 +762,6 @@ bool ReachableCartesianImpedanceController::refillRuckigIntendedBuffer(
 // ============================================================================
 // Build a single-step candidate plan
 // ============================================================================
-// ============================================================================
-// Build a single-step candidate plan
-// ============================================================================
 VerifiedPlan ReachableCartesianImpedanceController::buildSingleStepCandidatePlan(
     double wall_time,
     const Vector3d& current_position,
@@ -977,12 +846,10 @@ MonitorResult ReachableCartesianImpedanceController::verifyCandidatePlan(
     const Vector3d& current_position,
     const Vector6d& ee_twist,
     const Matrix7d& inertia,
-    const Matrix37d& Jv,
-    const Vector3d& plane_normal,
-    const Vector3d& sphere_center) const {
+    const Matrix37d& Jv) const {
   MonitorResult out;
 
-  const Vector3d n = plane_normal.normalized();
+  const Vector3d n = human_workspace_.normal();
 
   Vector3d x_pred = current_position;
   Vector3d v_pred = ee_twist.head<3>();
@@ -1020,13 +887,12 @@ MonitorResult ReachableCartesianImpedanceController::verifyCandidatePlan(
               0.0));
 
   const double inflated_contact_radius =
-      human_motion_radius_ +
-      human_hand_radius_ +
-      ee_collision_radius_ +
-      rho_p;
+      human_workspace_.inflatedCollisionRadius(ee_collision_radius_, rho_p);
 
   out.plane_distance_now =
-      (current_position - sphere_center).norm() - inflated_contact_radius;
+      human_workspace_.signedDistanceToInflatedSphere(
+          current_position,
+          inflated_contact_radius);
 
   out.plane_distance_min = out.plane_distance_now;
 
@@ -1068,16 +934,19 @@ MonitorResult ReachableCartesianImpedanceController::verifyCandidatePlan(
         v_pred + a_pred * dtp;
 
     const double d_pred =
-        (x_pred - sphere_center).norm() - inflated_contact_radius;
+        human_workspace_.signedDistanceToInflatedSphere(
+            x_pred,
+            inflated_contact_radius);
 
     const double d_next =
-        (x_next - sphere_center).norm() - inflated_contact_radius;
+        human_workspace_.signedDistanceToInflatedSphere(
+            x_next,
+            inflated_contact_radius);
 
     const double d_segment =
-        signedDistanceSegmentToInflatedSphere(
+        human_workspace_.signedDistanceSegmentToInflatedSphere(
             x_pred,
             x_next,
-            sphere_center,
             inflated_contact_radius);
 
     out.plane_distance_min =
@@ -1129,8 +998,12 @@ MonitorResult ReachableCartesianImpedanceController::verifyCandidatePlan(
       }
 
       if (!s.failsafe && !out.nominal_contact_sample_found) {
-        const Vector3d x_contact =
-            closestPointOnSegment(x_pred, x_next, sphere_center);
+        Vector3d x_contact = Vector3d::Zero();
+        human_workspace_.signedDistanceSegmentToInflatedSphere(
+            x_pred,
+            x_next,
+            inflated_contact_radius,
+            &x_contact);
 
         out.nominal_contact_sample_found = true;
         out.nominal_contact_time = s.t;
@@ -1244,8 +1117,7 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
   }
 
   auto verify_plan = [&](const VerifiedPlan& plan) {
-    return verifyCandidatePlan(plan, current_position, ee_twist, inertia, Jv,
-                               human_plane_normal_, human_sphere_center_);
+    return verifyCandidatePlan(plan, current_position, ee_twist, inertia, Jv);
   };
 
   auto execute_last_verified_failsafe = [&]() {
@@ -1432,26 +1304,26 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
 
   Vector6d Jdot_dq = Vector6d::Zero();
 
-  if (g_J_geo_prev_valid) {
+  if (J_geo_prev_valid_) {
     const Matrix67d Jdot =
-        (J_geo - g_J_geo_prev) / std::max(dt, kMinDt);
+        (J_geo - J_geo_prev_) / std::max(dt, kMinDt);
 
     Vector6d Jdot_dq_raw = Jdot * dq;
 
     const double raw_norm = Jdot_dq_raw.norm();
-    if (g_jdot_dq_max_norm > 0.0 && raw_norm > g_jdot_dq_max_norm) {
-      Jdot_dq_raw *= g_jdot_dq_max_norm / std::max(raw_norm, kSmallPositive);
+    if (jdot_dq_max_norm_ > 0.0 && raw_norm > jdot_dq_max_norm_) {
+      Jdot_dq_raw *= jdot_dq_max_norm_ / std::max(raw_norm, kSmallPositive);
     }
 
-    g_Jdot_dq_filtered =
-        g_jdot_dq_filter_alpha * Jdot_dq_raw +
-        (1.0 - g_jdot_dq_filter_alpha) * g_Jdot_dq_filtered;
+    Jdot_dq_filtered_ =
+        jdot_dq_filter_alpha_ * Jdot_dq_raw +
+        (1.0 - jdot_dq_filter_alpha_) * Jdot_dq_filtered_;
 
-    Jdot_dq = g_Jdot_dq_filtered;
+    Jdot_dq = Jdot_dq_filtered_;
   }
 
-  g_J_geo_prev = J_geo;
-  g_J_geo_prev_valid = true;
+  J_geo_prev_ = J_geo;
+  J_geo_prev_valid_ = true;
 
   Vector7d tau_task = Vector7d::Zero();
 
@@ -1467,7 +1339,7 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
 
       Matrix6d lambda_inv = J_geo * M_inv * J_geo.transpose();
       lambda_inv = 0.5 * (lambda_inv + lambda_inv.transpose());
-      lambda_inv.diagonal().array() += g_dynamic_lambda_regularization;
+      lambda_inv.diagonal().array() += dynamic_lambda_regularization_;
 
       const Eigen::LDLT<Matrix6d> lambda_ldlt(lambda_inv);
 
@@ -1641,7 +1513,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
   MonitorResult monitor = shield_dec.monitor;
   {
-    const Vector3d n = human_plane_normal_.normalized();
+    const Vector3d n = human_workspace_.normal();
     const double v_n_now_tube =
         std::abs(n.dot(ee_twist.head<3>())) + monitor.current_vel_error_radius;
     const double Tn_now_tube =
@@ -1747,7 +1619,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<std::string>("arm_id", "panda");
     auto_declare<bool>("enable_error_logging", true);
     auto_declare<std::string>("error_log_path",
-        "/home/developer/multipanda_ws/src/data_log/reachable_cartesian_impedance_validation.csv");
+        "");
+    auto_declare<std::string>("error_log_root_dir", kDefaultErrorLogRootDir);
+    auto_declare<std::string>("error_log_file_name", kDefaultErrorLogFileName);
 
     auto_declare<bool>("use_constant_reference", false);
     auto_declare<std::string>("reference_trajectory_type", "lissajous");
@@ -1769,10 +1643,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("ee_collision_radius", 0.04);
     auto_declare<int>("monitor_decimation", 1);
 
-    auto_declare<std::vector<double>>("human_plane_normal", std::vector<double>{0.0, 0.0, 1.0});
-    auto_declare<std::vector<double>>("human_sphere_center", std::vector<double>{0.0, 0.0, 0.2});
-    auto_declare<double>("human_motion_radius", 0.10);
-    auto_declare<double>("human_hand_radius", 0.04);
+    cps_human_workspace::HumanWorkspace::declareParameters(get_node());
 
     auto_declare<double>("k_rate_limit", 5000.0);
     auto_declare<double>("d_rate_limit", 500.0);
@@ -1840,7 +1711,21 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
   try {
     arm_id_ = get_node()->get_parameter("arm_id").as_string();
     enable_error_logging_ = get_node()->get_parameter("enable_error_logging").as_bool();
-    error_log_path_ = get_node()->get_parameter("error_log_path").as_string();
+    legacy_error_log_path_ = get_node()->get_parameter("error_log_path").as_string();
+    error_log_root_dir_ = get_node()->get_parameter("error_log_root_dir").as_string();
+    error_log_file_name_ = get_node()->get_parameter("error_log_file_name").as_string();
+
+    if (error_log_root_dir_.empty()) {
+      error_log_root_dir_ = kDefaultErrorLogRootDir;
+    }
+    error_log_file_name_ =
+        sanitizedFileNameOrDefault(error_log_file_name_, kDefaultErrorLogFileName);
+
+    if (!legacy_error_log_path_.empty()) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "error_log_path is deprecated and will be ignored. Use error_log_root_dir and error_log_file_name.");
+    }
 
     use_constant_reference_ = get_node()->get_parameter("use_constant_reference").as_bool();
     reference_trajectory_type_ = get_node()->get_parameter("reference_trajectory_type").as_string();
@@ -1900,14 +1785,14 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     use_dynamic_consistent_impedance_ = get_node()->get_parameter("use_dynamic_consistent_impedance").as_bool();
     torque_rate_limit_ = get_node()->get_parameter("torque_rate_limit").as_double();
 
-    g_dynamic_lambda_regularization = std::max(
+    dynamic_lambda_regularization_ = std::max(
         1.0e-10,
         get_node()->get_parameter("dynamic_lambda_regularization").as_double());
-    g_jdot_dq_filter_alpha = std::clamp(
+    jdot_dq_filter_alpha_ = std::clamp(
         get_node()->get_parameter("jdot_dq_filter_alpha").as_double(),
         0.0,
         1.0);
-    g_jdot_dq_max_norm = std::max(
+    jdot_dq_max_norm_ = std::max(
         0.0,
         get_node()->get_parameter("jdot_dq_max_norm").as_double());
 
@@ -1926,26 +1811,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     rviz_text_z_offset_ = get_node()->get_parameter("rviz_text_z_offset").as_double();
     rviz_ub_arrow_z_offset_ = get_node()->get_parameter("rviz_ub_arrow_z_offset").as_double();
 
-    const auto normal_vec = get_node()->get_parameter("human_plane_normal").as_double_array();
-    const auto center_vec = get_node()->get_parameter("human_sphere_center").as_double_array();
-    if (normal_vec.size() != 3 || center_vec.size() != 3) {
-      RCLCPP_ERROR(get_node()->get_logger(),
-                   "human_plane_normal and human_sphere_center must have length 3.");
+    if (!human_workspace_.configureFromParameters(get_node(), get_node()->get_logger())) {
       return CallbackReturn::ERROR;
     }
-    human_plane_normal_ = Vector3d(normal_vec[0], normal_vec[1], normal_vec[2]);
-    human_sphere_center_ = Vector3d(center_vec[0], center_vec[1], center_vec[2]);
-    human_motion_radius_ = get_node()->get_parameter("human_motion_radius").as_double();
-    human_hand_radius_ = get_node()->get_parameter("human_hand_radius").as_double();
-    if (human_motion_radius_ < 0.0 || human_hand_radius_ < 0.0) {
-      RCLCPP_ERROR(get_node()->get_logger(), "human_motion_radius and human_hand_radius must be nonnegative.");
-      return CallbackReturn::ERROR;
-    }
-    if (human_plane_normal_.norm() < 1e-8) {
-      RCLCPP_ERROR(get_node()->get_logger(), "human_plane_normal norm too small.");
-      return CallbackReturn::ERROR;
-    }
-    human_plane_normal_.normalize();
 
     profiling_stats_print_period_ = std::max<int>(
         1, static_cast<int>(get_node()->get_parameter("profiling_stats_print_period").as_int()));
@@ -2040,14 +1908,63 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   tau_cmd_prev_.setZero();
   last_shield_decision_valid_ = false;
 
-  g_J_geo_prev.setZero();
-  g_Jdot_dq_filtered.setZero();
-  g_J_geo_prev_valid = false;
+  J_geo_prev_.setZero();
+  Jdot_dq_filtered_.setZero();
+  J_geo_prev_valid_ = false;
 
   if (enable_error_logging_) {
-    error_log_file_.open(error_log_path_, std::ios::out | std::ios::trunc);
+    const std::filesystem::path root_dir(error_log_root_dir_);
+    error_log_run_dir_ =
+        (root_dir / makeBerlinTimestampForDirectoryName()).string();
+    error_log_file_path_ =
+        (std::filesystem::path(error_log_run_dir_) / error_log_file_name_).string();
+
+    std::error_code ec;
+    std::filesystem::create_directories(error_log_run_dir_, ec);
+    if (ec) {
+      RCLCPP_ERROR(
+          get_node()->get_logger(),
+          "Failed to create log run directory %s: %s",
+          error_log_run_dir_.c_str(),
+          ec.message().c_str());
+      return CallbackReturn::ERROR;
+    }
+
+    const std::filesystem::path run_info_path =
+        std::filesystem::path(error_log_run_dir_) / "run_info.txt";
+    std::ofstream run_info_file(run_info_path, std::ios::out | std::ios::trunc);
+    if (run_info_file.is_open()) {
+      run_info_file << "run_directory: " << error_log_run_dir_ << "\n"
+                    << "csv_file: " << error_log_file_path_ << "\n"
+                    << "arm_id: " << arm_id_ << "\n"
+                    << "reference_trajectory_type: " << reference_trajectory_type_ << "\n"
+                    << "use_constant_reference: " << static_cast<int>(use_constant_reference_) << "\n"
+                    << "enable_safety_monitor: " << static_cast<int>(enable_safety_monitor_) << "\n"
+                    << "timestamp_timezone: Europe/Berlin\n"
+                    << "initial_desired_position: ["
+                    << desired_position_.x() << ", "
+                    << desired_position_.y() << ", "
+                    << desired_position_.z() << "]\n"
+                    << "human_plane_normal: ["
+                    << human_workspace_.normal().x() << ", "
+                    << human_workspace_.normal().y() << ", "
+                    << human_workspace_.normal().z() << "]\n"
+                    << "human_sphere_center: ["
+                    << human_workspace_.center().x() << ", "
+                    << human_workspace_.center().y() << ", "
+                    << human_workspace_.center().z() << "]\n"
+                    << "human_motion_radius: " << human_workspace_.motionRadius() << "\n"
+                    << "human_hand_radius: " << human_workspace_.handRadius() << "\n"
+                    << "human_workspace_config_path: "
+                    << cps_human_workspace::HumanWorkspace::defaultConfigPath() << "\n";
+    }
+
+    error_log_file_.open(error_log_file_path_, std::ios::out | std::ios::trunc);
     if (!error_log_file_.is_open()) {
-      RCLCPP_ERROR(get_node()->get_logger(), "Failed to open log file: %s", error_log_path_.c_str());
+      RCLCPP_ERROR(
+          get_node()->get_logger(),
+          "Failed to open log file: %s",
+          error_log_file_path_.c_str());
       return CallbackReturn::ERROR;
     }
     error_log_file_ << std::fixed << std::setprecision(9);
@@ -2074,7 +1991,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "worst_case_pos_error_radius,worst_case_vel_error_radius,"
         << "monitored_contact_possible,collision_energy_unsafe,clamping_energy_unsafe,"
         << "terminal_energy_unsafe,monitored_unsafe,predicted_trigger\n";
-    RCLCPP_INFO(get_node()->get_logger(), "Validation log enabled: %s", error_log_path_.c_str());
+    RCLCPP_INFO(
+        get_node()->get_logger(),
+        "Validation log enabled: %s",
+        error_log_file_path_.c_str());
   }
   return CallbackReturn::SUCCESS;
 }
@@ -2082,9 +2002,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
 CallbackReturn ReachableCartesianImpedanceController::on_deactivate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   if (error_log_file_.is_open()) { error_log_file_.flush(); error_log_file_.close(); }
-  g_J_geo_prev.setZero();
-  g_Jdot_dq_filtered.setZero();
-  g_J_geo_prev_valid = false;
+  J_geo_prev_.setZero();
+  Jdot_dq_filtered_.setZero();
+  J_geo_prev_valid_ = false;
   franka_robot_model_->release_interfaces();
   return CallbackReturn::SUCCESS;
 }
