@@ -3,6 +3,7 @@ mujoco_server:
     MujocoPlugins:
       names:
         - mujoco_ros2_control
+        - mujoco_ros2_sensors
       mujoco_ros2_control:
         type: mujoco_ros2_control::MujocoRos2ControlPlugin
         hardware:
@@ -12,6 +13,8 @@ mujoco_server:
           namespace: ""
           robot_description_node: "robot_state_publisher"
           robot_description: "robot_description"
+      mujoco_ros2_sensors:
+        type: mujoco_ros::sensors::MujocoRos2SensorsPlugin
 
 controller_manager:
     ros__parameters:
@@ -207,12 +210,19 @@ reachable_cartesian_impedance_controller:
 
     enable_safety_monitor: true
 
-    safe_collision_energy_joule: 0.13
+    safe_collision_energy_joule: 0.15
     clamping_energy_budget_joule: 0.035
-    energy_budget_margin_joule: 0.005
+    energy_budget_margin_joule: 0.000
 
-    ee_collision_radius: 0.04
+    ee_collision_radius: 0.03
+    tcp_offset: [0.0, 0.0, 0.06]
+    ee_collision_center_offset: [0.0, 0.0, -0.03]
     monitor_decimation: 1
+    async_safety_monitor: true
+    async_plan_max_age_sec: 0.05
+    enable_mujoco_contact_logging: true
+    mujoco_contact_sensor_topic: /panda_metal_ball_touch
+    mujoco_contact_threshold: 1.0e-6
 
     k_rate_limit: 500000.0
     d_rate_limit: 50000.0
@@ -232,12 +242,12 @@ reachable_cartesian_impedance_controller:
     shield_plan_dt: 0.001
 
     # Ruckig 局部重规划与意图缓存参数
-    local_replan_horizon_steps: 200
+    local_replan_horizon_steps: 500
     local_replan_dt: 0.001
-    local_path_lookahead_sec: 0.20
-    local_replan_max_velocity: 0.30
-    local_replan_max_acceleration: 0.5
-    local_replan_max_jerk: 1.0
+    local_path_lookahead_sec: 0.50
+    local_replan_max_velocity: 0.6
+    local_replan_max_acceleration: 1.5
+    local_replan_max_jerk: 5.0
 
     path_retiming_search_window_sec: 0.25
     path_retiming_search_steps: 41
@@ -246,14 +256,14 @@ reachable_cartesian_impedance_controller:
     path_time_acc_limit: 0.5
     path_time_rate_target: 1.0
 
-    use_dynamic_consistent_impedance: true
+    use_dynamic_consistent_impedance: false
     torque_rate_limit: 600.0
 
     dynamic_lambda_regularization: 1.0e-6
     jdot_dq_filter_alpha: 0.15
     jdot_dq_max_norm: 5.0
 
-    rviz_enable_markers: true
+    rviz_enable_markers: false
     rviz_frame_id: panda_link0
     rviz_marker_decimation: 10
     rviz_marker_lifetime_sec: 0.2

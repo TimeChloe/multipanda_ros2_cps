@@ -62,6 +62,11 @@ def generate_launch_description():
         [FindExecutable(name='xacro'), ' ', franka_xacro_file, 
             ' arm_id:=', arm_id, 
             ' hand:=', str(load_gripper).lower(),
+            ' metal_ball:=true',
+            ' metal_ball_radius:=0.03',
+            ' metal_ball_mass:=0.2',
+            ' metal_ball_xyz:="0 0 0.03"',
+            ' metal_ball_tcp_xyz:="0 0 0.06"',
             ' initial_positions:=', initial_positions])
     
     params = {'robot_description': robot_description}
@@ -100,7 +105,8 @@ def generate_launch_description():
                 'frame_id': 'panda_link0',
                 'marker_topic': 'human_workspace/markers',
                 'ee_frame_id': 'panda_link8',
-                'ee_collision_radius': 0.04,
+                'ee_collision_radius': 0.03,
+                'ee_collision_center_offset': [0.0, 0.0, 0.03],
                 'tracking_pos_error_bound': 0.005,
                 'visualize_ee_collision_area': True,
             }

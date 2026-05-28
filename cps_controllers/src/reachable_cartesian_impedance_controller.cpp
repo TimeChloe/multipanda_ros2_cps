@@ -18,6 +18,7 @@
 #include <cmath>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -50,7 +51,6 @@
 namespace {
 
 constexpr double kMinDt = 1e-6;
-constexpr double kLambdaReg = 1e-9;
 constexpr double kSmallPositive = 1e-9;
 constexpr const char* kDefaultErrorLogRootDir =
     "/home/developer/multipanda_ws/src/data_log";
@@ -77,6 +77,14 @@ using cps_trajectory_generators::estimateLinePathTimeFromZ;
 using cps_trajectory_generators::makeLocalCartesianReplan;
 using cps_trajectory_generators::makeReferencePose;
 using cps_trajectory_generators::parseTrajectoryTypeOrDefault;
+
+Matrix3d skewSymmetric(const Vector3d& v) {
+  Matrix3d S;
+  S << 0.0, -v.z(), v.y(),
+       v.z(), 0.0, -v.x(),
+       -v.y(), v.x(), 0.0;
+  return S;
+}
 
 inline int daysInMonth(int year, int month) {
   static constexpr int kDaysByMonth[] = {
@@ -199,6 +207,10 @@ inline Matrix3d makePlaneFrameFromNormal(const Vector3d& n_in) {
 }  // namespace
 
 namespace cps_controllers {
+
+ReachableCartesianImpedanceController::~ReachableCartesianImpedanceController() {
+  stopSafetyMonitorWorker();
+}
 
 // ============================================================================
 // Helper: matrix rate limit & runtime gain update
@@ -525,15 +537,12 @@ ImpedanceSample ReachableCartesianImpedanceController::getNextFailsafeCommandFro
 }
 
 // ============================================================================
-// Refill the intended cache from the trajectory generator package
+// Generate intended prefix from the trajectory generator package
 // ============================================================================
-bool ReachableCartesianImpedanceController::refillIntendedBufferFromReplanner(
+std::vector<ImpedanceSample>
+ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     double nominal_guess_time,
-    const ImpedanceSample& planning_start_command) {
-  intended_buffer_.clear();
-  intended_buffer_index_ = 0;
-  intended_buffer_valid_ = false;
-
+    const ImpedanceSample& planning_start_command) const {
   const auto traj_type =
       parseTrajectoryTypeOrDefault(use_constant_reference_, reference_trajectory_type_);
 
@@ -563,7 +572,8 @@ bool ReachableCartesianImpedanceController::refillIntendedBufferFromReplanner(
       traj_type,
       config);
 
-  intended_buffer_.reserve(planned_samples.size());
+  std::vector<ImpedanceSample> intended_buffer;
+  intended_buffer.reserve(planned_samples.size());
 
   for (const auto& planned_sample : planned_samples) {
     ImpedanceSample s;
@@ -579,8 +589,24 @@ bool ReachableCartesianImpedanceController::refillIntendedBufferFromReplanner(
     s.D = D_nominal_;
     s.failsafe = false;
 
-    intended_buffer_.push_back(s);
+    intended_buffer.push_back(s);
   }
+
+  return intended_buffer;
+}
+
+// ============================================================================
+// Refill the intended cache from the trajectory generator package
+// ============================================================================
+bool ReachableCartesianImpedanceController::refillIntendedBufferFromReplanner(
+    double nominal_guess_time,
+    const ImpedanceSample& planning_start_command) {
+  intended_buffer_.clear();
+  intended_buffer_index_ = 0;
+  intended_buffer_valid_ = false;
+
+  intended_buffer_ =
+      makeIntendedBufferFromReplanner(nominal_guess_time, planning_start_command);
 
   intended_buffer_valid_ = !intended_buffer_.empty();
   return intended_buffer_valid_;
@@ -596,6 +622,8 @@ VerifiedPlan ReachableCartesianImpedanceController::buildSingleStepCandidatePlan
     const Vector6d& ee_twist,
     const Matrix7d& inertia,
     const Matrix37d& Jv,
+    const Matrix6d& K_runtime,
+    const Matrix6d& D_runtime,
     const ImpedanceSample& next_intended) const {
   (void)inertia;
   (void)Jv;
@@ -614,8 +642,8 @@ VerifiedPlan ReachableCartesianImpedanceController::buildSingleStepCandidatePlan
   plan.anchor.q.normalize();
   plan.anchor.w.setZero();
   plan.anchor.dw.setZero();
-  plan.anchor.K = K_runtime_;
-  plan.anchor.D = D_runtime_;
+  plan.anchor.K = K_runtime;
+  plan.anchor.D = D_runtime;
   plan.anchor.failsafe = false;
 
   ImpedanceSample step = next_intended;
@@ -665,258 +693,89 @@ VerifiedPlan ReachableCartesianImpedanceController::buildSingleStepCandidatePlan
   return plan;
 }
 
+SafetyMonitorConfig ReachableCartesianImpedanceController::makeSafetyMonitorConfig(
+    const Matrix6d& K_runtime,
+    const Matrix6d& D_runtime) const {
+  SafetyMonitorConfig config;
+  config.human_workspace = human_workspace_;
+  config.K_runtime = K_runtime;
+  config.D_runtime = D_runtime;
+  config.k_rate_limit = k_rate_limit_;
+  config.d_rate_limit = d_rate_limit_;
+  config.safe_collision_energy_joule = safe_collision_energy_joule_;
+  config.clamping_energy_budget_joule = clamping_energy_budget_joule_;
+  config.energy_budget_margin_joule = energy_budget_margin_joule_;
+  config.ee_collision_radius = ee_collision_radius_;
+  config.tracking_pos_error_bound = tracking_pos_error_bound_;
+  config.tracking_vel_error_bound = tracking_vel_error_bound_;
+  config.use_dynamic_consistent_impedance = use_dynamic_consistent_impedance_;
+  return config;
+}
+
+Vector3d ReachableCartesianImpedanceController::collisionCenterOffsetWorld(
+    const Quaterniond& orientation) const {
+  return orientation.normalized() * ee_collision_center_offset_;
+}
+
+Vector6d ReachableCartesianImpedanceController::twistAtCollisionCenter(
+    const Quaterniond& orientation,
+    const Vector6d& flange_twist) const {
+  Vector6d collision_twist = flange_twist;
+  const Vector3d offset_world = collisionCenterOffsetWorld(orientation);
+  collision_twist.head<3>() =
+      flange_twist.head<3>() + flange_twist.tail<3>().cross(offset_world);
+  return collision_twist;
+}
+
+VerifiedPlan ReachableCartesianImpedanceController::makeCollisionCenterPlanForMonitor(
+    const VerifiedPlan& flange_plan) const {
+  VerifiedPlan plan = flange_plan;
+
+  auto move_sample_to_collision_center = [this](ImpedanceSample& sample) {
+    const Vector3d offset_world = sample.q.normalized() * ee_collision_center_offset_;
+    sample.p += offset_world;
+    sample.dp += sample.w.cross(offset_world);
+    sample.ddp += sample.dw.cross(offset_world) +
+                  sample.w.cross(sample.w.cross(offset_world));
+  };
+
+  move_sample_to_collision_center(plan.anchor);
+  for (auto& sample : plan.intended) {
+    move_sample_to_collision_center(sample);
+  }
+  for (auto& sample : plan.failsafe) {
+    move_sample_to_collision_center(sample);
+  }
+
+  return plan;
+}
+
 // ============================================================================
 // verifyCandidatePlan
 // ============================================================================
 MonitorResult ReachableCartesianImpedanceController::verifyCandidatePlan(
     const VerifiedPlan& plan,
     const Vector3d& current_position,
+    const Quaterniond& current_orientation,
     const Vector6d& ee_twist,
     const Matrix7d& inertia,
-    const Matrix37d& Jv) const {
-  MonitorResult out;
+    const Matrix37d& Jv,
+    const Matrix6d& K_runtime,
+    const Matrix6d& D_runtime) const {
+  const VerifiedPlan collision_center_plan =
+      makeCollisionCenterPlanForMonitor(plan);
+  const Vector3d collision_center =
+      current_position + collisionCenterOffsetWorld(current_orientation);
+  const Vector6d collision_twist =
+      twistAtCollisionCenter(current_orientation, ee_twist);
 
-  const Vector3d n = human_workspace_.normal();
-
-  Vector3d x_pred = current_position;
-  Vector3d v_pred = ee_twist.head<3>();
-
-  Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
-  task_inertia_inv.diagonal().array() += kLambdaReg;
-
-  const double denom0 =
-      (n.transpose() * task_inertia_inv * n)(0, 0);
-
-  out.m_eff_n =
-      1.0 / std::max(denom0, kSmallPositive);
-
-  const double rho_p =
-      std::max(0.0, tracking_pos_error_bound_);
-
-  const double rho_v =
-      std::max(0.0, tracking_vel_error_bound_);
-
-  out.current_pos_error_radius = rho_p;
-  out.current_vel_error_radius = rho_v;
-  out.worst_case_pos_error_radius = rho_p;
-  out.worst_case_vel_error_radius = rho_v;
-
-  const double v_n_now_raw = n.dot(v_pred);
-  out.v_n_now = v_n_now_raw;
-  out.Tn_now =
-      0.5 * out.m_eff_n * v_n_now_raw * v_n_now_raw;
-
-  out.v_safe =
-      std::sqrt(
-          std::max(
-              2.0 * safe_collision_energy_joule_ /
-                  std::max(out.m_eff_n, kSmallPositive),
-              0.0));
-
-  const double inflated_contact_radius =
-      human_workspace_.inflatedCollisionRadius(ee_collision_radius_, rho_p);
-
-  out.plane_distance_now =
-      human_workspace_.signedDistanceToInflatedSphere(
-          current_position,
-          inflated_contact_radius);
-
-  out.plane_distance_min = out.plane_distance_now;
-
-  Matrix6d K_exec = K_runtime_;
-  Matrix6d D_exec = D_runtime_;
-
-  double T_n_max = 0.0;
-  double V_n_max = 0.0;
-
-  double terminal_T_ub = 0.0;
-  double terminal_V_ub = 0.0;
-  bool terminal_sample_found = false;
-
-  auto eval_sample = [&](const ImpedanceSample& s, double dtp) {
-    K_exec = applyMatrixRateLimit(K_exec, s.K, k_rate_limit_, dtp);
-    D_exec = applyMatrixRateLimit(D_exec, s.D, d_rate_limit_, dtp);
-
-    const Matrix3d Kp = K_exec.topLeftCorner<3, 3>();
-    const Matrix3d Dp = D_exec.topLeftCorner<3, 3>();
-
-    const Vector3d force_pred =
-        Kp * (s.p - x_pred) - Dp * (v_pred - s.dp);
-
-    Vector3d a_pred = Vector3d::Zero();
-
-    if (use_dynamic_consistent_impedance_) {
-      // Consistent with the implemented torque law:
-      // w = Lambda*xddot_des - K*e - D*edot,
-      // with K/D as physical Cartesian gains.
-      a_pred = s.ddp + task_inertia_inv * force_pred;
-    } else {
-      a_pred = task_inertia_inv * force_pred;
-    }
-
-    const Vector3d x_next =
-        x_pred + v_pred * dtp + 0.5 * a_pred * dtp * dtp;
-
-    const Vector3d v_next =
-        v_pred + a_pred * dtp;
-
-    const double d_pred =
-        human_workspace_.signedDistanceToInflatedSphere(
-            x_pred,
-            inflated_contact_radius);
-
-    const double d_next =
-        human_workspace_.signedDistanceToInflatedSphere(
-            x_next,
-            inflated_contact_radius);
-
-    const double d_segment =
-        human_workspace_.signedDistanceSegmentToInflatedSphere(
-            x_pred,
-            x_next,
-            inflated_contact_radius);
-
-    out.plane_distance_min =
-        std::min(out.plane_distance_min, d_segment);
-
-    const bool contact_possible_step =
-        d_segment <= 0.0;
-
-    const double k_n =
-        std::max(
-            (n.transpose() * Kp * n)(0, 0),
-            0.0);
-
-    const double e_n =
-        std::abs(n.dot(x_next - s.p)) + rho_p;
-
-    const double v_n =
-        std::abs(n.dot(v_next)) + rho_v;
-
-    const double T_n_ub =
-        0.5 * out.m_eff_n * v_n * v_n;
-
-    const double V_n_ub =
-        0.5 * k_n * e_n * e_n;
-
-    if (contact_possible_step) {
-      out.monitored_contact_possible = true;
-
-      if (T_n_ub > T_n_max) {
-        T_n_max = T_n_ub;
-
-        out.worst_case_contact_found = true;
-        out.worst_case_contact_time = s.t;
-        out.worst_case_plane_distance_at_candidate =
-            std::min(d_pred, d_next);
-        out.worst_case_nominal_forward_progress =
-            n.dot(x_next - current_position);
-        out.worst_case_v_n_ub = v_n;
-        out.worst_case_Tn_ub = T_n_ub;
-
-        out.worst_case_a_pos = 0.0;
-        out.worst_case_a_brake = 0.0;
-        out.worst_case_a_net = 0.0;
-      }
-
-      if (V_n_ub > V_n_max) {
-        V_n_max = V_n_ub;
-        out.worst_case_V_potential_ub = V_n_ub;
-      }
-
-      if (!s.failsafe && !out.nominal_contact_sample_found) {
-        Vector3d x_contact = Vector3d::Zero();
-        human_workspace_.signedDistanceSegmentToInflatedSphere(
-            x_pred,
-            x_next,
-            inflated_contact_radius,
-            &x_contact);
-
-        out.nominal_contact_sample_found = true;
-        out.nominal_contact_time = s.t;
-        out.nominal_contact_distance = d_segment;
-        out.v_n_contact_nominal = v_n;
-        out.Tn_contact_nominal = T_n_ub;
-        out.nominal_contact_point_world = x_contact;
-      }
-    }
-
-    if (s.failsafe) {
-      terminal_T_ub = T_n_ub;
-      terminal_V_ub = V_n_ub;
-      terminal_sample_found = true;
-    }
-
-    x_pred = x_next;
-    v_pred = v_next;
-  };
-
-  double t_prev = plan.anchor.t;
-
-  for (const auto& s : plan.intended) {
-    const double dtp =
-        std::max(s.t - t_prev, kMinDt);
-
-    eval_sample(s, dtp);
-    t_prev = s.t;
-  }
-
-  for (const auto& s : plan.failsafe) {
-    const double dtp =
-        std::max(s.t - t_prev, kMinDt);
-
-    eval_sample(s, dtp);
-    t_prev = s.t;
-  }
-
-  if (!terminal_sample_found) {
-    terminal_T_ub = 0.0;
-    terminal_V_ub = 0.0;
-  }
-
-  out.h_geom = out.plane_distance_min;
-
-  out.worst_case_Tn_ub = T_n_max;
-  out.worst_case_V_potential_ub = V_n_max;
-
-  out.terminal_energy_ub =
-      terminal_T_ub + terminal_V_ub;
-
-  const double L_TF_eff =
-      std::max(0.0, safe_collision_energy_joule_ - energy_budget_margin_joule_);
-
-  const double L_QS_eff =
-      std::max(0.0, clamping_energy_budget_joule_ - energy_budget_margin_joule_);
-
-  const double L_F_eff =
-      std::min(L_TF_eff, L_QS_eff);
-
-  out.h_monitored_energy =
-      L_TF_eff - out.worst_case_Tn_ub;
-
-  out.h_clamping_energy =
-      L_QS_eff - out.worst_case_V_potential_ub;
-
-  out.h_terminal_energy =
-      L_F_eff - out.terminal_energy_ub;
-
-  out.collision_energy_unsafe =
-      out.worst_case_Tn_ub > L_TF_eff;
-
-  out.clamping_energy_unsafe =
-      out.worst_case_V_potential_ub > L_QS_eff;
-
-  out.terminal_energy_unsafe =
-      out.terminal_energy_ub > L_F_eff;
-
-  out.monitored_unsafe =
-      out.collision_energy_unsafe ||
-      out.clamping_energy_unsafe ||
-      out.terminal_energy_unsafe;
-
-  out.predicted_trigger = out.monitored_unsafe;
-
-  return out;
+  return cps_safety_monitor::verifyReachablePlan(
+      collision_center_plan,
+      collision_center,
+      collision_twist,
+      inertia,
+      Jv,
+      makeSafetyMonitorConfig(K_runtime, D_runtime));
 }
 
 // ============================================================================
@@ -944,7 +803,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
   }
 
   auto verify_plan = [&](const VerifiedPlan& plan) {
-    return verifyCandidatePlan(plan, current_position, ee_twist, inertia, Jv);
+    return verifyCandidatePlan(
+        plan, current_position, current_orientation, ee_twist, inertia, Jv, K_runtime_, D_runtime_);
   };
 
   auto execute_last_verified_failsafe = [&]() {
@@ -1000,6 +860,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
         ee_twist,
         inertia,
         Jv,
+        K_runtime_,
+        D_runtime_,
         next_step);
     candidate_plan_valid_ = candidate_plan_.valid;
     if (!candidate_plan_valid_) return false;
@@ -1096,6 +958,265 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
   mode_ = SafetyMode::kFailsafe;
   execute_last_verified_failsafe();
   return dec;
+}
+
+ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAsyncInput(
+    const AsyncMonitorInput& input,
+    AsyncPlanningState& state) const {
+  ShieldDecision dec;
+
+  auto execute_last_verified_failsafe = [&]() {
+    dec.executing_last_verified_failsafe = true;
+    dec.candidate_verified = false;
+
+    if (state.last_verified_plan.valid &&
+        !state.last_verified_plan.failsafe.empty()) {
+      const std::size_t idx = std::min(
+          state.last_verified_plan.failsafe_exec_index,
+          state.last_verified_plan.failsafe.size() - 1);
+
+      dec.command = state.last_verified_plan.failsafe[idx];
+
+      if (state.last_verified_plan.failsafe_exec_index + 1 <
+          state.last_verified_plan.failsafe.size()) {
+        ++state.last_verified_plan.failsafe_exec_index;
+      }
+    } else {
+      dec.command = makeEmergencyStopCommand(
+          input.current_position,
+          input.current_orientation,
+          input.wall_time);
+    }
+  };
+
+  auto try_one_verification = [&]() -> bool {
+    if (!state.intended_buffer_valid ||
+        state.intended_buffer_index >= state.intended_buffer.size()) {
+      ImpedanceSample planning_start_command;
+      planning_start_command.t = input.wall_time;
+
+      if (input.last_commanded_sample_valid) {
+        planning_start_command.p = input.last_commanded_sample.p;
+        planning_start_command.q = input.last_commanded_sample.q;
+      } else {
+        planning_start_command.p = input.current_position;
+        planning_start_command.q = input.current_orientation;
+      }
+      planning_start_command.q.normalize();
+
+      planning_start_command.dp = input.ee_twist.head<3>();
+      planning_start_command.w = input.ee_twist.tail<3>();
+      planning_start_command.ddp.setZero();
+      planning_start_command.dw.setZero();
+      planning_start_command.K = K_nominal_;
+      planning_start_command.D = D_nominal_;
+      planning_start_command.failsafe = false;
+
+      state.intended_buffer =
+          makeIntendedBufferFromReplanner(
+              input.nominal_guess_time,
+              planning_start_command);
+
+      state.intended_buffer_index = 0;
+      state.intended_buffer_valid = !state.intended_buffer.empty();
+
+      if (!state.intended_buffer_valid) {
+        return false;
+      }
+    }
+
+    const ImpedanceSample next_step =
+        state.intended_buffer[state.intended_buffer_index];
+
+    VerifiedPlan candidate_plan = buildSingleStepCandidatePlan(
+        input.wall_time,
+        input.current_position,
+        input.current_orientation,
+        input.ee_twist,
+        input.inertia,
+        input.Jv,
+        input.K_runtime,
+        input.D_runtime,
+        next_step);
+
+    if (!candidate_plan.valid) {
+      return false;
+    }
+
+    dec.monitor = verifyCandidatePlan(
+        candidate_plan,
+        input.current_position,
+        input.current_orientation,
+        input.ee_twist,
+        input.inertia,
+        input.Jv,
+        input.K_runtime,
+        input.D_runtime);
+
+    dec.candidate_verified =
+        !enable_safety_monitor_ || !dec.monitor.predicted_trigger;
+
+    if (!dec.candidate_verified) {
+      return true;
+    }
+
+    state.last_verified_plan = candidate_plan;
+    state.last_verified_plan.valid = true;
+    state.last_verified_plan.intended_exec_index = 0;
+    state.last_verified_plan.failsafe_exec_index = 0;
+    ++state.intended_buffer_index;
+
+    dec.executing_last_verified_failsafe = false;
+    dec.command = state.last_verified_plan.intended.front();
+
+    return true;
+  };
+
+  const bool first_attempt = try_one_verification();
+
+  if (!first_attempt) {
+    state.intended_buffer_valid = false;
+    state.intended_buffer_index = 0;
+    state.intended_buffer.clear();
+    execute_last_verified_failsafe();
+    return dec;
+  }
+
+  if (dec.candidate_verified) {
+    return dec;
+  }
+
+  state.intended_buffer_valid = false;
+  state.intended_buffer_index = 0;
+
+  const bool second_attempt = try_one_verification();
+
+  if (second_attempt && dec.candidate_verified) {
+    return dec;
+  }
+
+  execute_last_verified_failsafe();
+  return dec;
+}
+
+void ReachableCartesianImpedanceController::publishAsyncMonitorInput(
+    const AsyncMonitorInput& input) {
+  if (!async_safety_monitor_ || !safety_monitor_worker_running_.load()) {
+    return;
+  }
+
+  if (async_input_mutex_.try_lock()) {
+    latest_async_input_ = input;
+    async_input_pending_ = true;
+    async_input_mutex_.unlock();
+    async_input_cv_.notify_one();
+  }
+}
+
+bool ReachableCartesianImpedanceController::takeAsyncMonitorOutput(
+    AsyncMonitorOutput* output) {
+  if (output == nullptr) {
+    return false;
+  }
+
+  if (!async_output_mutex_.try_lock()) {
+    return false;
+  }
+
+  const bool has_new_output =
+      latest_async_output_.valid &&
+      latest_async_output_.sequence > last_consumed_async_output_sequence_;
+
+  if (has_new_output) {
+    *output = latest_async_output_;
+    last_consumed_async_output_sequence_ = latest_async_output_.sequence;
+  }
+
+  async_output_mutex_.unlock();
+  return has_new_output;
+}
+
+void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop() {
+  AsyncPlanningState state;
+
+  while (safety_monitor_worker_running_.load()) {
+    AsyncMonitorInput input;
+
+    {
+      std::unique_lock<std::mutex> lock(async_input_mutex_);
+      async_input_cv_.wait(lock, [&]() {
+        return async_input_pending_ || !safety_monitor_worker_running_.load();
+      });
+
+      if (!safety_monitor_worker_running_.load()) {
+        break;
+      }
+
+      input = latest_async_input_;
+      async_input_pending_ = false;
+    }
+
+    AsyncMonitorOutput output;
+    output.sequence = input.sequence;
+    output.input_wall_time = input.wall_time;
+    output.valid = true;
+    output.decision =
+        computeShieldDecisionForAsyncInput(input, state);
+
+    {
+      std::lock_guard<std::mutex> lock(async_output_mutex_);
+      latest_async_output_ = output;
+    }
+  }
+}
+
+void ReachableCartesianImpedanceController::startSafetyMonitorWorker() {
+  if (!async_safety_monitor_ || safety_monitor_worker_running_.load()) {
+    return;
+  }
+
+  safety_monitor_worker_running_.store(true);
+  async_input_pending_ = false;
+  latest_async_output_ = AsyncMonitorOutput{};
+  last_consumed_async_output_sequence_ = 0;
+  last_async_output_wall_time_ = -1.0;
+  last_async_output_valid_ = false;
+
+  safety_monitor_worker_thread_ =
+      std::thread(&ReachableCartesianImpedanceController::safetyMonitorWorkerLoop, this);
+}
+
+void ReachableCartesianImpedanceController::stopSafetyMonitorWorker() {
+  if (!safety_monitor_worker_running_.exchange(false)) {
+    return;
+  }
+
+  async_input_cv_.notify_all();
+
+  if (safety_monitor_worker_thread_.joinable()) {
+    safety_monitor_worker_thread_.join();
+  }
+}
+
+void ReachableCartesianImpedanceController::handleMujocoContactSensor(
+    const mujoco_ros_msgs::msg::ScalarStamped::SharedPtr msg) {
+  const double value = msg->value;
+  latest_mujoco_contact_value_.store(value, std::memory_order_relaxed);
+  latest_mujoco_contact_msg_time_.store(
+      rclcpp::Time(msg->header.stamp).seconds(),
+      std::memory_order_relaxed);
+
+  const bool active = value > mujoco_contact_threshold_;
+  latest_mujoco_contact_active_.store(active, std::memory_order_relaxed);
+
+  if (active && !mujoco_first_contact_seen_.exchange(true)) {
+    mujoco_first_contact_wall_time_.store(
+        (get_node()->now() - start_time_).seconds(),
+        std::memory_order_relaxed);
+    mujoco_first_contact_msg_time_.store(
+        rclcpp::Time(msg->header.stamp).seconds(),
+        std::memory_order_relaxed);
+  }
 }
 
 // ============================================================================
@@ -1261,13 +1382,25 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
   const Eigen::Map<const Matrix4d> pose(
       franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector).data());
-  const Vector3d current_position = pose.block<3, 1>(0, 3);
+  const Vector3d flange_position = pose.block<3, 1>(0, 3);
   const Matrix3d current_rotation = pose.block<3, 3>(0, 0);
   Quaterniond current_orientation(current_rotation); current_orientation.normalize();
+  const Vector3d tcp_offset_world = current_orientation * tcp_offset_;
+  const Vector3d current_position = flange_position + tcp_offset_world;
 
   Matrix67d J_geo(franka_robot_model_->getZeroJacobian(franka::Frame::kEndEffector).data());
+  const Matrix37d Jv_flange = J_geo.topRows<3>();
+  const Matrix37d Jw = J_geo.bottomRows<3>();
+  J_geo.topRows<3>() = Jv_flange - skewSymmetric(tcp_offset_world) * Jw;
   const Vector6d ee_twist = J_geo * dq;
   const Matrix37d Jv = J_geo.topRows<3>();
+  const Vector3d collision_center =
+      current_position + collisionCenterOffsetWorld(current_orientation);
+  const Vector6d ee_collision_twist =
+      twistAtCollisionCenter(current_orientation, ee_twist);
+  const Matrix37d Jv_collision =
+      Jv - skewSymmetric(collisionCenterOffsetWorld(current_orientation)) * Jw;
+  const auto toc_model = Clock::now();
 
   double paused_total = paused_nominal_time_sec_;
   if (failsafe_enter_wall_time_sec_ >= 0.0)
@@ -1275,34 +1408,77 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   const double nominal_guess_time = std::max(0.0, wall_time - paused_total);
 
   ShieldDecision shield_dec;
-  const bool do_monitor =
-      !last_shield_decision_valid_ ||
-      ((monitor_counter_++ % std::max(1, monitor_decimation_)) == 0);
 
-  if (do_monitor) {
-    shield_dec = computeShieldDecision(wall_time, nominal_guess_time,
-                                       current_position, current_orientation,
-                                       ee_twist, inertia, Jv);
-    last_shield_decision_ = shield_dec;
-    last_shield_decision_valid_ = true;
-  } else {
-    shield_dec = last_shield_decision_;
-    if (mode_ == SafetyMode::kFailsafe || shield_dec.executing_last_verified_failsafe) {
-      shield_dec.executing_last_verified_failsafe = true;
-      if (last_verified_plan_.valid && !last_verified_plan_.failsafe.empty())
-        shield_dec.command = getNextFailsafeCommandFromCache(true);
-      else
-        shield_dec.command = makeEmergencyStopCommand(current_position, current_orientation, wall_time);
-    } else {
-      shield_dec.executing_last_verified_failsafe = false;
-      if (last_verified_plan_.valid && !last_verified_plan_.intended.empty())
-        shield_dec.command = last_verified_plan_.intended.front();
-      else
-        shield_dec.command = makeEmergencyStopCommand(current_position, current_orientation, wall_time);
+  if (async_safety_monitor_) {
+    AsyncMonitorInput async_input;
+    async_input.sequence = async_input_sequence_.fetch_add(1) + 1;
+    async_input.wall_time = wall_time;
+    async_input.nominal_guess_time = nominal_guess_time;
+    async_input.current_position = current_position;
+    async_input.current_orientation = current_orientation;
+    async_input.ee_twist = ee_twist;
+    async_input.inertia = inertia;
+    async_input.Jv = Jv_collision;
+    async_input.K_runtime = K_runtime_;
+    async_input.D_runtime = D_runtime_;
+    async_input.last_commanded_sample = last_commanded_sample_;
+    async_input.last_commanded_sample_valid = last_commanded_sample_valid_;
+    publishAsyncMonitorInput(async_input);
+
+    AsyncMonitorOutput async_output;
+    if (takeAsyncMonitorOutput(&async_output)) {
+      last_shield_decision_ = async_output.decision;
+      last_shield_decision_valid_ = true;
+      last_async_output_wall_time_ = async_output.input_wall_time;
+      last_async_output_valid_ = true;
     }
-    last_shield_decision_.command = shield_dec.command;
-    last_shield_decision_.executing_last_verified_failsafe = shield_dec.executing_last_verified_failsafe;
+
+    const bool output_is_fresh =
+        last_async_output_valid_ &&
+        last_shield_decision_valid_ &&
+        (async_plan_max_age_sec_ <= 0.0 ||
+         (wall_time - last_async_output_wall_time_) <= async_plan_max_age_sec_);
+
+    if (output_is_fresh) {
+      shield_dec = last_shield_decision_;
+    } else {
+      shield_dec.executing_last_verified_failsafe = true;
+      shield_dec.candidate_verified = false;
+      shield_dec.command =
+          makeEmergencyStopCommand(current_position, current_orientation, wall_time);
+    }
+  } else {
+    const bool do_monitor =
+        !last_shield_decision_valid_ ||
+        ((monitor_counter_++ % std::max(1, monitor_decimation_)) == 0);
+
+    if (do_monitor) {
+      shield_dec = computeShieldDecision(wall_time, nominal_guess_time,
+                                         current_position, current_orientation,
+                                         ee_twist, inertia, Jv_collision);
+      last_shield_decision_ = shield_dec;
+      last_shield_decision_valid_ = true;
+    } else {
+      shield_dec = last_shield_decision_;
+      if (mode_ == SafetyMode::kFailsafe || shield_dec.executing_last_verified_failsafe) {
+        shield_dec.executing_last_verified_failsafe = true;
+        if (last_verified_plan_.valid && !last_verified_plan_.failsafe.empty())
+          shield_dec.command = getNextFailsafeCommandFromCache(true);
+        else
+          shield_dec.command = makeEmergencyStopCommand(current_position, current_orientation, wall_time);
+      } else {
+        shield_dec.executing_last_verified_failsafe = false;
+        if (last_verified_plan_.valid && !last_verified_plan_.intended.empty())
+          shield_dec.command = last_verified_plan_.intended.front();
+        else
+          shield_dec.command = makeEmergencyStopCommand(current_position, current_orientation, wall_time);
+      }
+      last_shield_decision_.command = shield_dec.command;
+      last_shield_decision_.executing_last_verified_failsafe =
+          shield_dec.executing_last_verified_failsafe;
+    }
   }
+  const auto toc_shield = Clock::now();
 
   if (shield_dec.executing_last_verified_failsafe) {
     if (failsafe_enter_wall_time_sec_ < 0.0) {
@@ -1342,7 +1518,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   {
     const Vector3d n = human_workspace_.normal();
     const double v_n_now_tube =
-        std::abs(n.dot(ee_twist.head<3>())) + monitor.current_vel_error_radius;
+        std::abs(n.dot(ee_collision_twist.head<3>())) + monitor.current_vel_error_radius;
     const double Tn_now_tube =
         0.5 * std::max(monitor.m_eff_n, 0.0) * v_n_now_tube * v_n_now_tube;
     monitor.v_n_now_tube = v_n_now_tube;
@@ -1370,10 +1546,11 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       q, dq, inertia, coriolis, J_geo,
       current_position, current_orientation,
       shield_dec.command, dt);
+  const auto toc_torque = Clock::now();
 
   for (int i = 0; i < kNumJoints; ++i) command_interfaces_[i].set_value(tau_cmd(i));
 
-  publishRvizDiagnostics(wall_time, current_position, desired_position_cur, ee_twist, monitor);
+  publishRvizDiagnostics(wall_time, collision_center, desired_position_cur, ee_collision_twist, monitor);
 
   if (enable_error_logging_ && error_log_file_.is_open()) {
     error_log_file_ << std::fixed << std::setprecision(9)
@@ -1383,6 +1560,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << current_position(0) << "," << current_position(1) << "," << current_position(2) << ","
         << ee_twist(0) << "," << ee_twist(1) << "," << ee_twist(2) << ","
         << ee_twist(3) << "," << ee_twist(4) << "," << ee_twist(5) << ","
+        << current_position(0) << "," << current_position(1) << "," << current_position(2) << ","
+        << ee_twist(0) << "," << ee_twist(1) << "," << ee_twist(2) << ","
+        << collision_center(0) << "," << collision_center(1) << "," << collision_center(2) << ","
+        << ee_collision_twist(0) << "," << ee_collision_twist(1) << "," << ee_collision_twist(2) << ","
         << desired_linear_velocity_cur(0) << "," << desired_linear_velocity_cur(1) << "," << desired_linear_velocity_cur(2) << ","
         << error(0) << "," << error(1) << "," << error(2) << ","
         << error(3) << "," << error(4) << "," << error(5) << ","
@@ -1413,26 +1594,67 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << static_cast<int>(monitor.clamping_energy_unsafe) << ","
         << static_cast<int>(monitor.terminal_energy_unsafe) << ","
         << static_cast<int>(monitor.monitored_unsafe) << ","
-        << static_cast<int>(monitor.predicted_trigger) << "\n";
+        << static_cast<int>(monitor.predicted_trigger) << ","
+        << latest_mujoco_contact_value_.load(std::memory_order_relaxed) << ","
+        << static_cast<int>(latest_mujoco_contact_active_.load(std::memory_order_relaxed)) << ","
+        << latest_mujoco_contact_msg_time_.load(std::memory_order_relaxed) << ","
+        << static_cast<int>(mujoco_first_contact_seen_.load(std::memory_order_relaxed)) << ","
+        << mujoco_first_contact_wall_time_.load(std::memory_order_relaxed) << ","
+        << mujoco_first_contact_msg_time_.load(std::memory_order_relaxed) << "\n";
     ++log_write_counter_;
     if ((log_write_counter_ % 200) == 0) error_log_file_.flush();
   }
+  const auto toc_io = Clock::now();
 
   const auto toc_total = Clock::now();
+  const double model_ms = std::chrono::duration<double, std::milli>(toc_model - tic_total).count();
+  const double shield_ms = std::chrono::duration<double, std::milli>(toc_shield - toc_model).count();
+  const double torque_ms = std::chrono::duration<double, std::milli>(toc_torque - toc_shield).count();
+  const double io_ms = std::chrono::duration<double, std::milli>(toc_io - toc_torque).count();
   const double exec_ms = std::chrono::duration<double, std::milli>(toc_total - tic_total).count();
   exec_sum_ms_ += exec_ms;
   exec_max_ms_ = std::max(exec_max_ms_, exec_ms);
   exec_min_ms_ = std::min(exec_min_ms_, exec_ms);
+  if (exec_ms > 1.0) ++exec_overrun_1ms_count_;
+  if (exec_ms > 2.0) ++exec_overrun_2ms_count_;
+  prof_model_sum_ms_ += model_ms;
+  prof_model_max_ms_ = std::max(prof_model_max_ms_, model_ms);
+  prof_shield_sum_ms_ += shield_ms;
+  prof_shield_max_ms_ = std::max(prof_shield_max_ms_, shield_ms);
+  prof_torque_sum_ms_ += torque_ms;
+  prof_torque_max_ms_ = std::max(prof_torque_max_ms_, torque_ms);
+  prof_io_sum_ms_ += io_ms;
+  prof_io_max_ms_ = std::max(prof_io_max_ms_, io_ms);
   ++loop_counter_;
   if (loop_counter_ >= static_cast<std::size_t>(profiling_stats_print_period_)) {
     const double n = static_cast<double>(loop_counter_);
     RCLCPP_INFO(get_node()->get_logger(),
-                "[reachable_impedance] mode=%d avg=%.3f ms min=%.3f ms max=%.3f ms buf=%zu/%zu plan_valid=%d",
+                "[reachable_impedance] mode=%d avg=%.3f ms min=%.3f ms max=%.3f ms overruns>1ms=%zu >2ms=%zu "
+                "model_avg/max=%.3f/%.3f shield_avg/max=%.3f/%.3f torque_avg/max=%.3f/%.3f io_avg/max=%.3f/%.3f "
+                "buf=%zu/%zu plan_valid=%d",
                 static_cast<int>(mode_),
                 exec_sum_ms_ / n, exec_min_ms_, exec_max_ms_,
+                exec_overrun_1ms_count_, exec_overrun_2ms_count_,
+                prof_model_sum_ms_ / n, prof_model_max_ms_,
+                prof_shield_sum_ms_ / n, prof_shield_max_ms_,
+                prof_torque_sum_ms_ / n, prof_torque_max_ms_,
+                prof_io_sum_ms_ / n, prof_io_max_ms_,
                 intended_buffer_index_, intended_buffer_.size(),
                 static_cast<int>(last_verified_plan_.valid));
-    loop_counter_ = 0; exec_sum_ms_ = 0.0; exec_min_ms_ = 1e9; exec_max_ms_ = 0.0;
+    loop_counter_ = 0;
+    exec_sum_ms_ = 0.0;
+    exec_min_ms_ = 1e9;
+    exec_max_ms_ = 0.0;
+    exec_overrun_1ms_count_ = 0;
+    exec_overrun_2ms_count_ = 0;
+    prof_model_sum_ms_ = 0.0;
+    prof_model_max_ms_ = 0.0;
+    prof_shield_sum_ms_ = 0.0;
+    prof_shield_max_ms_ = 0.0;
+    prof_torque_sum_ms_ = 0.0;
+    prof_torque_max_ms_ = 0.0;
+    prof_io_sum_ms_ = 0.0;
+    prof_io_max_ms_ = 0.0;
   }
 
   return controller_interface::return_type::OK;
@@ -1468,7 +1690,13 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("clamping_energy_budget_joule", 0.05);
     auto_declare<double>("energy_budget_margin_joule", 0.005);
     auto_declare<double>("ee_collision_radius", 0.04);
+    auto_declare<std::vector<double>>(
+        "tcp_offset", std::vector<double>{0.0, 0.0, 0.0});
+    auto_declare<std::vector<double>>(
+        "ee_collision_center_offset", std::vector<double>{0.0, 0.0, 0.0});
     auto_declare<int>("monitor_decimation", 1);
+    auto_declare<bool>("async_safety_monitor", true);
+    auto_declare<double>("async_plan_max_age_sec", 0.05);
 
     cps_human_workspace::HumanWorkspace::declareParameters(get_node());
 
@@ -1523,6 +1751,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("rviz_ub_arrow_z_offset", 0.05);
 
     auto_declare<int>("profiling_stats_print_period", 1000);
+    auto_declare<bool>("enable_mujoco_contact_logging", true);
+    auto_declare<std::string>("mujoco_contact_sensor_topic", "/panda_metal_ball_touch");
+    auto_declare<double>("mujoco_contact_threshold", 1.0e-6);
   } catch (const std::exception& e) {
     fprintf(stderr, "Exception thrown during init stage: %s\n", e.what());
     return CallbackReturn::ERROR;
@@ -1579,7 +1810,33 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         std::max(0.0, get_node()->get_parameter("energy_budget_margin_joule").as_double());
 
     ee_collision_radius_ = get_node()->get_parameter("ee_collision_radius").as_double();
+    const auto tcp_offset =
+        get_node()->get_parameter("tcp_offset").as_double_array();
+    if (tcp_offset.size() == 3) {
+      tcp_offset_ = Vector3d(tcp_offset[0], tcp_offset[1], tcp_offset[2]);
+    } else {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "tcp_offset must contain 3 values. Using [0, 0, 0].");
+      tcp_offset_.setZero();
+    }
+    const auto ee_collision_center_offset =
+        get_node()->get_parameter("ee_collision_center_offset").as_double_array();
+    if (ee_collision_center_offset.size() == 3) {
+      ee_collision_center_offset_ = Vector3d(
+          ee_collision_center_offset[0],
+          ee_collision_center_offset[1],
+          ee_collision_center_offset[2]);
+    } else {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "ee_collision_center_offset must contain 3 values. Using [0, 0, 0].");
+      ee_collision_center_offset_.setZero();
+    }
     monitor_decimation_ = std::max(1, static_cast<int>(get_node()->get_parameter("monitor_decimation").as_int()));
+    async_safety_monitor_ = get_node()->get_parameter("async_safety_monitor").as_bool();
+    async_plan_max_age_sec_ =
+        std::max(0.0, get_node()->get_parameter("async_plan_max_age_sec").as_double());
 
     k_rate_limit_ = std::max(0.0, get_node()->get_parameter("k_rate_limit").as_double());
     d_rate_limit_ = std::max(0.0, get_node()->get_parameter("d_rate_limit").as_double());
@@ -1644,6 +1901,25 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
 
     profiling_stats_print_period_ = std::max<int>(
         1, static_cast<int>(get_node()->get_parameter("profiling_stats_print_period").as_int()));
+    enable_mujoco_contact_logging_ =
+        get_node()->get_parameter("enable_mujoco_contact_logging").as_bool();
+    mujoco_contact_sensor_topic_ =
+        get_node()->get_parameter("mujoco_contact_sensor_topic").as_string();
+    mujoco_contact_threshold_ =
+        std::max(0.0, get_node()->get_parameter("mujoco_contact_threshold").as_double());
+
+    if (enable_mujoco_contact_logging_ && !mujoco_contact_sensor_topic_.empty()) {
+      mujoco_contact_sub_ =
+          get_node()->create_subscription<mujoco_ros_msgs::msg::ScalarStamped>(
+              mujoco_contact_sensor_topic_,
+              rclcpp::QoS(10),
+              std::bind(
+                  &ReachableCartesianImpedanceController::handleMujocoContactSensor,
+                  this,
+                  std::placeholders::_1));
+    } else {
+      mujoco_contact_sub_.reset();
+    }
 
     K_nominal_.setZero(); D_nominal_.setZero();
     K_f_target_.setZero(); D_f_target_.setZero();
@@ -1689,9 +1965,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   desired_qn_ = q;
   const Eigen::Map<const Matrix4d> pose(
       franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector).data());
-  desired_position_ = pose.block<3, 1>(0, 3);
   desired_orientation_ = Quaterniond(pose.block<3, 3>(0, 0));
   desired_orientation_.normalize();
+  desired_position_ =
+      pose.block<3, 1>(0, 3) + desired_orientation_ * tcp_offset_;
 
   last_commanded_sample_ = ImpedanceSample{};
   last_commanded_sample_.t = 0.0;
@@ -1712,8 +1989,24 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   failsafe_enter_wall_time_sec_ = -1.0;
   paused_nominal_time_sec_ = 0.0;
   loop_counter_ = 0; exec_sum_ms_ = 0.0; exec_min_ms_ = 1e9; exec_max_ms_ = 0.0;
+  exec_overrun_1ms_count_ = 0;
+  exec_overrun_2ms_count_ = 0;
+  prof_model_sum_ms_ = 0.0;
+  prof_model_max_ms_ = 0.0;
+  prof_shield_sum_ms_ = 0.0;
+  prof_shield_max_ms_ = 0.0;
+  prof_torque_sum_ms_ = 0.0;
+  prof_torque_max_ms_ = 0.0;
+  prof_io_sum_ms_ = 0.0;
+  prof_io_max_ms_ = 0.0;
   log_write_counter_ = 0;
   prev_Tn_fs_ = 0.0; prev_Tn_fs_valid_ = false; last_v_n_fs_ = 0.0;
+  latest_mujoco_contact_value_.store(0.0);
+  latest_mujoco_contact_msg_time_.store(-1.0);
+  latest_mujoco_contact_active_.store(false);
+  mujoco_first_contact_seen_.store(false);
+  mujoco_first_contact_wall_time_.store(-1.0);
+  mujoco_first_contact_msg_time_.store(-1.0);
 
   monitor_counter_ = 0;
   last_monitor_result_valid_ = false;
@@ -1734,6 +2027,12 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
 
   tau_cmd_prev_.setZero();
   last_shield_decision_valid_ = false;
+  async_input_sequence_.store(0);
+  async_input_pending_ = false;
+  latest_async_output_ = AsyncMonitorOutput{};
+  last_consumed_async_output_sequence_ = 0;
+  last_async_output_wall_time_ = -1.0;
+  last_async_output_valid_ = false;
 
   J_geo_prev_.setZero();
   Jdot_dq_filtered_.setZero();
@@ -1767,6 +2066,23 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "reference_trajectory_type: " << reference_trajectory_type_ << "\n"
                     << "use_constant_reference: " << static_cast<int>(use_constant_reference_) << "\n"
                     << "enable_safety_monitor: " << static_cast<int>(enable_safety_monitor_) << "\n"
+                    << "async_safety_monitor: " << static_cast<int>(async_safety_monitor_) << "\n"
+                    << "async_plan_max_age_sec: " << async_plan_max_age_sec_ << "\n"
+                    << "tcp_offset: ["
+                    << tcp_offset_.x() << ", "
+                    << tcp_offset_.y() << ", "
+                    << tcp_offset_.z() << "]\n"
+                    << "ee_collision_radius: " << ee_collision_radius_ << "\n"
+                    << "ee_collision_center_offset_from_tcp: ["
+                    << ee_collision_center_offset_.x() << ", "
+                    << ee_collision_center_offset_.y() << ", "
+                    << ee_collision_center_offset_.z() << "]\n"
+                    << "enable_mujoco_contact_logging: "
+                    << static_cast<int>(enable_mujoco_contact_logging_) << "\n"
+                    << "mujoco_contact_sensor_topic: "
+                    << mujoco_contact_sensor_topic_ << "\n"
+                    << "mujoco_contact_threshold: "
+                    << mujoco_contact_threshold_ << "\n"
                     << "timestamp_timezone: Europe/Berlin\n"
                     << "initial_desired_position: ["
                     << desired_position_.x() << ", "
@@ -1798,7 +2114,11 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
     error_log_file_
         << "wall_time_sec,nominal_time_sec,paused_nominal_time_sec,mode,"
         << "des_px,des_py,des_pz,cur_px,cur_py,cur_pz,"
-        << "cur_vx,cur_vy,cur_vz,cur_wx,cur_wy,cur_wz,des_vx,des_vy,des_vz,"
+        << "cur_vx,cur_vy,cur_vz,cur_wx,cur_wy,cur_wz,"
+        << "tcp_px,tcp_py,tcp_pz,tcp_vx,tcp_vy,tcp_vz,"
+        << "collision_center_px,collision_center_py,collision_center_pz,"
+        << "collision_center_vx,collision_center_vy,collision_center_vz,"
+        << "des_vx,des_vy,des_vz,"
         << "err_px,err_py,err_pz,err_rx,err_ry,err_rz,"
         << "tau_task_norm,tau_null_norm,tau_friction_norm,tau_cmd_norm,"
         << "Kx,Ky,Kz,Dx,Dy,Dz,"
@@ -1817,17 +2137,22 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "current_pos_error_radius,current_vel_error_radius,"
         << "worst_case_pos_error_radius,worst_case_vel_error_radius,"
         << "monitored_contact_possible,collision_energy_unsafe,clamping_energy_unsafe,"
-        << "terminal_energy_unsafe,monitored_unsafe,predicted_trigger\n";
+        << "terminal_energy_unsafe,monitored_unsafe,predicted_trigger,"
+        << "mujoco_contact_value,mujoco_contact_active,mujoco_contact_msg_time_sec,"
+        << "mujoco_first_contact_seen,mujoco_first_contact_wall_time_sec,"
+        << "mujoco_first_contact_msg_time_sec\n";
     RCLCPP_INFO(
         get_node()->get_logger(),
         "Validation log enabled: %s",
         error_log_file_path_.c_str());
   }
+  startSafetyMonitorWorker();
   return CallbackReturn::SUCCESS;
 }
 
 CallbackReturn ReachableCartesianImpedanceController::on_deactivate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
+  stopSafetyMonitorWorker();
   if (error_log_file_.is_open()) { error_log_file_.flush(); error_log_file_.close(); }
   J_geo_prev_.setZero();
   Jdot_dq_filtered_.setZero();

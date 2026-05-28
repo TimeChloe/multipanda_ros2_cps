@@ -1,19 +1,26 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <cstddef>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <Eigen/Dense>
 
 #include <controller_interface/controller_interface.hpp>
+#include <mujoco_ros_msgs/msg/scalar_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "cps_human_workspace/human_workspace.hpp"
+#include "cps_safety_monitor/reachable_safety_monitor.hpp"
 #include "franka_semantic_components/franka_robot_model.hpp"
 
 using CallbackReturn =
@@ -38,89 +45,10 @@ enum class SafetyMode {
   kFailsafe = 1
 };
 
-struct MonitorResult {
-  bool monitored_contact_possible{false};
-  bool monitored_unsafe{false};
-  bool predicted_trigger{false};
-
-  double plane_distance_now{0.0};
-  double plane_distance_min{0.0};
-
-  double m_eff_n{0.0};
-  double v_n_now{0.0};
-  double Tn_now{0.0};
-  double v_safe{0.0};
-
-  bool nominal_contact_sample_found{false};
-  double nominal_contact_time{0.0};
-  double nominal_contact_distance{0.0};
-  double v_n_contact_nominal{0.0};
-  double Tn_contact_nominal{0.0};
-  Vector3d nominal_contact_point_world{Vector3d::Zero()};
-
-  bool worst_case_contact_found{false};
-  double worst_case_contact_time{0.0};
-  double worst_case_plane_distance_at_candidate{0.0};
-  double worst_case_nominal_forward_progress{0.0};
-
-  double worst_case_v_n_ub{0.0};
-  double worst_case_Tn_ub{0.0};
-  double worst_case_a_pos{0.0};
-  double worst_case_a_brake{0.0};
-  double worst_case_a_net{0.0};
-
-  double h_geom{0.0};
-  double h_monitored_energy{0.0};
-
-  double v_n_now_tube{0.0};
-  double Tn_now_tube{0.0};
-  double Tn_dot_est{0.0};
-
-  double current_pos_error_radius{0.0};
-  double current_vel_error_radius{0.0};
-  double worst_case_pos_error_radius{0.0};
-  double worst_case_vel_error_radius{0.0};
-
-  double worst_case_V_potential_ub{0.0};
-  double h_clamping_energy{std::numeric_limits<double>::infinity()};
-  bool clamping_energy_unsafe{false};
-  bool collision_energy_unsafe{false};
-
-  double terminal_energy_ub{0.0};
-  double h_terminal_energy{std::numeric_limits<double>::infinity()};
-  bool terminal_energy_unsafe{false};
-};
-
-struct ImpedanceSample {
-  double t{0.0};
-
-  Vector3d p{Vector3d::Zero()};
-  Vector3d dp{Vector3d::Zero()};
-  Vector3d ddp{Vector3d::Zero()};
-
-  Quaterniond q{Quaterniond::Identity()};
-  Vector3d w{Vector3d::Zero()};
-  Vector3d dw{Vector3d::Zero()};
-
-  Matrix6d K{Matrix6d::Zero()};
-  Matrix6d D{Matrix6d::Zero()};
-
-  bool failsafe{false};
-};
-
-struct VerifiedPlan {
-  bool valid{false};
-
-  ImpedanceSample anchor;
-  std::vector<ImpedanceSample> intended;
-  std::vector<ImpedanceSample> failsafe;
-
-  std::size_t intended_exec_index{0};
-  std::size_t failsafe_exec_index{0};
-
-  double generated_wall_time{0.0};
-  double nominal_time_anchor{0.0};
-};
+using MonitorResult = cps_safety_monitor::MonitorResult;
+using ImpedanceSample = cps_safety_monitor::ImpedanceSample;
+using VerifiedPlan = cps_safety_monitor::VerifiedPlan;
+using SafetyMonitorConfig = cps_safety_monitor::SafetyMonitorConfig;
 
 struct ShieldDecision {
   bool candidate_verified{false};
@@ -133,6 +61,8 @@ struct ShieldDecision {
 class ReachableCartesianImpedanceController
     : public controller_interface::ControllerInterface {
  public:
+  ~ReachableCartesianImpedanceController() override;
+
   controller_interface::InterfaceConfiguration command_interface_configuration() const override;
 
   controller_interface::InterfaceConfiguration state_interface_configuration() const override;
@@ -216,6 +146,10 @@ class ReachableCartesianImpedanceController
       const Quaterniond& current_orientation,
       double wall_time) const;
 
+  std::vector<ImpedanceSample> makeIntendedBufferFromReplanner(
+      double nominal_guess_time,
+      const ImpedanceSample& planning_start_command) const;
+
   bool refillIntendedBufferFromReplanner(
       double nominal_guess_time,
       const ImpedanceSample& planning_start_command);
@@ -228,13 +162,25 @@ class ReachableCartesianImpedanceController
       const Vector6d& ee_twist,
       const Matrix7d& inertia,
       const Matrix37d& Jv,
+      const Matrix6d& K_runtime,
+      const Matrix6d& D_runtime,
       const ImpedanceSample& next_intended) const;
 
   MonitorResult verifyCandidatePlan(const VerifiedPlan& plan,
                                     const Vector3d& current_position,
+                                    const Quaterniond& current_orientation,
                                     const Vector6d& ee_twist,
                                     const Matrix7d& inertia,
-                                    const Matrix37d& Jv) const;
+                                    const Matrix37d& Jv,
+                                    const Matrix6d& K_runtime,
+                                    const Matrix6d& D_runtime) const;
+
+  Vector3d collisionCenterOffsetWorld(const Quaterniond& orientation) const;
+
+  Vector6d twistAtCollisionCenter(const Quaterniond& orientation,
+                                  const Vector6d& flange_twist) const;
+
+  VerifiedPlan makeCollisionCenterPlanForMonitor(const VerifiedPlan& flange_plan) const;
 
   ShieldDecision computeShieldDecision(double wall_time,
                                        double nominal_guess_time,
@@ -243,6 +189,52 @@ class ReachableCartesianImpedanceController
                                        const Vector6d& ee_twist,
                                        const Matrix7d& inertia,
                                        const Matrix37d& Jv);
+
+  SafetyMonitorConfig makeSafetyMonitorConfig(const Matrix6d& K_runtime,
+                                              const Matrix6d& D_runtime) const;
+
+  struct AsyncMonitorInput {
+    std::uint64_t sequence{0};
+    double wall_time{0.0};
+    double nominal_guess_time{0.0};
+
+    Vector3d current_position{Vector3d::Zero()};
+    Quaterniond current_orientation{Quaterniond::Identity()};
+    Vector6d ee_twist{Vector6d::Zero()};
+    Matrix7d inertia{Matrix7d::Zero()};
+    Matrix37d Jv{Matrix37d::Zero()};
+    Matrix6d K_runtime{Matrix6d::Zero()};
+    Matrix6d D_runtime{Matrix6d::Zero()};
+
+    ImpedanceSample last_commanded_sample;
+    bool last_commanded_sample_valid{false};
+  };
+
+  struct AsyncMonitorOutput {
+    std::uint64_t sequence{0};
+    double input_wall_time{0.0};
+    bool valid{false};
+    ShieldDecision decision;
+  };
+
+  struct AsyncPlanningState {
+    std::vector<ImpedanceSample> intended_buffer;
+    std::size_t intended_buffer_index{0};
+    bool intended_buffer_valid{false};
+    VerifiedPlan last_verified_plan;
+  };
+
+  ShieldDecision computeShieldDecisionForAsyncInput(
+      const AsyncMonitorInput& input,
+      AsyncPlanningState& state) const;
+
+  void publishAsyncMonitorInput(const AsyncMonitorInput& input);
+  bool takeAsyncMonitorOutput(AsyncMonitorOutput* output);
+  void safetyMonitorWorkerLoop();
+  void startSafetyMonitorWorker();
+  void stopSafetyMonitorWorker();
+  void handleMujocoContactSensor(
+      const mujoco_ros_msgs::msg::ScalarStamped::SharedPtr msg);
 
   Vector7d computeImpedanceTorque(const Vector7d& q,
                                   const Vector7d& dq,
@@ -303,7 +295,11 @@ class ReachableCartesianImpedanceController
 
   double safe_collision_energy_joule_{0.05};
   double ee_collision_radius_{0.04};
+  Vector3d tcp_offset_{Vector3d::Zero()};
+  Vector3d ee_collision_center_offset_{Vector3d::Zero()};
   int monitor_decimation_{1};
+  bool async_safety_monitor_{true};
+  double async_plan_max_age_sec_{0.05};
 
   cps_human_workspace::HumanWorkspace human_workspace_;
 
@@ -356,6 +352,21 @@ class ReachableCartesianImpedanceController
   bool last_shield_decision_valid_{false};
   ShieldDecision last_shield_decision_{};
 
+  std::thread safety_monitor_worker_thread_;
+  std::atomic<bool> safety_monitor_worker_running_{false};
+  std::atomic<std::uint64_t> async_input_sequence_{0};
+
+  std::mutex async_input_mutex_;
+  std::condition_variable async_input_cv_;
+  AsyncMonitorInput latest_async_input_{};
+  bool async_input_pending_{false};
+
+  std::mutex async_output_mutex_;
+  AsyncMonitorOutput latest_async_output_{};
+  std::uint64_t last_consumed_async_output_sequence_{0};
+  double last_async_output_wall_time_{-1.0};
+  bool last_async_output_valid_{false};
+
   VerifiedPlan last_verified_plan_{};
   VerifiedPlan candidate_plan_{};
   bool candidate_plan_valid_{false};
@@ -397,10 +408,32 @@ class ReachableCartesianImpedanceController
 
   int profiling_stats_print_period_{1000};
 
+  bool enable_mujoco_contact_logging_{true};
+  std::string mujoco_contact_sensor_topic_{"/panda_metal_ball_touch"};
+  double mujoco_contact_threshold_{1.0e-6};
+  rclcpp::Subscription<mujoco_ros_msgs::msg::ScalarStamped>::SharedPtr
+      mujoco_contact_sub_;
+  std::atomic<double> latest_mujoco_contact_value_{0.0};
+  std::atomic<double> latest_mujoco_contact_msg_time_{-1.0};
+  std::atomic<bool> latest_mujoco_contact_active_{false};
+  std::atomic<bool> mujoco_first_contact_seen_{false};
+  std::atomic<double> mujoco_first_contact_wall_time_{-1.0};
+  std::atomic<double> mujoco_first_contact_msg_time_{-1.0};
+
   std::size_t loop_counter_{0};
   double exec_sum_ms_{0.0};
   double exec_min_ms_{1e9};
   double exec_max_ms_{0.0};
+  std::size_t exec_overrun_1ms_count_{0};
+  std::size_t exec_overrun_2ms_count_{0};
+  double prof_model_sum_ms_{0.0};
+  double prof_model_max_ms_{0.0};
+  double prof_shield_sum_ms_{0.0};
+  double prof_shield_max_ms_{0.0};
+  double prof_torque_sum_ms_{0.0};
+  double prof_torque_max_ms_{0.0};
+  double prof_io_sum_ms_{0.0};
+  double prof_io_max_ms_{0.0};
 
   double clamping_energy_budget_joule_{0.05};
   double energy_budget_margin_joule_{0.005};

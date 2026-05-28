@@ -4,6 +4,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <Eigen/Dense>
 
@@ -84,6 +85,19 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     ee_collision_radius_ = std::max(
         0.0,
         declare_parameter<double>("ee_collision_radius", 0.04));
+    const auto ee_collision_center_offset =
+        declare_parameter<std::vector<double>>(
+            "ee_collision_center_offset", std::vector<double>{0.0, 0.0, 0.0});
+    if (ee_collision_center_offset.size() == 3) {
+      ee_collision_center_offset_ = Vector3d(
+          ee_collision_center_offset[0],
+          ee_collision_center_offset[1],
+          ee_collision_center_offset[2]);
+    } else {
+      RCLCPP_WARN(
+          get_logger(),
+          "ee_collision_center_offset must contain 3 values. Using [0, 0, 0].");
+    }
     tracking_pos_error_bound_ = std::max(
         0.0,
         declare_parameter<double>("tracking_pos_error_bound", 0.005));
@@ -239,12 +253,20 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
         transform.transform.translation.x,
         transform.transform.translation.y,
         transform.transform.translation.z);
+    Quaterniond ee_orientation(
+        transform.transform.rotation.w,
+        transform.transform.rotation.x,
+        transform.transform.rotation.y,
+        transform.transform.rotation.z);
+    ee_orientation.normalize();
+    const Vector3d collision_center =
+        ee_position + ee_orientation * ee_collision_center_offset_;
     const double monitored_radius = ee_collision_radius_ + tracking_pos_error_bound_;
 
     {
       Marker marker;
       setupMarker(marker, 10, "ee_collision_center", Marker::SPHERE);
-      marker.pose.position = toPoint(ee_position);
+      marker.pose.position = toPoint(collision_center);
       marker.pose.orientation.w = 1.0;
       marker.scale.x = 0.03;
       marker.scale.y = 0.03;
@@ -256,7 +278,7 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     {
       Marker marker;
       setupMarker(marker, 11, "ee_collision_radius", Marker::SPHERE);
-      marker.pose.position = toPoint(ee_position);
+      marker.pose.position = toPoint(collision_center);
       marker.pose.orientation.w = 1.0;
       marker.scale.x = 2.0 * ee_collision_radius_;
       marker.scale.y = 2.0 * ee_collision_radius_;
@@ -268,7 +290,7 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     {
       Marker marker;
       setupMarker(marker, 12, "ee_monitored_radius", Marker::SPHERE);
-      marker.pose.position = toPoint(ee_position);
+      marker.pose.position = toPoint(collision_center);
       marker.pose.orientation.w = 1.0;
       marker.scale.x = 2.0 * monitored_radius;
       marker.scale.y = 2.0 * monitored_radius;
@@ -280,7 +302,8 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     {
       Marker marker;
       setupMarker(marker, 13, "ee_collision_status", Marker::TEXT_VIEW_FACING);
-      marker.pose.position = toPoint(ee_position + Vector3d(0.0, 0.0, text_z_offset_));
+      marker.pose.position =
+          toPoint(collision_center + Vector3d(0.0, 0.0, text_z_offset_));
       marker.pose.orientation.w = 1.0;
       marker.scale.z = text_scale_;
       marker.color = makeColor(0.8f, 1.0f, 0.9f, 0.95f);
@@ -301,6 +324,7 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
   bool visualize_ee_collision_area_{true};
   double publish_rate_hz_{10.0};
   double ee_collision_radius_{0.04};
+  Vector3d ee_collision_center_offset_{Vector3d::Zero()};
   double tracking_pos_error_bound_{0.005};
   double plane_size_{0.8};
   double plane_thickness_{0.003};
