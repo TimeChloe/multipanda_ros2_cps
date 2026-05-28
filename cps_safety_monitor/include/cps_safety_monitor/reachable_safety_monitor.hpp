@@ -22,6 +22,7 @@ using Quaterniond = Eigen::Quaterniond;
 
 struct MonitorResult {
   bool monitored_contact_possible{false};
+  bool contact_relevant_for_energy{false};
   bool monitored_unsafe{false};
   bool predicted_trigger{false};
 
@@ -116,6 +117,7 @@ struct SafetyMonitorConfig {
   double clamping_energy_budget_joule{0.05};
   double energy_budget_margin_joule{0.005};
   double ee_collision_radius{0.04};
+  double contact_activation_margin{0.0};
   double tracking_pos_error_bound{0.005};
   double tracking_vel_error_bound{0.05};
   bool use_dynamic_consistent_impedance{true};

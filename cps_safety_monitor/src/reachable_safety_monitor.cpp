@@ -232,10 +232,15 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   out.clamping_energy_unsafe = out.worst_case_V_potential_ub > L_QS_eff;
   out.terminal_energy_unsafe = out.terminal_energy_ub > L_F_eff;
 
+  out.contact_relevant_for_energy =
+      out.monitored_contact_possible ||
+      out.plane_distance_min <= std::max(0.0, config.contact_activation_margin);
+
   out.monitored_unsafe =
-      out.collision_energy_unsafe ||
-      out.clamping_energy_unsafe ||
-      out.terminal_energy_unsafe;
+      out.contact_relevant_for_energy &&
+      (out.collision_energy_unsafe ||
+       out.clamping_energy_unsafe ||
+       out.terminal_energy_unsafe);
 
   out.predicted_trigger = out.monitored_unsafe;
 

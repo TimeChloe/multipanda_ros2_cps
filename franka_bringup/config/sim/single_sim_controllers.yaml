@@ -196,23 +196,24 @@ reachable_cartesian_impedance_controller:
     use_constant_reference: false
     reference_trajectory_type: line
 
-    nominal_pos_stiffness: 800.0
-    nominal_rot_stiffness: 40.0
+    nominal_pos_stiffness: 1200.0
+    nominal_rot_stiffness: 120.0
 
     # Failsafe 建议比 nominal 更软，但阻尼更大，用于安全吸收动能。
-    failsafe_pos_stiffness: 100.0
-    failsafe_rot_stiffness: 20.0
-    failsafe_pos_damping_scale: 1.1
-    failsafe_rot_damping_scale: 1.1
+    failsafe_pos_stiffness: 1200.0
+    failsafe_rot_stiffness: 120.0
+    failsafe_pos_damping_scale: 10.0
+    failsafe_rot_damping_scale: 10.0
 
     n_stiffness: 0.0
     disable_nullspace_in_failsafe: true
 
     enable_safety_monitor: true
 
-    safe_collision_energy_joule: 0.15
-    clamping_energy_budget_joule: 0.035
+    safe_collision_energy_joule: 0.08
+    clamping_energy_budget_joule: 0.02
     energy_budget_margin_joule: 0.000
+    contact_activation_margin: 0.0
 
     ee_collision_radius: 0.03
     tcp_offset: [0.0, 0.0, 0.06]
@@ -234,8 +235,8 @@ reachable_cartesian_impedance_controller:
     stiffness_error_bound_m: 0.00
 
     # 误差管道 tracking error tube 边界
-    tracking_pos_error_bound: 0.005
-    tracking_vel_error_bound: 0.01
+    tracking_pos_error_bound: 0.002
+    tracking_vel_error_bound: 0.002
 
     # monitored trajectory = intended + failsafe
     shield_horizon_steps: 5
@@ -245,7 +246,7 @@ reachable_cartesian_impedance_controller:
     local_replan_horizon_steps: 500
     local_replan_dt: 0.001
     local_path_lookahead_sec: 0.50
-    local_replan_max_velocity: 0.6
+    local_replan_max_velocity: 0.3
     local_replan_max_acceleration: 1.5
     local_replan_max_jerk: 5.0
 
@@ -256,7 +257,7 @@ reachable_cartesian_impedance_controller:
     path_time_acc_limit: 0.5
     path_time_rate_target: 1.0
 
-    use_dynamic_consistent_impedance: false
+    use_dynamic_consistent_impedance: true
     torque_rate_limit: 600.0
 
     dynamic_lambda_regularization: 1.0e-6

@@ -437,6 +437,7 @@ class ReachableCartesianImpedanceController
 
   double clamping_energy_budget_joule_{0.05};
   double energy_budget_margin_joule_{0.005};
+  double contact_activation_margin_{0.0};
   double failsafe_min_pos_stiffness_{5.0};
 
   double failsafe_pos_damping_scale_{2.5};

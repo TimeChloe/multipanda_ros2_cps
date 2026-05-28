@@ -706,6 +706,7 @@ SafetyMonitorConfig ReachableCartesianImpedanceController::makeSafetyMonitorConf
   config.clamping_energy_budget_joule = clamping_energy_budget_joule_;
   config.energy_budget_margin_joule = energy_budget_margin_joule_;
   config.ee_collision_radius = ee_collision_radius_;
+  config.contact_activation_margin = contact_activation_margin_;
   config.tracking_pos_error_bound = tracking_pos_error_bound_;
   config.tracking_vel_error_bound = tracking_vel_error_bound_;
   config.use_dynamic_consistent_impedance = use_dynamic_consistent_impedance_;
@@ -1590,6 +1591,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << monitor.current_pos_error_radius << "," << monitor.current_vel_error_radius << ","
         << monitor.worst_case_pos_error_radius << "," << monitor.worst_case_vel_error_radius << ","
         << static_cast<int>(monitor.monitored_contact_possible) << ","
+        << static_cast<int>(monitor.contact_relevant_for_energy) << ","
         << static_cast<int>(monitor.collision_energy_unsafe) << ","
         << static_cast<int>(monitor.clamping_energy_unsafe) << ","
         << static_cast<int>(monitor.terminal_energy_unsafe) << ","
@@ -1689,6 +1691,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("safe_collision_energy_joule", 0.05);
     auto_declare<double>("clamping_energy_budget_joule", 0.05);
     auto_declare<double>("energy_budget_margin_joule", 0.005);
+    auto_declare<double>("contact_activation_margin", 0.0);
     auto_declare<double>("ee_collision_radius", 0.04);
     auto_declare<std::vector<double>>(
         "tcp_offset", std::vector<double>{0.0, 0.0, 0.0});
@@ -1808,6 +1811,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
 
     energy_budget_margin_joule_ =
         std::max(0.0, get_node()->get_parameter("energy_budget_margin_joule").as_double());
+    contact_activation_margin_ =
+        std::max(0.0, get_node()->get_parameter("contact_activation_margin").as_double());
 
     ee_collision_radius_ = get_node()->get_parameter("ee_collision_radius").as_double();
     const auto tcp_offset =
@@ -1925,7 +1930,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     K_f_target_.setZero(); D_f_target_.setZero();
     K_nominal_.topLeftCorner<3, 3>() = nominal_pos_stiffness * Matrix3d::Identity();
     K_nominal_.bottomRightCorner<3, 3>() = nominal_rot_stiffness * Matrix3d::Identity();
-    D_nominal_.topLeftCorner<3, 3>() = 2.0 * std::sqrt(std::max(nominal_pos_stiffness, 0.0)) * Matrix3d::Identity();
+    D_nominal_.topLeftCorner<3, 3>() = 0.8 * 2.0 * std::sqrt(std::max(nominal_pos_stiffness, 0.0)) * Matrix3d::Identity();
     D_nominal_.bottomRightCorner<3, 3>() = 0.8 * 2.0 * std::sqrt(std::max(nominal_rot_stiffness, 0.0)) * Matrix3d::Identity();
     K_f_target_.topLeftCorner<3, 3>() = failsafe_pos_stiffness * Matrix3d::Identity();
     K_f_target_.bottomRightCorner<3, 3>() = failsafe_rot_stiffness * Matrix3d::Identity();
@@ -2068,6 +2073,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "enable_safety_monitor: " << static_cast<int>(enable_safety_monitor_) << "\n"
                     << "async_safety_monitor: " << static_cast<int>(async_safety_monitor_) << "\n"
                     << "async_plan_max_age_sec: " << async_plan_max_age_sec_ << "\n"
+                    << "contact_activation_margin: "
+                    << contact_activation_margin_ << "\n"
                     << "tcp_offset: ["
                     << tcp_offset_.x() << ", "
                     << tcp_offset_.y() << ", "
@@ -2136,7 +2143,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "v_n_now_tube,Tn_now_tube,Tn_dot_est,"
         << "current_pos_error_radius,current_vel_error_radius,"
         << "worst_case_pos_error_radius,worst_case_vel_error_radius,"
-        << "monitored_contact_possible,collision_energy_unsafe,clamping_energy_unsafe,"
+        << "monitored_contact_possible,contact_relevant_for_energy,"
+        << "collision_energy_unsafe,clamping_energy_unsafe,"
         << "terminal_energy_unsafe,monitored_unsafe,predicted_trigger,"
         << "mujoco_contact_value,mujoco_contact_active,mujoco_contact_msg_time_sec,"
         << "mujoco_first_contact_seen,mujoco_first_contact_wall_time_sec,"
