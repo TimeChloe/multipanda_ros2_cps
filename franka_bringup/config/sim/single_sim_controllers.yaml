@@ -223,8 +223,7 @@ reachable_cartesian_impedance_controller:
     ee_collision_radius: 0.03
     tcp_offset: [0.0, 0.0, 0.06]
     ee_collision_center_offset: [0.0, 0.0, -0.03]
-    monitor_decimation: 1
-    async_safety_monitor: false
+    async_safety_monitor: true
     async_plan_max_age_sec: 0.05
     enable_mujoco_contact_logging: true
     mujoco_contact_sensor_topic: /panda_metal_ball_touch
@@ -245,6 +244,7 @@ reachable_cartesian_impedance_controller:
 
     # monitored trajectory uses the Ruckig brake result length for failsafe
     shield_plan_dt: 0.001
+    monitor_frequency_hz: 50.0
 
     # Ruckig 局部重规划与意图缓存参数
     local_replan_horizon_steps: 500

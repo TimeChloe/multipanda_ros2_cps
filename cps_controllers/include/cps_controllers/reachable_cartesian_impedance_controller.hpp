@@ -156,8 +156,7 @@ class ReachableCartesianImpedanceController
       double nominal_guess_time,
       const ImpedanceSample& planning_start_command);
 
-  // 新增：构建单步执行且 path-consistent 锚点的备选计划
-  VerifiedPlan buildSingleStepCandidatePlan(
+  VerifiedPlan buildCandidatePlan(
       double wall_time,
       const Vector3d& current_position,
       const Quaterniond& current_orientation,
@@ -166,7 +165,7 @@ class ReachableCartesianImpedanceController
       const Matrix37d& Jv,
       const Matrix6d& K_runtime,
       const Matrix6d& D_runtime,
-      const ImpedanceSample& next_intended) const;
+      const std::vector<ImpedanceSample>& intended_samples) const;
 
   MonitorResult verifyCandidatePlan(const VerifiedPlan& plan,
                                     const Vector3d& current_position,
@@ -338,6 +337,9 @@ class ReachableCartesianImpedanceController
   double tracking_vel_error_bound_{0.00};
 
   double shield_plan_dt_{0.01};
+  int shield_intended_steps_{1};
+  double monitor_frequency_hz_{100.0};
+  double monitor_update_period_sec_{0.01};
 
   double path_retiming_search_window_sec_{0.25};
   int path_retiming_search_steps_{41};
@@ -397,6 +399,7 @@ class ReachableCartesianImpedanceController
   std::uint64_t last_consumed_async_output_sequence_{0};
   double last_async_output_wall_time_{-1.0};
   bool last_async_output_valid_{false};
+  double last_async_input_publish_wall_time_{-1.0};
 
   VerifiedPlan last_verified_plan_{};
   VerifiedPlan candidate_plan_{};
