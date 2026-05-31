@@ -13,6 +13,9 @@ mujoco_server:
           namespace: ""
           robot_description_node: "robot_state_publisher"
           robot_description: "robot_description"
+          # Options: "friction" keeps MJCF joint damping/frictionloss;
+          # "no_friction" zeros damping/frictionloss on Panda arm joints.
+          panda_model_variant: "no_friction"
       mujoco_ros2_sensors:
         type: mujoco_ros::sensors::MujocoRos2SensorsPlugin
 
@@ -202,8 +205,8 @@ reachable_cartesian_impedance_controller:
     nominal_rot_stiffness: 60.0
 
     # Failsafe 建议比 nominal 更软，但阻尼更大，用于安全吸收动能。
-    failsafe_pos_stiffness: 600.0
-    failsafe_rot_stiffness: 60.0
+    failsafe_pos_stiffness: 50.0
+    failsafe_rot_stiffness: 10.0
     failsafe_pos_damping_scale: 5.0
     failsafe_rot_damping_scale: 5.0
 
@@ -212,7 +215,7 @@ reachable_cartesian_impedance_controller:
 
     enable_safety_monitor: true
 
-    safe_collision_energy_joule: 0.20
+    safe_collision_energy_joule: 0.05
     clamping_energy_budget_joule: 0.05
     energy_budget_margin_joule: 0.000
     contact_activation_margin: 0.0
@@ -237,7 +240,7 @@ reachable_cartesian_impedance_controller:
     stiffness_error_bound_m: 0.00
 
     # 误差管道 tracking error tube 边界
-    tracking_pos_error_bound: 0.003
+    tracking_pos_error_bound: 0.000
     tracking_vel_error_bound: 0.0
 
     # monitored trajectory = intended + failsafe

@@ -356,6 +356,12 @@ class ReachableCartesianImpedanceController
 
   bool use_dynamic_consistent_impedance_{true};
   double torque_rate_limit_{1000.0};
+  bool torque_rate_limited_last_{false};
+  double torque_rate_max_desired_delta_nm_last_{0.0};
+  double torque_rate_limit_delta_nm_last_{0.0};
+  double torque_rate_max_excess_nm_last_{0.0};
+  double torque_rate_max_ratio_last_{0.0};
+  double torque_rate_max_cmd_delta_nm_last_{0.0};
   double dynamic_lambda_regularization_{1.0e-6};
   double jdot_dq_filter_alpha_{0.15};
   double jdot_dq_max_norm_{5.0};

@@ -1570,15 +1570,34 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
   const Vector7d tau_des = tau_task + coriolis + tau_nullspace_eff;
 
   const double max_delta = torque_rate_limit_ * std::max(dt, kMinDt);
+  torque_rate_limited_last_ = false;
+  torque_rate_max_desired_delta_nm_last_ = 0.0;
+  torque_rate_limit_delta_nm_last_ = max_delta;
+  torque_rate_max_excess_nm_last_ = 0.0;
+  torque_rate_max_ratio_last_ = 0.0;
+  torque_rate_max_cmd_delta_nm_last_ = 0.0;
+
   Vector7d tau_cmd = tau_cmd_prev_;
 
   for (int i = 0; i < 7; ++i) {
-    const double delta = std::clamp(
-        tau_des(i) - tau_cmd_prev_(i),
-        -max_delta,
-        max_delta);
+    const double desired_delta = tau_des(i) - tau_cmd_prev_(i);
+    const double abs_desired_delta = std::abs(desired_delta);
+    torque_rate_max_desired_delta_nm_last_ =
+        std::max(torque_rate_max_desired_delta_nm_last_, abs_desired_delta);
+    torque_rate_max_ratio_last_ =
+        std::max(torque_rate_max_ratio_last_,
+                 abs_desired_delta / std::max(max_delta, kSmallPositive));
+    torque_rate_max_excess_nm_last_ =
+        std::max(torque_rate_max_excess_nm_last_, abs_desired_delta - max_delta);
+    if (abs_desired_delta > max_delta) {
+      torque_rate_limited_last_ = true;
+    }
+
+    const double delta = std::clamp(desired_delta, -max_delta, max_delta);
 
     tau_cmd(i) = tau_cmd_prev_(i) + delta;
+    torque_rate_max_cmd_delta_nm_last_ =
+        std::max(torque_rate_max_cmd_delta_nm_last_, std::abs(delta));
   }
 
   tau_cmd_prev_ = tau_cmd;
@@ -1824,6 +1843,12 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << error(0) << "," << error(1) << "," << error(2) << ","
         << error(3) << "," << error(4) << "," << error(5) << ","
         << 0.0 << "," << 0.0 << "," << 0.0 << "," << tau_cmd.norm() << ","
+        << static_cast<int>(torque_rate_limited_last_) << ","
+        << torque_rate_max_desired_delta_nm_last_ << ","
+        << torque_rate_limit_delta_nm_last_ << ","
+        << torque_rate_max_excess_nm_last_ << ","
+        << torque_rate_max_ratio_last_ << ","
+        << torque_rate_max_cmd_delta_nm_last_ << ","
         << K_runtime_(0, 0) << "," << K_runtime_(1, 1) << "," << K_runtime_(2, 2) << ","
         << D_runtime_(0, 0) << "," << D_runtime_(1, 1) << "," << D_runtime_(2, 2) << ","
         << monitor.plane_distance_now << "," << monitor.plane_distance_min << ","
@@ -1831,7 +1856,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << static_cast<int>(monitor.nominal_contact_sample_found) << ","
         << monitor.nominal_contact_time << "," << monitor.nominal_contact_distance << ","
         << monitor.v_n_contact_nominal << "," << monitor.Tn_contact_nominal << ","
-        << static_cast<int>(monitor.worst_case_contact_found) << ","
         << monitor.worst_case_contact_time << "," << monitor.worst_case_plane_distance_at_candidate << ","
         << monitor.worst_case_nominal_forward_progress << ","
         << monitor.worst_case_v_n_ub << "," << monitor.worst_case_Tn_ub << ","
@@ -2396,12 +2420,15 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "des_vx,des_vy,des_vz,"
         << "err_px,err_py,err_pz,err_rx,err_ry,err_rz,"
         << "tau_task_norm,tau_null_norm,tau_friction_norm,tau_cmd_norm,"
+        << "torque_rate_limited,torque_rate_max_desired_delta_nm,"
+        << "torque_rate_limit_delta_nm,torque_rate_max_excess_nm,"
+        << "torque_rate_max_ratio,torque_rate_max_cmd_delta_nm,"
         << "Kx,Ky,Kz,Dx,Dy,Dz,"
         << "plane_distance_now,plane_distance_min,"
         << "m_eff_n,v_n_now,Tn_now,v_safe,"
         << "nominal_contact_sample_found,nominal_contact_time,nominal_contact_distance,"
         << "v_n_contact_nominal,Tn_contact_nominal,"
-        << "worst_case_contact_found,worst_case_contact_time,worst_case_plane_distance_at_candidate,"
+        << "worst_case_contact_time,worst_case_plane_distance_at_candidate,"
         << "worst_case_nominal_forward_progress,"
         << "worst_case_v_n_ub,worst_case_Tn_ub,"
         << "worst_case_a_pos,worst_case_a_brake,worst_case_a_net,"

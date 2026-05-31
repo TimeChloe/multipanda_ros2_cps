@@ -41,7 +41,6 @@ struct MonitorResult {
   double Tn_contact_nominal{0.0};
   Vector3d nominal_contact_point_world{Vector3d::Zero()};
 
-  bool worst_case_contact_found{false};
   double worst_case_contact_time{0.0};
   double worst_case_plane_distance_at_candidate{0.0};
   double worst_case_nominal_forward_progress{0.0};

@@ -171,7 +171,6 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
 
     if (contact_possible_step) {
       out.monitored_contact_possible = true;
-      out.worst_case_contact_found = true;
 
       if (!s.failsafe && !out.nominal_contact_sample_found) {
         Vector3d x_contact = Vector3d::Zero();
