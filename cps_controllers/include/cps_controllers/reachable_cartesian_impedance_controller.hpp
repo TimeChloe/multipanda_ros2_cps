@@ -53,9 +53,11 @@ using SafetyMonitorConfig = cps_safety_monitor::SafetyMonitorConfig;
 struct ShieldDecision {
   bool candidate_verified{false};
   bool executing_last_verified_failsafe{false};
+  bool has_evaluated_plan{false};
 
   ImpedanceSample command;
   MonitorResult monitor;
+  VerifiedPlan evaluated_plan;
 };
 
 class ReachableCartesianImpedanceController
@@ -214,6 +216,7 @@ class ReachableCartesianImpedanceController
     std::uint64_t sequence{0};
     double input_wall_time{0.0};
     bool valid{false};
+    AsyncMonitorInput input;
     ShieldDecision decision;
   };
 
@@ -235,6 +238,21 @@ class ReachableCartesianImpedanceController
   void stopSafetyMonitorWorker();
   void handleMujocoContactSensor(
       const mujoco_ros_msgs::msg::ScalarStamped::SharedPtr msg);
+  void logShieldPredictionTrajectory(
+      double wall_time,
+      double nominal_guess_time,
+      const Vector3d& current_position,
+      const Quaterniond& current_orientation,
+      const Vector6d& ee_twist,
+      const Matrix7d& inertia,
+      const Matrix37d& Jv,
+      const Matrix6d& K_runtime,
+      const Matrix6d& D_runtime,
+      const VerifiedPlan& evaluated_plan,
+      const MonitorResult& monitor,
+      bool candidate_verified,
+      bool executing_failsafe,
+      const char* source);
 
   Vector7d computeImpedanceTorque(const Vector7d& q,
                                   const Vector7d& dq,
@@ -263,6 +281,11 @@ class ReachableCartesianImpedanceController
   std::string error_log_file_path_;
   std::ofstream error_log_file_;
   std::size_t log_write_counter_{0};
+  bool enable_prediction_logging_{true};
+  std::string prediction_log_file_name_{"shield_prediction_trajectory.csv"};
+  std::string prediction_log_file_path_;
+  std::ofstream prediction_log_file_;
+  std::size_t prediction_log_write_counter_{0};
 
   std::string arm_id_;
   std::string reference_trajectory_type_{"line"};

@@ -192,26 +192,28 @@ reachable_cartesian_impedance_controller:
     enable_error_logging: true
     error_log_root_dir: /home/developer/multipanda_ws/src/data_log
     error_log_file_name: reachable_cartesian_impedance_validation.csv
+    enable_prediction_logging: true
+    prediction_log_file_name: shield_prediction_trajectory.csv
 
     use_constant_reference: false
     reference_trajectory_type: line
 
-    nominal_pos_stiffness: 1200.0
-    nominal_rot_stiffness: 120.0
+    nominal_pos_stiffness: 600.0
+    nominal_rot_stiffness: 60.0
 
     # Failsafe 建议比 nominal 更软，但阻尼更大，用于安全吸收动能。
-    failsafe_pos_stiffness: 1200.0
-    failsafe_rot_stiffness: 120.0
-    failsafe_pos_damping_scale: 10.0
-    failsafe_rot_damping_scale: 10.0
+    failsafe_pos_stiffness: 600.0
+    failsafe_rot_stiffness: 60.0
+    failsafe_pos_damping_scale: 5.0
+    failsafe_rot_damping_scale: 5.0
 
     n_stiffness: 0.0
     disable_nullspace_in_failsafe: true
 
     enable_safety_monitor: true
 
-    safe_collision_energy_joule: 0.08
-    clamping_energy_budget_joule: 0.02
+    safe_collision_energy_joule: 0.20
+    clamping_energy_budget_joule: 0.05
     energy_budget_margin_joule: 0.000
     contact_activation_margin: 0.0
 
@@ -219,7 +221,7 @@ reachable_cartesian_impedance_controller:
     tcp_offset: [0.0, 0.0, 0.06]
     ee_collision_center_offset: [0.0, 0.0, -0.03]
     monitor_decimation: 1
-    async_safety_monitor: true
+    async_safety_monitor: false
     async_plan_max_age_sec: 0.05
     enable_mujoco_contact_logging: true
     mujoco_contact_sensor_topic: /panda_metal_ball_touch
@@ -235,18 +237,18 @@ reachable_cartesian_impedance_controller:
     stiffness_error_bound_m: 0.00
 
     # 误差管道 tracking error tube 边界
-    tracking_pos_error_bound: 0.002
-    tracking_vel_error_bound: 0.002
+    tracking_pos_error_bound: 0.003
+    tracking_vel_error_bound: 0.0
 
     # monitored trajectory = intended + failsafe
-    shield_horizon_steps: 5
+    shield_horizon_steps: 100
     shield_plan_dt: 0.001
 
     # Ruckig 局部重规划与意图缓存参数
     local_replan_horizon_steps: 500
     local_replan_dt: 0.001
     local_path_lookahead_sec: 0.50
-    local_replan_max_velocity: 0.3
+    local_replan_max_velocity: 0.5
     local_replan_max_acceleration: 1.5
     local_replan_max_jerk: 5.0
 

@@ -868,6 +868,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     if (!candidate_plan_valid_) return false;
 
     dec.monitor = verify_plan(candidate_plan_);
+    dec.evaluated_plan = candidate_plan_;
+    dec.has_evaluated_plan = true;
     dec.candidate_verified = !enable_safety_monitor_ || !dec.monitor.predicted_trigger;
     return true;
   };
@@ -1053,6 +1055,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
         input.Jv,
         input.K_runtime,
         input.D_runtime);
+    dec.evaluated_plan = candidate_plan;
+    dec.has_evaluated_plan = true;
 
     dec.candidate_verified =
         !enable_safety_monitor_ || !dec.monitor.predicted_trigger;
@@ -1161,6 +1165,7 @@ void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop() {
     output.sequence = input.sequence;
     output.input_wall_time = input.wall_time;
     output.valid = true;
+    output.input = input;
     output.decision =
         computeShieldDecisionForAsyncInput(input, state);
 
@@ -1217,6 +1222,222 @@ void ReachableCartesianImpedanceController::handleMujocoContactSensor(
     mujoco_first_contact_msg_time_.store(
         rclcpp::Time(msg->header.stamp).seconds(),
         std::memory_order_relaxed);
+  }
+}
+
+void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
+    double wall_time,
+    double nominal_guess_time,
+    const Vector3d& current_position,
+    const Quaterniond& current_orientation,
+    const Vector6d& ee_twist,
+    const Matrix7d& inertia,
+    const Matrix37d& Jv,
+    const Matrix6d& K_runtime,
+    const Matrix6d& D_runtime,
+    const VerifiedPlan& evaluated_plan,
+    const MonitorResult& monitor,
+    bool candidate_verified,
+    bool executing_failsafe,
+    const char* source) {
+  if (!enable_prediction_logging_ || !prediction_log_file_.is_open() ||
+      !evaluated_plan.valid) {
+    return;
+  }
+
+  struct PredictionRow {
+    const char* stage{""};
+    int index{0};
+    bool failsafe{false};
+    double sample_t{0.0};
+    double dt{0.0};
+    Vector3d flange_target_p{Vector3d::Zero()};
+    Vector3d collision_target_p{Vector3d::Zero()};
+    Vector3d x_pred{Vector3d::Zero()};
+    Vector3d v_pred{Vector3d::Zero()};
+    Vector3d x_next{Vector3d::Zero()};
+    Vector3d v_next{Vector3d::Zero()};
+    Vector3d a_pred{Vector3d::Zero()};
+    double d_pred{0.0};
+    double d_next{0.0};
+    double d_segment{0.0};
+    bool contact_possible{false};
+    double k_n{0.0};
+    double e_n{0.0};
+    double v_n{0.0};
+    double T_n_ub{0.0};
+    double V_n_ub{0.0};
+    double Kx{0.0};
+    double Ky{0.0};
+    double Kz{0.0};
+    double Dx{0.0};
+    double Dy{0.0};
+    double Dz{0.0};
+  };
+
+  const VerifiedPlan collision_plan =
+      makeCollisionCenterPlanForMonitor(evaluated_plan);
+  const Vector3d collision_center =
+      current_position + collisionCenterOffsetWorld(current_orientation);
+  const Vector6d collision_twist =
+      twistAtCollisionCenter(current_orientation, ee_twist);
+
+  const Vector3d n = human_workspace_.normal();
+  const double rho_p = std::max(0.0, tracking_pos_error_bound_);
+  const double rho_v = std::max(0.0, tracking_vel_error_bound_);
+  const double inflated_contact_radius =
+      human_workspace_.inflatedCollisionRadius(ee_collision_radius_, rho_p);
+
+  Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
+  task_inertia_inv.diagonal().array() += kSmallPositive;
+  Matrix6d K_exec = K_runtime;
+  Matrix6d D_exec = D_runtime;
+
+  Vector3d x_pred = collision_center;
+  Vector3d v_pred = collision_twist.head<3>();
+  double t_prev = collision_plan.anchor.t;
+  std::vector<PredictionRow> rows;
+  rows.reserve(1 + collision_plan.intended.size() + collision_plan.failsafe.size());
+
+  auto append_row = [&](const char* stage,
+                        int index,
+                        const ImpedanceSample& flange_sample,
+                        const ImpedanceSample& collision_sample,
+                        double dtp) {
+    K_exec = applyMatrixRateLimit(K_exec, collision_sample.K, k_rate_limit_, dtp);
+    D_exec = applyMatrixRateLimit(D_exec, collision_sample.D, d_rate_limit_, dtp);
+
+    const Matrix3d Kp = K_exec.topLeftCorner<3, 3>();
+    const Matrix3d Dp = D_exec.topLeftCorner<3, 3>();
+    const Vector3d force_pred =
+        Kp * (collision_sample.p - x_pred) -
+        Dp * (v_pred - collision_sample.dp);
+    Vector3d a_pred = Vector3d::Zero();
+    if (use_dynamic_consistent_impedance_) {
+      a_pred = collision_sample.ddp + task_inertia_inv * force_pred;
+    } else {
+      a_pred = task_inertia_inv * force_pred;
+    }
+
+    const Vector3d x_next =
+        x_pred + v_pred * dtp + 0.5 * a_pred * dtp * dtp;
+    const Vector3d v_next = v_pred + a_pred * dtp;
+
+    PredictionRow row;
+    row.stage = stage;
+    row.index = index;
+    row.failsafe = collision_sample.failsafe;
+    row.sample_t = collision_sample.t;
+    row.dt = dtp;
+    row.flange_target_p = flange_sample.p;
+    row.collision_target_p = collision_sample.p;
+    row.x_pred = x_pred;
+    row.v_pred = v_pred;
+    row.x_next = x_next;
+    row.v_next = v_next;
+    row.a_pred = a_pred;
+    row.d_pred =
+        human_workspace_.signedDistanceToInflatedSphere(x_pred, inflated_contact_radius);
+    row.d_next =
+        human_workspace_.signedDistanceToInflatedSphere(x_next, inflated_contact_radius);
+    row.d_segment =
+        human_workspace_.signedDistanceSegmentToInflatedSphere(
+            x_pred, x_next, inflated_contact_radius);
+    row.contact_possible = row.d_segment <= 0.0;
+    row.k_n = std::max((n.transpose() * Kp * n)(0, 0), 0.0);
+    row.e_n = std::abs(n.dot(x_next - collision_sample.p)) + rho_p;
+    row.v_n = std::abs(n.dot(v_next)) + rho_v;
+    row.T_n_ub = 0.5 * std::max(monitor.m_eff_n, 0.0) * row.v_n * row.v_n;
+    row.V_n_ub = 0.5 * row.k_n * row.e_n * row.e_n;
+    row.Kx = K_exec(0, 0);
+    row.Ky = K_exec(1, 1);
+    row.Kz = K_exec(2, 2);
+    row.Dx = D_exec(0, 0);
+    row.Dy = D_exec(1, 1);
+    row.Dz = D_exec(2, 2);
+    rows.push_back(row);
+
+    x_pred = x_next;
+    v_pred = v_next;
+  };
+
+  auto append_samples = [&](const char* stage,
+                            const std::vector<ImpedanceSample>& flange_samples,
+                            const std::vector<ImpedanceSample>& collision_samples) {
+    const std::size_t count = std::min(flange_samples.size(), collision_samples.size());
+    for (std::size_t i = 0; i < count; ++i) {
+      const double dtp = std::max(collision_samples[i].t - t_prev, kMinDt);
+      append_row(stage,
+                 static_cast<int>(i),
+                 flange_samples[i],
+                 collision_samples[i],
+                 dtp);
+      t_prev = collision_samples[i].t;
+    }
+  };
+
+  append_samples("intended", evaluated_plan.intended, collision_plan.intended);
+  append_samples("failsafe", evaluated_plan.failsafe, collision_plan.failsafe);
+
+  double max_T = 0.0;
+  double max_V = 0.0;
+  for (const auto& row : rows) {
+    if (row.contact_possible) {
+      max_T = std::max(max_T, row.T_n_ub);
+      max_V = std::max(max_V, row.V_n_ub);
+    }
+  }
+
+  const double actual_collision_distance =
+      human_workspace_.signedDistanceToInflatedSphere(
+          collision_center,
+          inflated_contact_radius);
+
+  prediction_log_file_ << std::fixed << std::setprecision(9);
+  for (const auto& row : rows) {
+    const bool is_worst_T =
+        row.contact_possible && std::abs(row.T_n_ub - max_T) <= 1.0e-9;
+    const bool is_worst_V =
+        row.contact_possible && std::abs(row.V_n_ub - max_V) <= 1.0e-9;
+
+    prediction_log_file_
+        << wall_time << "," << nominal_guess_time << ","
+        << (source == nullptr ? "" : source) << ","
+        << (executing_failsafe ? 1 : 0) << ","
+        << static_cast<int>(candidate_verified) << ","
+        << static_cast<int>(executing_failsafe) << ","
+        << static_cast<int>(monitor.predicted_trigger) << ","
+        << static_cast<int>(monitor.monitored_contact_possible) << ","
+        << row.stage << "," << row.index << ","
+        << static_cast<int>(row.failsafe) << ","
+        << row.sample_t << "," << row.dt << ","
+        << current_position(0) << "," << current_position(1) << "," << current_position(2) << ","
+        << collision_center(0) << "," << collision_center(1) << "," << collision_center(2) << ","
+        << actual_collision_distance << ","
+        << row.flange_target_p(0) << "," << row.flange_target_p(1) << "," << row.flange_target_p(2) << ","
+        << row.collision_target_p(0) << "," << row.collision_target_p(1) << "," << row.collision_target_p(2) << ","
+        << row.x_pred(0) << "," << row.x_pred(1) << "," << row.x_pred(2) << ","
+        << row.v_pred(0) << "," << row.v_pred(1) << "," << row.v_pred(2) << ","
+        << row.x_next(0) << "," << row.x_next(1) << "," << row.x_next(2) << ","
+        << row.v_next(0) << "," << row.v_next(1) << "," << row.v_next(2) << ","
+        << row.a_pred(0) << "," << row.a_pred(1) << "," << row.a_pred(2) << ","
+        << row.d_pred << "," << row.d_next << "," << row.d_segment << ","
+        << static_cast<int>(row.contact_possible) << ","
+        << row.k_n << "," << row.e_n << "," << row.v_n << ","
+        << row.T_n_ub << "," << row.V_n_ub << ","
+        << static_cast<int>(is_worst_T) << "," << static_cast<int>(is_worst_V) << ","
+        << row.Kx << "," << row.Ky << "," << row.Kz << ","
+        << row.Dx << "," << row.Dy << "," << row.Dz << ","
+        << monitor.worst_case_Tn_ub << ","
+        << monitor.worst_case_V_potential_ub << ","
+        << monitor.terminal_energy_ub << ","
+        << monitor.h_geom << ","
+        << monitor.h_clamping_energy << "\n";
+  }
+
+  ++prediction_log_write_counter_;
+  if ((prediction_log_write_counter_ % 50) == 0) {
+    prediction_log_file_.flush();
   }
 }
 
@@ -1432,6 +1653,23 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       last_shield_decision_valid_ = true;
       last_async_output_wall_time_ = async_output.input_wall_time;
       last_async_output_valid_ = true;
+      if (async_output.decision.has_evaluated_plan) {
+        logShieldPredictionTrajectory(
+            async_output.input.wall_time,
+            async_output.input.nominal_guess_time,
+            async_output.input.current_position,
+            async_output.input.current_orientation,
+            async_output.input.ee_twist,
+            async_output.input.inertia,
+            async_output.input.Jv,
+            async_output.input.K_runtime,
+            async_output.input.D_runtime,
+            async_output.decision.evaluated_plan,
+            async_output.decision.monitor,
+            async_output.decision.candidate_verified,
+            async_output.decision.executing_last_verified_failsafe,
+            "async");
+      }
     }
 
     const bool output_is_fresh =
@@ -1459,6 +1697,23 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                                          ee_twist, inertia, Jv_collision);
       last_shield_decision_ = shield_dec;
       last_shield_decision_valid_ = true;
+      if (shield_dec.has_evaluated_plan) {
+        logShieldPredictionTrajectory(
+            wall_time,
+            nominal_guess_time,
+            current_position,
+            current_orientation,
+            ee_twist,
+            inertia,
+            Jv_collision,
+            K_runtime_,
+            D_runtime_,
+            shield_dec.evaluated_plan,
+            shield_dec.monitor,
+            shield_dec.candidate_verified,
+            shield_dec.executing_last_verified_failsafe,
+            "sync");
+      }
     } else {
       shield_dec = last_shield_decision_;
       if (mode_ == SafetyMode::kFailsafe || shield_dec.executing_last_verified_failsafe) {
@@ -1673,6 +1928,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
         "");
     auto_declare<std::string>("error_log_root_dir", kDefaultErrorLogRootDir);
     auto_declare<std::string>("error_log_file_name", kDefaultErrorLogFileName);
+    auto_declare<bool>("enable_prediction_logging", true);
+    auto_declare<std::string>(
+        "prediction_log_file_name",
+        "shield_prediction_trajectory.csv");
 
     auto_declare<bool>("use_constant_reference", false);
     auto_declare<std::string>("reference_trajectory_type", "lissajous");
@@ -1775,6 +2034,11 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     legacy_error_log_path_ = get_node()->get_parameter("error_log_path").as_string();
     error_log_root_dir_ = get_node()->get_parameter("error_log_root_dir").as_string();
     error_log_file_name_ = get_node()->get_parameter("error_log_file_name").as_string();
+    enable_prediction_logging_ =
+        get_node()->get_parameter("enable_prediction_logging").as_bool();
+    prediction_log_file_name_ = sanitizedFileNameOrDefault(
+        get_node()->get_parameter("prediction_log_file_name").as_string(),
+        "shield_prediction_trajectory.csv");
 
     if (error_log_root_dir_.empty()) {
       error_log_root_dir_ = kDefaultErrorLogRootDir;
@@ -2005,6 +2269,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   prof_io_sum_ms_ = 0.0;
   prof_io_max_ms_ = 0.0;
   log_write_counter_ = 0;
+  prediction_log_write_counter_ = 0;
   prev_Tn_fs_ = 0.0; prev_Tn_fs_valid_ = false; last_v_n_fs_ = 0.0;
   latest_mujoco_contact_value_.store(0.0);
   latest_mujoco_contact_msg_time_.store(-1.0);
@@ -2049,6 +2314,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         (root_dir / makeBerlinTimestampForDirectoryName()).string();
     error_log_file_path_ =
         (std::filesystem::path(error_log_run_dir_) / error_log_file_name_).string();
+    prediction_log_file_path_ =
+        (std::filesystem::path(error_log_run_dir_) / prediction_log_file_name_).string();
 
     std::error_code ec;
     std::filesystem::create_directories(error_log_run_dir_, ec);
@@ -2067,6 +2334,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
     if (run_info_file.is_open()) {
       run_info_file << "run_directory: " << error_log_run_dir_ << "\n"
                     << "csv_file: " << error_log_file_path_ << "\n"
+                    << "prediction_csv_file: " << prediction_log_file_path_ << "\n"
                     << "arm_id: " << arm_id_ << "\n"
                     << "reference_trajectory_type: " << reference_trajectory_type_ << "\n"
                     << "use_constant_reference: " << static_cast<int>(use_constant_reference_) << "\n"
@@ -2153,6 +2421,42 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         get_node()->get_logger(),
         "Validation log enabled: %s",
         error_log_file_path_.c_str());
+
+    if (enable_prediction_logging_) {
+      prediction_log_file_.open(prediction_log_file_path_, std::ios::out | std::ios::trunc);
+      if (!prediction_log_file_.is_open()) {
+        RCLCPP_ERROR(
+            get_node()->get_logger(),
+            "Failed to open shield prediction log file: %s",
+            prediction_log_file_path_.c_str());
+        return CallbackReturn::ERROR;
+      }
+      prediction_log_file_ << std::fixed << std::setprecision(9);
+      prediction_log_file_
+          << "wall_time_sec,nominal_time_sec,source,mode,candidate_verified,"
+          << "executing_failsafe,predicted_trigger,monitored_contact_possible,"
+          << "stage,index,is_failsafe_sample,sample_t,dt,"
+          << "actual_tcp_px,actual_tcp_py,actual_tcp_pz,"
+          << "actual_collision_px,actual_collision_py,actual_collision_pz,"
+          << "actual_collision_distance,"
+          << "flange_target_px,flange_target_py,flange_target_pz,"
+          << "collision_target_px,collision_target_py,collision_target_pz,"
+          << "pred_start_px,pred_start_py,pred_start_pz,"
+          << "pred_start_vx,pred_start_vy,pred_start_vz,"
+          << "pred_next_px,pred_next_py,pred_next_pz,"
+          << "pred_next_vx,pred_next_vy,pred_next_vz,"
+          << "pred_ax,pred_ay,pred_az,"
+          << "distance_start,distance_next,distance_segment,"
+          << "contact_possible,k_n,e_n,v_n,T_n_ub,V_potential_ub,"
+          << "is_worst_T,is_worst_V,"
+          << "Kx,Ky,Kz,Dx,Dy,Dz,"
+          << "monitor_worst_case_Tn_ub,monitor_worst_case_V_potential_ub,"
+          << "monitor_terminal_energy_ub,monitor_h_geom,monitor_h_clamping_energy\n";
+      RCLCPP_INFO(
+          get_node()->get_logger(),
+          "Shield prediction log enabled: %s",
+          prediction_log_file_path_.c_str());
+    }
   }
   startSafetyMonitorWorker();
   return CallbackReturn::SUCCESS;
@@ -2162,6 +2466,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_deactivate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   stopSafetyMonitorWorker();
   if (error_log_file_.is_open()) { error_log_file_.flush(); error_log_file_.close(); }
+  if (prediction_log_file_.is_open()) {
+    prediction_log_file_.flush();
+    prediction_log_file_.close();
+  }
   J_geo_prev_.setZero();
   Jdot_dq_filtered_.setZero();
   J_geo_prev_valid_ = false;

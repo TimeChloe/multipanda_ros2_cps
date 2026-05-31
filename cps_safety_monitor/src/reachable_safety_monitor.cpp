@@ -61,6 +61,8 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   const double v_n_now_raw = n.dot(v_pred);
   out.v_n_now = v_n_now_raw;
   out.Tn_now = 0.5 * out.m_eff_n * v_n_now_raw * v_n_now_raw;
+  out.v_n_now_tube = std::abs(v_n_now_raw) + rho_v;
+  out.Tn_now_tube = 0.5 * out.m_eff_n * out.v_n_now_tube * out.v_n_now_tube;
 
   out.v_safe = std::sqrt(
       std::max(
@@ -83,8 +85,16 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   Matrix6d K_exec = config.K_runtime;
   Matrix6d D_exec = config.D_runtime;
 
-  double T_n_max = 0.0;
-  double V_n_max = 0.0;
+  const Matrix3d Kp_now = K_exec.topLeftCorner<3, 3>();
+  const double k_n_now = std::max((n.transpose() * Kp_now * n)(0, 0), 0.0);
+  const double e_n_now = std::abs(n.dot(current_position - plan.anchor.p)) + rho_p;
+  const double V_n_now_tube = 0.5 * k_n_now * e_n_now * e_n_now;
+
+  double T_n_max = out.Tn_now_tube;
+  double V_n_max = V_n_now_tube;
+  out.worst_case_v_n_ub = out.v_n_now_tube;
+  out.worst_case_Tn_ub = T_n_max;
+  out.worst_case_V_potential_ub = V_n_max;
 
   double terminal_T_ub = 0.0;
   double terminal_V_ub = 0.0;
@@ -140,28 +150,28 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     const double T_n_ub = 0.5 * out.m_eff_n * v_n * v_n;
     const double V_n_ub = 0.5 * k_n * e_n * e_n;
 
+    if (T_n_ub > T_n_max) {
+      T_n_max = T_n_ub;
+
+      out.worst_case_contact_time = s.t;
+      out.worst_case_plane_distance_at_candidate = std::min(d_pred, d_next);
+      out.worst_case_nominal_forward_progress = n.dot(x_next - current_position);
+      out.worst_case_v_n_ub = v_n;
+      out.worst_case_Tn_ub = T_n_ub;
+
+      out.worst_case_a_pos = 0.0;
+      out.worst_case_a_brake = 0.0;
+      out.worst_case_a_net = 0.0;
+    }
+
+    if (V_n_ub > V_n_max) {
+      V_n_max = V_n_ub;
+      out.worst_case_V_potential_ub = V_n_ub;
+    }
+
     if (contact_possible_step) {
       out.monitored_contact_possible = true;
-
-      if (T_n_ub > T_n_max) {
-        T_n_max = T_n_ub;
-
-        out.worst_case_contact_found = true;
-        out.worst_case_contact_time = s.t;
-        out.worst_case_plane_distance_at_candidate = std::min(d_pred, d_next);
-        out.worst_case_nominal_forward_progress = n.dot(x_next - current_position);
-        out.worst_case_v_n_ub = v_n;
-        out.worst_case_Tn_ub = T_n_ub;
-
-        out.worst_case_a_pos = 0.0;
-        out.worst_case_a_brake = 0.0;
-        out.worst_case_a_net = 0.0;
-      }
-
-      if (V_n_ub > V_n_max) {
-        V_n_max = V_n_ub;
-        out.worst_case_V_potential_ub = V_n_ub;
-      }
+      out.worst_case_contact_found = true;
 
       if (!s.failsafe && !out.nominal_contact_sample_found) {
         Vector3d x_contact = Vector3d::Zero();
@@ -224,17 +234,24 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
 
   const double L_F_eff = std::min(L_TF_eff, L_QS_eff);
 
-  out.h_monitored_energy = L_TF_eff - out.worst_case_Tn_ub;
-  out.h_clamping_energy = L_QS_eff - out.worst_case_V_potential_ub;
-  out.h_terminal_energy = L_F_eff - out.terminal_energy_ub;
-
-  out.collision_energy_unsafe = out.worst_case_Tn_ub > L_TF_eff;
-  out.clamping_energy_unsafe = out.worst_case_V_potential_ub > L_QS_eff;
-  out.terminal_energy_unsafe = out.terminal_energy_ub > L_F_eff;
-
   out.contact_relevant_for_energy =
       out.monitored_contact_possible ||
       out.plane_distance_min <= std::max(0.0, config.contact_activation_margin);
+
+  const bool current_collision_energy_unsafe =
+      out.contact_relevant_for_energy && out.Tn_now_tube > L_TF_eff;
+  const double monitored_collision_energy_ub =
+      std::max(out.worst_case_Tn_ub,
+               out.contact_relevant_for_energy ? out.Tn_now_tube : 0.0);
+
+  out.h_monitored_energy = L_TF_eff - monitored_collision_energy_ub;
+  out.h_clamping_energy = L_QS_eff - out.worst_case_V_potential_ub;
+  out.h_terminal_energy = L_F_eff - out.terminal_energy_ub;
+
+  out.collision_energy_unsafe =
+      out.worst_case_Tn_ub > L_TF_eff || current_collision_energy_unsafe;
+  out.clamping_energy_unsafe = out.worst_case_V_potential_ub > L_QS_eff;
+  out.terminal_energy_unsafe = out.terminal_energy_ub > L_F_eff;
 
   out.monitored_unsafe =
       out.contact_relevant_for_energy &&
