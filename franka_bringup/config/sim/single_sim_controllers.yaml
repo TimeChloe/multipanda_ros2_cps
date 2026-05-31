@@ -15,7 +15,7 @@ mujoco_server:
           robot_description: "robot_description"
           # Options: "friction" keeps MJCF joint damping/frictionloss;
           # "no_friction" zeros damping/frictionloss on Panda arm joints.
-          panda_model_variant: "no_friction"
+          panda_model_variant: "friction"
       mujoco_ros2_sensors:
         type: mujoco_ros::sensors::MujocoRos2SensorsPlugin
 
@@ -243,8 +243,7 @@ reachable_cartesian_impedance_controller:
     tracking_pos_error_bound: 0.000
     tracking_vel_error_bound: 0.0
 
-    # monitored trajectory = intended + failsafe
-    shield_horizon_steps: 100
+    # monitored trajectory uses the Ruckig brake result length for failsafe
     shield_plan_dt: 0.001
 
     # Ruckig 局部重规划与意图缓存参数
@@ -254,6 +253,9 @@ reachable_cartesian_impedance_controller:
     local_replan_max_velocity: 0.5
     local_replan_max_acceleration: 1.5
     local_replan_max_jerk: 5.0
+    failsafe_brake_max_velocity: 0.8
+    failsafe_brake_max_acceleration: 2.0
+    failsafe_brake_max_jerk: 80.0
 
     path_retiming_search_window_sec: 0.25
     path_retiming_search_steps: 41
@@ -263,7 +265,7 @@ reachable_cartesian_impedance_controller:
     path_time_rate_target: 1.0
 
     use_dynamic_consistent_impedance: true
-    torque_rate_limit: 600.0
+    torque_rate_limit: 1000.0
 
     dynamic_lambda_regularization: 1.0e-6
     jdot_dq_filter_alpha: 0.15
@@ -280,8 +282,6 @@ reachable_cartesian_impedance_controller:
     rviz_arrow_shaft_diameter: 0.01
     rviz_arrow_head_diameter: 0.02
     rviz_arrow_head_length: 0.03
-    rviz_text_scale: 0.04
-    rviz_text_z_offset: 0.12
     rviz_ub_arrow_z_offset: 0.05
 
     profiling_stats_print_period: 1000

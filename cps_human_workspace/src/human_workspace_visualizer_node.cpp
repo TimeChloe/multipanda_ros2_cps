@@ -108,9 +108,6 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     arrow_shaft_diameter_ = declare_parameter<double>("arrow_shaft_diameter", 0.01);
     arrow_head_diameter_ = declare_parameter<double>("arrow_head_diameter", 0.02);
     arrow_head_length_ = declare_parameter<double>("arrow_head_length", 0.03);
-    text_scale_ = declare_parameter<double>("text_scale", 0.04);
-    text_z_offset_ = declare_parameter<double>("text_z_offset", 0.12);
-
     const bool configured =
         config_path.empty()
             ? workspace_.configureFromDefaultConfig(get_logger())
@@ -210,17 +207,7 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     {
       Marker marker;
       setupMarker(marker, 4, "human_workspace_status", Marker::TEXT_VIEW_FACING);
-      marker.pose.position = toPoint(center + Vector3d(0.0, 0.0, text_z_offset_));
-      marker.pose.orientation.w = 1.0;
-      marker.scale.z = text_scale_;
-      marker.color = makeColor(1.0f, 1.0f, 1.0f, 0.95f);
-
-      std::ostringstream text;
-      text << "human workspace  center=["
-           << center.x() << ", " << center.y() << ", " << center.z() << "]"
-           << "  r_motion=" << workspace_.motionRadius()
-           << "  r_hand=" << workspace_.handRadius();
-      marker.text = text.str();
+      marker.action = Marker::DELETE;
       array.markers.push_back(marker);
     }
 
@@ -302,16 +289,7 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     {
       Marker marker;
       setupMarker(marker, 13, "ee_collision_status", Marker::TEXT_VIEW_FACING);
-      marker.pose.position =
-          toPoint(collision_center + Vector3d(0.0, 0.0, text_z_offset_));
-      marker.pose.orientation.w = 1.0;
-      marker.scale.z = text_scale_;
-      marker.color = makeColor(0.8f, 1.0f, 0.9f, 0.95f);
-
-      std::ostringstream text;
-      text << "EE collision area  r=" << ee_collision_radius_
-           << "  monitored=" << monitored_radius;
-      marker.text = text.str();
+      marker.action = Marker::DELETE;
       array.markers.push_back(marker);
     }
   }
@@ -332,9 +310,6 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
   double arrow_shaft_diameter_{0.01};
   double arrow_head_diameter_{0.02};
   double arrow_head_length_{0.03};
-  double text_scale_{0.04};
-  double text_z_offset_{0.12};
-
   rclcpp::Publisher<MarkerArray>::SharedPtr marker_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;

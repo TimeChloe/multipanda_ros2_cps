@@ -337,7 +337,6 @@ class ReachableCartesianImpedanceController
   double tracking_pos_error_bound_{0.000};
   double tracking_vel_error_bound_{0.00};
 
-  int shield_horizon_steps_{100};
   double shield_plan_dt_{0.01};
 
   double path_retiming_search_window_sec_{0.25};
@@ -353,6 +352,9 @@ class ReachableCartesianImpedanceController
   double local_replan_max_velocity_{0.08};
   double local_replan_max_acceleration_{0.4};
   double local_replan_max_jerk_{2.0};
+  double failsafe_brake_max_velocity_{1.0};
+  double failsafe_brake_max_acceleration_{4.0};
+  double failsafe_brake_max_jerk_{80.0};
 
   bool use_dynamic_consistent_impedance_{true};
   double torque_rate_limit_{1000.0};
@@ -431,8 +433,6 @@ class ReachableCartesianImpedanceController
   double rviz_arrow_head_diameter_{0.02};
   double rviz_arrow_head_length_{0.03};
 
-  double rviz_text_scale_{0.04};
-  double rviz_text_z_offset_{0.12};
   double rviz_ub_arrow_z_offset_{0.05};
 
   int profiling_stats_print_period_{1000};

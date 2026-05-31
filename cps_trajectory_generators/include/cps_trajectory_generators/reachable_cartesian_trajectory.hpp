@@ -82,4 +82,8 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplan(
     ReferenceTrajectoryType traj_type,
     const LocalCartesianReplanConfig& config);
 
+std::vector<CartesianTrajectorySample> makeCartesianBrakeTrajectory(
+    const CartesianTrajectorySample& brake_start,
+    const LocalCartesianReplanConfig& config);
+
 }  // namespace cps_trajectory_generators

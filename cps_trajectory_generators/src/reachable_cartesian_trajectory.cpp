@@ -363,4 +363,76 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplan(
   return samples;
 }
 
+std::vector<CartesianTrajectorySample> makeCartesianBrakeTrajectory(
+    const CartesianTrajectorySample& brake_start,
+    const LocalCartesianReplanConfig& config) {
+  std::vector<CartesianTrajectorySample> samples;
+
+  const double dt = std::max(config.dt, kMinDt);
+  const double max_velocity = std::max(config.max_velocity, 1e-4);
+  const double max_acceleration = std::max(config.max_acceleration, 1e-4);
+  const double max_jerk = std::max(config.max_jerk, 1e-4);
+
+  ruckig::Ruckig<3> otg;
+  ruckig::InputParameter<3> input;
+  ruckig::Trajectory<3> trajectory;
+
+  input.control_interface = ruckig::ControlInterface::Velocity;
+
+  input.current_position = {
+      brake_start.p.x(),
+      brake_start.p.y(),
+      brake_start.p.z()};
+
+  input.current_velocity = {
+      brake_start.dp.x(),
+      brake_start.dp.y(),
+      brake_start.dp.z()};
+
+  input.current_acceleration = {
+      brake_start.ddp.x(),
+      brake_start.ddp.y(),
+      brake_start.ddp.z()};
+
+  input.target_velocity = {0.0, 0.0, 0.0};
+  input.target_acceleration = {0.0, 0.0, 0.0};
+
+  input.max_velocity = {max_velocity, max_velocity, max_velocity};
+  input.max_acceleration = {max_acceleration, max_acceleration, max_acceleration};
+  input.max_jerk = {max_jerk, max_jerk, max_jerk};
+
+  const auto result = otg.calculate(input, trajectory);
+  if (result < ruckig::Result::Working) {
+    return {};
+  }
+
+  const double duration = std::max(trajectory.get_duration(), dt);
+  const int n_steps =
+      std::max(1, static_cast<int>(std::ceil(duration / dt)));
+
+  samples.reserve(static_cast<std::size_t>(n_steps));
+
+  for (int i = 0; i < n_steps; ++i) {
+    const double tau = std::min(static_cast<double>(i + 1) * dt, duration);
+
+    std::array<double, 3> p{}, v{}, a{};
+    trajectory.at_time(tau, p, v, a);
+
+    CartesianTrajectorySample s;
+    s.t = static_cast<double>(i + 1) * dt;
+    s.p = Eigen::Vector3d(p[0], p[1], p[2]);
+    s.dp = Eigen::Vector3d(v[0], v[1], v[2]);
+    s.ddp = Eigen::Vector3d(a[0], a[1], a[2]);
+    s.q = brake_start.q;
+    s.q.normalize();
+    if (i + 1 == n_steps) {
+      s.dp.setZero();
+      s.ddp.setZero();
+    }
+    samples.push_back(s);
+  }
+
+  return samples;
+}
+
 }  // namespace cps_trajectory_generators

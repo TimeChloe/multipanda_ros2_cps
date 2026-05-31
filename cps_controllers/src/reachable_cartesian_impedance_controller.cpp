@@ -332,6 +332,7 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
     double wall_time, const Vector3d& current_position,
     const Vector3d& desired_position_cur, const Vector6d& ee_twist,
     const MonitorResult& monitor) {
+  (void)wall_time;
   (void)ee_twist;
   if (!rviz_enable_markers_ || !rviz_marker_pub_) return;
   ++rviz_publish_counter_;
@@ -413,25 +414,7 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
       arr.markers.push_back(m);
     } else { m.action = Marker::DELETE; arr.markers.push_back(m); } }
   { Marker m; setupMarker(m, 10, "reachable_status_text", Marker::TEXT_VIEW_FACING);
-    m.pose.position = toPoint(current_position + Vector3d(0.0, 0.0, rviz_text_z_offset_));
-    m.pose.orientation.w = 1.0;
-    m.scale.z = rviz_text_scale_;
-    m.color = makeColor(1.0f, 1.0f, 1.0f, 0.95f);
-    std::ostringstream ss;
-    ss << std::fixed << std::setprecision(3)
-       << "mode=" << static_cast<int>(mode_)
-       << "  d=" << monitor.plane_distance_now
-       << "  rp=" << monitor.current_pos_error_radius
-       << "  rv=" << monitor.current_vel_error_radius
-       << "  Tn_nom=" << monitor.Tn_contact_nominal
-       << "  Tn_ub=" << monitor.worst_case_Tn_ub
-       << "  V_ub=" << monitor.worst_case_V_potential_ub
-       << "  hV=" << monitor.h_clamping_energy
-       << "  trig=" << static_cast<int>(monitor.predicted_trigger)
-       << "  EF=" << monitor.terminal_energy_ub
-       << "  hF=" << monitor.h_terminal_energy
-       << "  wall_t=" << wall_time;
-    m.text = ss.str();
+    m.action = Marker::DELETE;
     arr.markers.push_back(m); }
 
   rviz_marker_pub_->publish(arr);
@@ -656,11 +639,38 @@ VerifiedPlan ReachableCartesianImpedanceController::buildSingleStepCandidatePlan
   plan.intended.push_back(step);
 
   const ImpedanceSample freeze_anchor = step;
-  const int N_fs = std::max(1, shield_horizon_steps_);
   const double dtp_fs = std::max(shield_plan_dt_, kMinDt);
 
   auto fill_failsafe_prefix = [&](const Matrix6d& K_terminal) {
     plan.failsafe.clear();
+
+    CartesianTrajectorySample brake_start;
+    brake_start.t = freeze_anchor.t;
+    brake_start.p = freeze_anchor.p;
+    brake_start.dp = freeze_anchor.dp;
+    brake_start.ddp = freeze_anchor.ddp;
+    brake_start.q = freeze_anchor.q;
+    brake_start.q.normalize();
+    brake_start.w = freeze_anchor.w;
+    brake_start.dw = freeze_anchor.dw;
+
+    LocalCartesianReplanConfig brake_config;
+    brake_config.dt = dtp_fs;
+    brake_config.max_velocity = failsafe_brake_max_velocity_;
+    brake_config.max_acceleration = failsafe_brake_max_acceleration_;
+    brake_config.max_jerk = failsafe_brake_max_jerk_;
+
+    const auto brake_samples =
+        makeCartesianBrakeTrajectory(brake_start, brake_config);
+
+    if (brake_samples.empty()) {
+      const double tk = freeze_anchor.t + dtp_fs;
+      plan.failsafe.push_back(
+          makeFrozenFailsafeSample(tk, freeze_anchor, K_terminal, D_f_target_));
+      return;
+    }
+
+    const int N_fs = static_cast<int>(brake_samples.size());
     plan.failsafe.reserve(static_cast<std::size_t>(N_fs));
 
     for (int i = 0; i < N_fs; ++i) {
@@ -679,8 +689,20 @@ VerifiedPlan ReachableCartesianImpedanceController::buildSingleStepCandidatePlan
               failsafe_pos_damping_scale_,
               failsafe_rot_damping_scale_);
 
-      plan.failsafe.push_back(
-          makeFrozenFailsafeSample(tk, freeze_anchor, K_sched, D_sched));
+      ImpedanceSample s;
+      const auto& brake = brake_samples[static_cast<std::size_t>(i)];
+      s.t = tk;
+      s.p = brake.p;
+      s.dp = brake.dp;
+      s.ddp = brake.ddp;
+      s.q = brake.q;
+      s.q.normalize();
+      s.w = brake.w;
+      s.dw = brake.dw;
+      s.K = K_sched;
+      s.D = D_sched;
+      s.failsafe = true;
+      plan.failsafe.push_back(s);
     }
   };
 
@@ -1408,6 +1430,8 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
         << static_cast<int>(executing_failsafe) << ","
         << static_cast<int>(monitor.predicted_trigger) << ","
         << static_cast<int>(monitor.monitored_contact_possible) << ","
+        << evaluated_plan.intended.size() << ","
+        << evaluated_plan.failsafe.size() << ","
         << row.stage << "," << row.index << ","
         << static_cast<int>(row.failsafe) << ","
         << row.sample_t << "," << row.dt << ","
@@ -1772,6 +1796,16 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   const Vector3d desired_position_cur = shield_dec.command.p;
   const Quaterniond desired_orientation_cur = shield_dec.command.q;
   const Vector3d desired_linear_velocity_cur = shield_dec.command.dp;
+  const std::size_t monitored_intended_steps =
+      (shield_dec.has_evaluated_plan && shield_dec.evaluated_plan.valid)
+          ? shield_dec.evaluated_plan.intended.size()
+          : 0;
+  const std::size_t monitored_failsafe_steps =
+      (shield_dec.has_evaluated_plan && shield_dec.evaluated_plan.valid)
+          ? shield_dec.evaluated_plan.failsafe.size()
+          : 0;
+  const std::size_t monitored_total_steps =
+      monitored_intended_steps + monitored_failsafe_steps;
 
   Vector6d error = Vector6d::Zero();
   error.head<3>() = current_position - desired_position_cur;
@@ -1876,6 +1910,9 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << static_cast<int>(monitor.terminal_energy_unsafe) << ","
         << static_cast<int>(monitor.monitored_unsafe) << ","
         << static_cast<int>(monitor.predicted_trigger) << ","
+        << monitored_intended_steps << ","
+        << monitored_failsafe_steps << ","
+        << monitored_total_steps << ","
         << latest_mujoco_contact_value_.load(std::memory_order_relaxed) << ","
         << static_cast<int>(latest_mujoco_contact_active_.load(std::memory_order_relaxed)) << ","
         << latest_mujoco_contact_msg_time_.load(std::memory_order_relaxed) << ","
@@ -1996,7 +2033,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("tracking_pos_error_bound", 0.005);
     auto_declare<double>("tracking_vel_error_bound", 0.05);
 
-    auto_declare<int>("shield_horizon_steps", 100);
     auto_declare<double>("shield_plan_dt", 0.01);
 
     auto_declare<double>("path_retiming_search_window_sec", 0.25);
@@ -2012,6 +2048,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("local_replan_max_velocity", 0.08);
     auto_declare<double>("local_replan_max_acceleration", 0.4);
     auto_declare<double>("local_replan_max_jerk", 2.0);
+    auto_declare<double>("failsafe_brake_max_velocity", 1.0);
+    auto_declare<double>("failsafe_brake_max_acceleration", 4.0);
+    auto_declare<double>("failsafe_brake_max_jerk", 80.0);
 
     auto_declare<bool>("use_dynamic_consistent_impedance", true);
     auto_declare<double>("torque_rate_limit", 1000.0);
@@ -2032,8 +2071,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("rviz_arrow_shaft_diameter", 0.01);
     auto_declare<double>("rviz_arrow_head_diameter", 0.02);
     auto_declare<double>("rviz_arrow_head_length", 0.03);
-    auto_declare<double>("rviz_text_scale", 0.04);
-    auto_declare<double>("rviz_text_z_offset", 0.12);
     auto_declare<double>("rviz_ub_arrow_z_offset", 0.05);
 
     auto_declare<int>("profiling_stats_print_period", 1000);
@@ -2141,7 +2178,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     tracking_pos_error_bound_ = std::max(0.0, get_node()->get_parameter("tracking_pos_error_bound").as_double());
     tracking_vel_error_bound_ = std::max(0.0, get_node()->get_parameter("tracking_vel_error_bound").as_double());
 
-    shield_horizon_steps_ = std::max(1, static_cast<int>(get_node()->get_parameter("shield_horizon_steps").as_int()));
     shield_plan_dt_ = std::max(get_node()->get_parameter("shield_plan_dt").as_double(), kMinDt);
 
     path_retiming_search_window_sec_ = std::max(get_node()->get_parameter("path_retiming_search_window_sec").as_double(), 0.0);
@@ -2158,6 +2194,12 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     local_replan_max_velocity_ = std::max(1e-4, get_node()->get_parameter("local_replan_max_velocity").as_double());
     local_replan_max_acceleration_ = std::max(1e-4, get_node()->get_parameter("local_replan_max_acceleration").as_double());
     local_replan_max_jerk_ = std::max(1e-4, get_node()->get_parameter("local_replan_max_jerk").as_double());
+    failsafe_brake_max_velocity_ =
+        std::min(1.7, std::max(1e-4, get_node()->get_parameter("failsafe_brake_max_velocity").as_double()));
+    failsafe_brake_max_acceleration_ =
+        std::min(13.0, std::max(1e-4, get_node()->get_parameter("failsafe_brake_max_acceleration").as_double()));
+    failsafe_brake_max_jerk_ =
+        std::min(6500.0, std::max(1e-4, get_node()->get_parameter("failsafe_brake_max_jerk").as_double()));
 
     use_dynamic_consistent_impedance_ = get_node()->get_parameter("use_dynamic_consistent_impedance").as_bool();
     torque_rate_limit_ = get_node()->get_parameter("torque_rate_limit").as_double();
@@ -2184,8 +2226,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     rviz_arrow_shaft_diameter_ = get_node()->get_parameter("rviz_arrow_shaft_diameter").as_double();
     rviz_arrow_head_diameter_ = get_node()->get_parameter("rviz_arrow_head_diameter").as_double();
     rviz_arrow_head_length_ = get_node()->get_parameter("rviz_arrow_head_length").as_double();
-    rviz_text_scale_ = get_node()->get_parameter("rviz_text_scale").as_double();
-    rviz_text_z_offset_ = get_node()->get_parameter("rviz_text_z_offset").as_double();
     rviz_ub_arrow_z_offset_ = get_node()->get_parameter("rviz_ub_arrow_z_offset").as_double();
 
     if (!human_workspace_.configureFromParameters(get_node(), get_node()->get_logger())) {
@@ -2441,6 +2481,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "monitored_contact_possible,contact_relevant_for_energy,"
         << "collision_energy_unsafe,clamping_energy_unsafe,"
         << "terminal_energy_unsafe,monitored_unsafe,predicted_trigger,"
+        << "monitored_intended_steps,monitored_failsafe_steps,monitored_total_steps,"
         << "mujoco_contact_value,mujoco_contact_active,mujoco_contact_msg_time_sec,"
         << "mujoco_first_contact_seen,mujoco_first_contact_wall_time_sec,"
         << "mujoco_first_contact_msg_time_sec\n";
@@ -2462,6 +2503,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
       prediction_log_file_
           << "wall_time_sec,nominal_time_sec,source,mode,candidate_verified,"
           << "executing_failsafe,predicted_trigger,monitored_contact_possible,"
+          << "plan_intended_steps,plan_failsafe_steps,"
           << "stage,index,is_failsafe_sample,sample_t,dt,"
           << "actual_tcp_px,actual_tcp_py,actual_tcp_pz,"
           << "actual_collision_px,actual_collision_py,actual_collision_pz,"
