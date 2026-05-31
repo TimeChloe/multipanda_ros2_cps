@@ -11,7 +11,8 @@ namespace cps_trajectory_generators {
 enum class ReferenceTrajectoryType {
   kLine,
   kLissajous,
-  kConstant
+  kConstant,
+  kViaPointsSmooth
 };
 
 struct SmoothStartProfile {
@@ -45,6 +46,34 @@ struct LocalCartesianReplanConfig {
   double max_acceleration{0.4};
   double max_jerk{2.0};
 };
+
+struct TrajectoryGeneratorSettings {
+  double shield_plan_dt{0.001};
+  double monitor_frequency_hz{50.0};
+
+  int local_replan_horizon_steps{500};
+  double local_replan_dt{0.001};
+  double local_path_lookahead_sec{0.50};
+  double local_replan_max_velocity{0.5};
+  double local_replan_max_acceleration{1.5};
+  double local_replan_max_jerk{5.0};
+
+  double failsafe_brake_max_velocity{0.8};
+  double failsafe_brake_max_acceleration{2.0};
+  double failsafe_brake_max_jerk{80.0};
+
+  double path_retiming_search_window_sec{0.25};
+  int path_retiming_search_steps{41};
+  double path_time_rate_min{0.0};
+  double path_time_rate_max{1.0};
+  double path_time_acc_limit{0.5};
+  double path_time_rate_target{1.0};
+};
+
+std::string defaultTrajectoryGeneratorConfigPath();
+
+TrajectoryGeneratorSettings loadTrajectoryGeneratorSettings(
+    const std::string& config_path = "");
 
 ReferenceTrajectoryType parseReferenceTrajectoryType(const std::string& name);
 
@@ -80,6 +109,17 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplan(
     const Eigen::Vector3d& reference_position,
     const Eigen::Quaterniond& reference_orientation,
     ReferenceTrajectoryType traj_type,
+    const LocalCartesianReplanConfig& config);
+
+std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
+    const std::vector<Eigen::Vector3d>& waypoints,
+    const Eigen::Quaterniond& reference_orientation,
+    const LocalCartesianReplanConfig& config);
+
+std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
+    double min_path_time,
+    const CartesianTrajectorySample& planning_start,
+    const std::vector<CartesianTrajectorySample>& timed_path,
     const LocalCartesianReplanConfig& config);
 
 std::vector<CartesianTrajectorySample> makeCartesianBrakeTrajectory(

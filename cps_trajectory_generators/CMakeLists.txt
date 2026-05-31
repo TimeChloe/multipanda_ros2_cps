@@ -6,6 +6,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 find_package(ament_cmake REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(ruckig REQUIRED)
 
@@ -22,6 +23,7 @@ target_include_directories(${PROJECT_NAME}
 target_link_libraries(${PROJECT_NAME}
   PUBLIC
     Eigen3::Eigen
+    ament_index_cpp::ament_index_cpp
   PRIVATE
     ruckig::ruckig
 )
@@ -39,10 +41,15 @@ install(
   DESTINATION include
 )
 
+install(
+  DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
+)
+
 ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME})
 ament_export_targets(export_${PROJECT_NAME})
-ament_export_dependencies(Eigen3 ruckig)
+ament_export_dependencies(ament_index_cpp Eigen3 ruckig)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)

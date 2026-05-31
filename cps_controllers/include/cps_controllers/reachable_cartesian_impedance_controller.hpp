@@ -21,6 +21,7 @@
 
 #include "cps_human_workspace/human_workspace.hpp"
 #include "cps_safety_monitor/reachable_safety_monitor.hpp"
+#include "cps_trajectory_generators/reachable_cartesian_trajectory.hpp"
 #include "franka_semantic_components/franka_robot_model.hpp"
 
 using CallbackReturn =
@@ -289,6 +290,10 @@ class ReachableCartesianImpedanceController
   std::string arm_id_;
   std::string reference_trajectory_type_{"line"};
   bool use_constant_reference_{false};
+  bool cartesian_via_points_relative_{false};
+  std::vector<Vector3d> cartesian_via_points_;
+  std::vector<cps_trajectory_generators::CartesianTrajectorySample>
+      cartesian_via_point_path_;
 
   std::unique_ptr<franka_semantic_components::FrankaRobotModel> franka_robot_model_;
 
@@ -357,6 +362,7 @@ class ReachableCartesianImpedanceController
   double failsafe_brake_max_velocity_{1.0};
   double failsafe_brake_max_acceleration_{4.0};
   double failsafe_brake_max_jerk_{80.0};
+  std::string trajectory_generator_config_path_;
 
   bool use_dynamic_consistent_impedance_{true};
   double torque_rate_limit_{1000.0};
@@ -448,6 +454,8 @@ class ReachableCartesianImpedanceController
   std::atomic<double> latest_mujoco_contact_value_{0.0};
   std::atomic<double> latest_mujoco_contact_msg_time_{-1.0};
   std::atomic<bool> latest_mujoco_contact_active_{false};
+  std::atomic<std::uint64_t> latest_mujoco_contact_sequence_{0};
+  std::uint64_t last_logged_mujoco_contact_sequence_{0};
   std::atomic<bool> mujoco_first_contact_seen_{false};
   std::atomic<double> mujoco_first_contact_wall_time_{-1.0};
   std::atomic<double> mujoco_first_contact_msg_time_{-1.0};

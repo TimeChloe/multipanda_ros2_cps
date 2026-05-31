@@ -1,0 +1,23 @@
+# Reachable Cartesian trajectory generator settings.
+# Controller ROS parameters should only choose the task, not tune Ruckig internals.
+
+shield_plan_dt: 0.001
+monitor_frequency_hz: 30.0
+
+local_replan_horizon_steps: 500
+local_replan_dt: 0.001
+local_path_lookahead_sec: 0.50
+local_replan_max_velocity: 0.5
+local_replan_max_acceleration: 1.5
+local_replan_max_jerk: 5.0
+
+failsafe_brake_max_velocity: 0.8
+failsafe_brake_max_acceleration: 2.0
+failsafe_brake_max_jerk: 80.0
+
+path_retiming_search_window_sec: 0.25
+path_retiming_search_steps: 41
+path_time_rate_min: 0.0
+path_time_rate_max: 1.0
+path_time_acc_limit: 0.5
+path_time_rate_target: 1.0

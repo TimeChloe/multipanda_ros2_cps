@@ -29,6 +29,74 @@ Matrix6d applyMatrixRateLimit(const Matrix6d& current,
   return out;
 }
 
+Vector3d normalizedOrZero(const Vector3d& v) {
+  const double norm = v.norm();
+  if (norm < 1.0e-9) {
+    return Vector3d::Zero();
+  }
+  return v / norm;
+}
+
+Vector3d fallbackDirection(const Vector3d& x_pred,
+                           const Vector3d& v_pred,
+                           const cps_human_workspace::HumanWorkspace& human_workspace) {
+  Vector3d direction = normalizedOrZero(v_pred);
+  if (direction.squaredNorm() > 0.0) {
+    return direction;
+  }
+
+  direction = normalizedOrZero(human_workspace.center() - x_pred);
+  if (direction.squaredNorm() > 0.0) {
+    return direction;
+  }
+
+  return human_workspace.normal();
+}
+
+Vector3d commandDirection(const ImpedanceSample& s,
+                          const Vector3d& previous_command_position,
+                          const Vector3d& x_pred,
+                          const Vector3d& v_pred,
+                          const cps_human_workspace::HumanWorkspace& human_workspace) {
+  Vector3d direction = normalizedOrZero(s.dp);
+  if (direction.squaredNorm() > 0.0) {
+    return direction;
+  }
+
+  direction = normalizedOrZero(s.p - previous_command_position);
+  if (direction.squaredNorm() > 0.0) {
+    return direction;
+  }
+
+  direction = normalizedOrZero(s.p - x_pred);
+  if (direction.squaredNorm() > 0.0) {
+    return direction;
+  }
+
+  return fallbackDirection(x_pred, v_pred, human_workspace);
+}
+
+Vector3d initialCommandDirection(const VerifiedPlan& plan,
+                                 const Vector3d& current_position,
+                                 const Vector3d& current_velocity,
+                                 const cps_human_workspace::HumanWorkspace& human_workspace) {
+  if (!plan.intended.empty()) {
+    return commandDirection(plan.intended.front(),
+                            plan.anchor.p,
+                            current_position,
+                            current_velocity,
+                            human_workspace);
+  }
+  if (!plan.failsafe.empty()) {
+    return commandDirection(plan.failsafe.front(),
+                            plan.anchor.p,
+                            current_position,
+                            current_velocity,
+                            human_workspace);
+  }
+  return fallbackDirection(current_position, current_velocity, human_workspace);
+}
+
 }  // namespace
 
 MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
@@ -39,15 +107,15 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
                                   const SafetyMonitorConfig& config) {
   MonitorResult out;
 
-  const Vector3d n = config.human_workspace.normal();
-
   Vector3d x_pred = current_position;
   Vector3d v_pred = ee_twist.head<3>();
 
   Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
   task_inertia_inv.diagonal().array() += kLambdaReg;
 
-  const double denom0 = (n.transpose() * task_inertia_inv * n)(0, 0);
+  const Vector3d direction_now =
+      initialCommandDirection(plan, current_position, v_pred, config.human_workspace);
+  const double denom0 = (direction_now.transpose() * task_inertia_inv * direction_now)(0, 0);
   out.m_eff_n = 1.0 / std::max(denom0, kSmallPositive);
 
   const double rho_p = std::max(0.0, config.tracking_pos_error_bound);
@@ -58,7 +126,7 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   out.worst_case_pos_error_radius = rho_p;
   out.worst_case_vel_error_radius = rho_v;
 
-  const double v_n_now_raw = n.dot(v_pred);
+  const double v_n_now_raw = direction_now.dot(v_pred);
   out.v_n_now = v_n_now_raw;
   out.Tn_now = 0.5 * out.m_eff_n * v_n_now_raw * v_n_now_raw;
   out.v_n_now_tube = std::abs(v_n_now_raw) + rho_v;
@@ -86,8 +154,10 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   Matrix6d D_exec = config.D_runtime;
 
   const Matrix3d Kp_now = K_exec.topLeftCorner<3, 3>();
-  const double k_n_now = std::max((n.transpose() * Kp_now * n)(0, 0), 0.0);
-  const double e_n_now = std::abs(n.dot(current_position - plan.anchor.p)) + rho_p;
+  const double k_n_now =
+      std::max((direction_now.transpose() * Kp_now * direction_now)(0, 0), 0.0);
+  const double e_n_now =
+      std::abs(direction_now.dot(current_position - plan.anchor.p)) + rho_p;
   const double V_n_now_tube = 0.5 * k_n_now * e_n_now * e_n_now;
 
   double T_n_max = out.Tn_now_tube;
@@ -99,6 +169,7 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   double terminal_T_ub = 0.0;
   double terminal_V_ub = 0.0;
   bool terminal_sample_found = false;
+  Vector3d previous_command_position = plan.anchor.p;
 
   auto eval_sample = [&](const ImpedanceSample& s, double dtp) {
     K_exec = applyMatrixRateLimit(K_exec, s.K, config.k_rate_limit, dtp);
@@ -143,11 +214,21 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
 
     const bool contact_possible_step = d_segment <= 0.0;
 
-    const double k_n = std::max((n.transpose() * Kp * n)(0, 0), 0.0);
-    const double e_n = std::abs(n.dot(x_next - s.p)) + rho_p;
-    const double v_n = std::abs(n.dot(v_next)) + rho_v;
+    const Vector3d direction =
+        commandDirection(
+            s,
+            previous_command_position,
+            x_pred,
+            v_pred,
+            config.human_workspace);
+    const double denom = (direction.transpose() * task_inertia_inv * direction)(0, 0);
+    const double m_eff = 1.0 / std::max(denom, kSmallPositive);
+    const double k_n =
+        std::max((direction.transpose() * Kp * direction)(0, 0), 0.0);
+    const double e_n = std::abs(direction.dot(x_next - s.p)) + rho_p;
+    const double v_n = std::abs(direction.dot(v_next)) + rho_v;
 
-    const double T_n_ub = 0.5 * out.m_eff_n * v_n * v_n;
+    const double T_n_ub = 0.5 * m_eff * v_n * v_n;
     const double V_n_ub = 0.5 * k_n * e_n * e_n;
 
     if (T_n_ub > T_n_max) {
@@ -155,7 +236,7 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
 
       out.worst_case_contact_time = s.t;
       out.worst_case_plane_distance_at_candidate = std::min(d_pred, d_next);
-      out.worst_case_nominal_forward_progress = n.dot(x_next - current_position);
+      out.worst_case_nominal_forward_progress = direction.dot(x_next - current_position);
       out.worst_case_v_n_ub = v_n;
       out.worst_case_Tn_ub = T_n_ub;
 
@@ -197,6 +278,7 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
 
     x_pred = x_next;
     v_pred = v_next;
+    previous_command_position = s.p;
   };
 
   double t_prev = plan.anchor.t;

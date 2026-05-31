@@ -75,8 +75,11 @@ using LocalCartesianReplanConfig = cps_trajectory_generators::LocalCartesianRepl
 using ReferenceTrajectoryType = cps_trajectory_generators::ReferenceTrajectoryType;
 using TaskRefPose = cps_trajectory_generators::TaskRefPose;
 using cps_trajectory_generators::estimateLinePathTimeFromZ;
+using cps_trajectory_generators::loadTrajectoryGeneratorSettings;
 using cps_trajectory_generators::makeLocalCartesianReplan;
+using cps_trajectory_generators::makeLocalCartesianReplanFromTimedPath;
 using cps_trajectory_generators::makeReferencePose;
+using cps_trajectory_generators::makeSmoothViaPointCartesianTrajectory;
 using cps_trajectory_generators::parseTrajectoryTypeOrDefault;
 
 Matrix3d skewSymmetric(const Vector3d& v) {
@@ -203,6 +206,55 @@ inline Matrix3d makePlaneFrameFromNormal(const Vector3d& n_in) {
   Matrix3d R;
   R.col(0) = x; R.col(1) = y; R.col(2) = n;
   return R;
+}
+
+inline Vector3d normalizedOrZero(const Vector3d& v) {
+  const double norm = v.norm();
+  if (norm < 1.0e-9) {
+    return Vector3d::Zero();
+  }
+  return v / norm;
+}
+
+inline Vector3d fallbackMonitorDirection(
+    const Vector3d& x_pred,
+    const Vector3d& v_pred,
+    const cps_human_workspace::HumanWorkspace& human_workspace) {
+  Vector3d direction = normalizedOrZero(v_pred);
+  if (direction.squaredNorm() > 0.0) {
+    return direction;
+  }
+
+  direction = normalizedOrZero(human_workspace.center() - x_pred);
+  if (direction.squaredNorm() > 0.0) {
+    return direction;
+  }
+
+  return human_workspace.normal();
+}
+
+inline Vector3d commandMonitorDirection(
+    const cps_safety_monitor::ImpedanceSample& sample,
+    const Vector3d& previous_command_position,
+    const Vector3d& x_pred,
+    const Vector3d& v_pred,
+    const cps_human_workspace::HumanWorkspace& human_workspace) {
+  Vector3d direction = normalizedOrZero(sample.dp);
+  if (direction.squaredNorm() > 0.0) {
+    return direction;
+  }
+
+  direction = normalizedOrZero(sample.p - previous_command_position);
+  if (direction.squaredNorm() > 0.0) {
+    return direction;
+  }
+
+  direction = normalizedOrZero(sample.p - x_pred);
+  if (direction.squaredNorm() > 0.0) {
+    return direction;
+  }
+
+  return fallbackMonitorDirection(x_pred, v_pred, human_workspace);
 }
 
 }  // namespace
@@ -554,13 +606,31 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
   config.max_acceleration = local_replan_max_acceleration_;
   config.max_jerk = local_replan_max_jerk_;
 
-  const auto planned_samples = makeLocalCartesianReplan(
-      nominal_guess_time,
-      planning_start,
-      desired_position_,
-      desired_orientation_,
-      traj_type,
-      config);
+  std::vector<CartesianTrajectorySample> planned_samples;
+  if (traj_type == ReferenceTrajectoryType::kViaPointsSmooth &&
+      !cartesian_via_point_path_.empty()) {
+    planned_samples = makeLocalCartesianReplanFromTimedPath(
+        std::max(nominal_guess_time, commanded_path_time_),
+        planning_start,
+        cartesian_via_point_path_,
+        config);
+  } else if (traj_type == ReferenceTrajectoryType::kViaPointsSmooth) {
+    planned_samples = makeLocalCartesianReplan(
+        nominal_guess_time,
+        planning_start,
+        desired_position_,
+        desired_orientation_,
+        ReferenceTrajectoryType::kConstant,
+        config);
+  } else {
+    planned_samples = makeLocalCartesianReplan(
+        nominal_guess_time,
+        planning_start,
+        desired_position_,
+        desired_orientation_,
+        traj_type,
+        config);
+  }
 
   std::vector<ImpedanceSample> intended_buffer;
   intended_buffer.reserve(planned_samples.size());
@@ -653,6 +723,7 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     return plan;
   }
 
+  plan.nominal_time_anchor = intended_samples.back().t;
   const ImpedanceSample freeze_anchor = plan.intended.back();
   const double dtp_fs = std::max(shield_plan_dt_, kMinDt);
 
@@ -940,6 +1011,10 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     candidate_plan_valid_ = false;
 
     intended_buffer_index_ += last_verified_plan_.intended.size();
+    if (last_verified_plan_.nominal_time_anchor > 0.0) {
+      commanded_path_time_ =
+          std::max(commanded_path_time_, last_verified_plan_.nominal_time_anchor);
+    }
 
     if (parseTrajectoryTypeOrDefault(use_constant_reference_, reference_trajectory_type_) ==
         ReferenceTrajectoryType::kLine) {
@@ -980,6 +1055,10 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     candidate_plan_valid_ = false;
 
     intended_buffer_index_ += last_verified_plan_.intended.size();
+    if (last_verified_plan_.nominal_time_anchor > 0.0) {
+      commanded_path_time_ =
+          std::max(commanded_path_time_, last_verified_plan_.nominal_time_anchor);
+    }
 
     if (parseTrajectoryTypeOrDefault(use_constant_reference_, reference_trajectory_type_) ==
         ReferenceTrajectoryType::kLine) {
@@ -1264,6 +1343,7 @@ void ReachableCartesianImpedanceController::handleMujocoContactSensor(
   latest_mujoco_contact_msg_time_.store(
       rclcpp::Time(msg->header.stamp).seconds(),
       std::memory_order_relaxed);
+  latest_mujoco_contact_sequence_.fetch_add(1, std::memory_order_relaxed);
 
   const bool active = value > mujoco_contact_threshold_;
   latest_mujoco_contact_active_.store(active, std::memory_order_relaxed);
@@ -1335,7 +1415,6 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
   const Vector6d collision_twist =
       twistAtCollisionCenter(current_orientation, ee_twist);
 
-  const Vector3d n = human_workspace_.normal();
   const double rho_p = std::max(0.0, tracking_pos_error_bound_);
   const double rho_v = std::max(0.0, tracking_vel_error_bound_);
   const double inflated_contact_radius =
@@ -1349,6 +1428,7 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
   Vector3d x_pred = collision_center;
   Vector3d v_pred = collision_twist.head<3>();
   double t_prev = collision_plan.anchor.t;
+  Vector3d previous_command_position = collision_plan.anchor.p;
   std::vector<PredictionRow> rows;
   rows.reserve(1 + collision_plan.intended.size() + collision_plan.failsafe.size());
 
@@ -1397,10 +1477,21 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
         human_workspace_.signedDistanceSegmentToInflatedSphere(
             x_pred, x_next, inflated_contact_radius);
     row.contact_possible = row.d_segment <= 0.0;
-    row.k_n = std::max((n.transpose() * Kp * n)(0, 0), 0.0);
-    row.e_n = std::abs(n.dot(x_next - collision_sample.p)) + rho_p;
-    row.v_n = std::abs(n.dot(v_next)) + rho_v;
-    row.T_n_ub = 0.5 * std::max(monitor.m_eff_n, 0.0) * row.v_n * row.v_n;
+    const Vector3d monitor_direction =
+        commandMonitorDirection(
+            collision_sample,
+            previous_command_position,
+            x_pred,
+            v_pred,
+            human_workspace_);
+    const double denom =
+        (monitor_direction.transpose() * task_inertia_inv * monitor_direction)(0, 0);
+    const double m_eff_dir = 1.0 / std::max(denom, kSmallPositive);
+    row.k_n =
+        std::max((monitor_direction.transpose() * Kp * monitor_direction)(0, 0), 0.0);
+    row.e_n = std::abs(monitor_direction.dot(x_next - collision_sample.p)) + rho_p;
+    row.v_n = std::abs(monitor_direction.dot(v_next)) + rho_v;
+    row.T_n_ub = 0.5 * m_eff_dir * row.v_n * row.v_n;
     row.V_n_ub = 0.5 * row.k_n * row.e_n * row.e_n;
     row.Kx = K_exec(0, 0);
     row.Ky = K_exec(1, 1);
@@ -1412,6 +1503,7 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
 
     x_pred = x_next;
     v_pred = v_next;
+    previous_command_position = collision_sample.p;
   };
 
   auto append_samples = [&](const char* stage,
@@ -1758,6 +1850,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         last_verified_plan_.valid = true;
         last_verified_plan_.intended_exec_index = 0;
         last_verified_plan_.failsafe_exec_index = 0;
+        if (last_verified_plan_.nominal_time_anchor > 0.0) {
+          commanded_path_time_ =
+              std::max(commanded_path_time_, last_verified_plan_.nominal_time_anchor);
+        }
       }
     }
 
@@ -1788,10 +1884,47 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         }
       }
     } else {
-      shield_dec.executing_last_verified_failsafe = true;
-      shield_dec.candidate_verified = false;
-      shield_dec.command =
-          makeEmergencyStopCommand(current_position, current_orientation, wall_time);
+      const bool need_sync_bootstrap =
+          !last_verified_plan_.valid || last_verified_plan_.intended.empty();
+
+      if (need_sync_bootstrap) {
+        shield_dec = computeShieldDecision(wall_time, nominal_guess_time,
+                                           current_position, current_orientation,
+                                           ee_twist, inertia, Jv_collision);
+        last_shield_decision_ = shield_dec;
+        last_shield_decision_valid_ = true;
+        if (shield_dec.has_evaluated_plan) {
+          logShieldPredictionTrajectory(
+              wall_time,
+              nominal_guess_time,
+              current_position,
+              current_orientation,
+              ee_twist,
+              inertia,
+              Jv_collision,
+              K_runtime_,
+              D_runtime_,
+              shield_dec.evaluated_plan,
+              shield_dec.monitor,
+              shield_dec.candidate_verified,
+              shield_dec.executing_last_verified_failsafe,
+              "async_bootstrap_sync");
+        }
+      } else {
+        shield_dec = last_shield_decision_;
+        if (mode_ == SafetyMode::kFailsafe ||
+            shield_dec.executing_last_verified_failsafe ||
+            shield_dec.monitor.predicted_trigger) {
+          shield_dec.executing_last_verified_failsafe = true;
+          shield_dec.command = getNextFailsafeCommandFromCache(true);
+        } else {
+          shield_dec.executing_last_verified_failsafe = false;
+          shield_dec.command = getNextIntendedCommandFromCache(true);
+        }
+        last_shield_decision_.command = shield_dec.command;
+        last_shield_decision_.executing_last_verified_failsafe =
+            shield_dec.executing_last_verified_failsafe;
+      }
     }
   } else {
     const bool do_monitor =
@@ -1889,11 +2022,30 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
   MonitorResult monitor = shield_dec.monitor;
   {
-    const Vector3d n = human_workspace_.normal();
+    ImpedanceSample current_command = shield_dec.command;
+    current_command.p =
+        desired_position_cur + collisionCenterOffsetWorld(desired_orientation_cur);
+    const Vector3d monitor_direction =
+        commandMonitorDirection(
+            current_command,
+            current_command.p,
+            collision_center,
+            ee_collision_twist.head<3>(),
+            human_workspace_);
+    Matrix3d task_inertia_inv = Jv_collision * inertia.inverse() * Jv_collision.transpose();
+    task_inertia_inv.diagonal().array() += kSmallPositive;
+    const double denom =
+        (monitor_direction.transpose() * task_inertia_inv * monitor_direction)(0, 0);
+    const double m_eff_dir = 1.0 / std::max(denom, kSmallPositive);
     const double v_n_now_tube =
-        std::abs(n.dot(ee_collision_twist.head<3>())) + monitor.current_vel_error_radius;
+        std::abs(monitor_direction.dot(ee_collision_twist.head<3>())) +
+        monitor.current_vel_error_radius;
     const double Tn_now_tube =
-        0.5 * std::max(monitor.m_eff_n, 0.0) * v_n_now_tube * v_n_now_tube;
+        0.5 * std::max(m_eff_dir, 0.0) * v_n_now_tube * v_n_now_tube;
+    monitor.m_eff_n = m_eff_dir;
+    monitor.v_n_now = monitor_direction.dot(ee_collision_twist.head<3>());
+    monitor.Tn_now = 0.5 * std::max(m_eff_dir, 0.0) *
+                     monitor.v_n_now * monitor.v_n_now;
     monitor.v_n_now_tube = v_n_now_tube;
     monitor.Tn_now_tube  = Tn_now_tube;
     if (mode_ == SafetyMode::kFailsafe) {
@@ -1926,6 +2078,21 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   publishRvizDiagnostics(wall_time, collision_center, desired_position_cur, ee_collision_twist, monitor);
 
   if (enable_error_logging_ && error_log_file_.is_open()) {
+    const double mujoco_contact_msg_time =
+        latest_mujoco_contact_msg_time_.load(std::memory_order_relaxed);
+    const std::uint64_t mujoco_contact_sequence =
+        latest_mujoco_contact_sequence_.load(std::memory_order_relaxed);
+    const bool mujoco_contact_new_sample =
+        mujoco_contact_sequence != last_logged_mujoco_contact_sequence_;
+    const std::uint64_t mujoco_contact_samples_since_last_log =
+        (mujoco_contact_sequence >= last_logged_mujoco_contact_sequence_)
+            ? (mujoco_contact_sequence - last_logged_mujoco_contact_sequence_)
+            : 0;
+    const double mujoco_contact_sample_age =
+        (mujoco_contact_msg_time >= 0.0)
+            ? std::max(0.0, this->get_node()->now().seconds() - mujoco_contact_msg_time)
+            : -1.0;
+
     error_log_file_ << std::fixed << std::setprecision(9)
         << wall_time << "," << nominal_guess_time << "," << paused_nominal_time_sec_ << ","
         << static_cast<int>(mode_) << ","
@@ -1979,10 +2146,15 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << monitored_total_steps << ","
         << latest_mujoco_contact_value_.load(std::memory_order_relaxed) << ","
         << static_cast<int>(latest_mujoco_contact_active_.load(std::memory_order_relaxed)) << ","
-        << latest_mujoco_contact_msg_time_.load(std::memory_order_relaxed) << ","
+        << mujoco_contact_msg_time << ","
+        << mujoco_contact_sequence << ","
+        << static_cast<int>(mujoco_contact_new_sample) << ","
+        << mujoco_contact_samples_since_last_log << ","
+        << mujoco_contact_sample_age << ","
         << static_cast<int>(mujoco_first_contact_seen_.load(std::memory_order_relaxed)) << ","
         << mujoco_first_contact_wall_time_.load(std::memory_order_relaxed) << ","
         << mujoco_first_contact_msg_time_.load(std::memory_order_relaxed) << "\n";
+    last_logged_mujoco_contact_sequence_ = mujoco_contact_sequence;
     ++log_write_counter_;
     if ((log_write_counter_ % 200) == 0) error_log_file_.flush();
   }
@@ -2060,6 +2232,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
 
     auto_declare<bool>("use_constant_reference", false);
     auto_declare<std::string>("reference_trajectory_type", "lissajous");
+    auto_declare<bool>("cartesian_via_points_relative", false);
+    auto_declare<std::vector<double>>(
+        "cartesian_via_points",
+        std::vector<double>{});
 
     auto_declare<double>("nominal_pos_stiffness", 400.0);
     auto_declare<double>("nominal_rot_stiffness", 20.0);
@@ -2095,26 +2271,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
 
     auto_declare<double>("tracking_pos_error_bound", 0.005);
     auto_declare<double>("tracking_vel_error_bound", 0.05);
-
-    auto_declare<double>("shield_plan_dt", 0.01);
-    auto_declare<double>("monitor_frequency_hz", 100.0);
-
-    auto_declare<double>("path_retiming_search_window_sec", 0.25);
-    auto_declare<int>("path_retiming_search_steps", 41);
-    auto_declare<double>("path_time_rate_min", 0.0);
-    auto_declare<double>("path_time_rate_max", 1.5);
-    auto_declare<double>("path_time_acc_limit", 3.0);
-    auto_declare<double>("path_time_rate_target", 1.0);
-
-    auto_declare<int>("local_replan_horizon_steps", 200);
-    auto_declare<double>("local_replan_dt", 0.001);
-    auto_declare<double>("local_path_lookahead_sec", 0.08);
-    auto_declare<double>("local_replan_max_velocity", 0.08);
-    auto_declare<double>("local_replan_max_acceleration", 0.4);
-    auto_declare<double>("local_replan_max_jerk", 2.0);
-    auto_declare<double>("failsafe_brake_max_velocity", 1.0);
-    auto_declare<double>("failsafe_brake_max_acceleration", 4.0);
-    auto_declare<double>("failsafe_brake_max_jerk", 80.0);
 
     auto_declare<bool>("use_dynamic_consistent_impedance", true);
     auto_declare<double>("torque_rate_limit", 1000.0);
@@ -2179,6 +2335,32 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
 
     use_constant_reference_ = get_node()->get_parameter("use_constant_reference").as_bool();
     reference_trajectory_type_ = get_node()->get_parameter("reference_trajectory_type").as_string();
+    cartesian_via_points_relative_ =
+        get_node()->get_parameter("cartesian_via_points_relative").as_bool();
+    cartesian_via_points_.clear();
+    std::vector<double> cartesian_via_points;
+    const rclcpp::Parameter via_points_param =
+        get_node()->get_parameter("cartesian_via_points");
+    if (via_points_param.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY) {
+      cartesian_via_points = via_points_param.as_double_array();
+    } else if (via_points_param.get_type() != rclcpp::ParameterType::PARAMETER_NOT_SET) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "cartesian_via_points must be a double array. Ignoring this value.");
+    }
+    if ((cartesian_via_points.size() % 3) != 0) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "cartesian_via_points must contain triples [x0, y0, z0, ...]. Ignoring the incomplete tail.");
+    }
+    const std::size_t via_point_count = cartesian_via_points.size() / 3;
+    cartesian_via_points_.reserve(via_point_count);
+    for (std::size_t i = 0; i < via_point_count; ++i) {
+      cartesian_via_points_.emplace_back(
+          cartesian_via_points[3 * i + 0],
+          cartesian_via_points[3 * i + 1],
+          cartesian_via_points[3 * i + 2]);
+    }
 
     const double nominal_pos_stiffness = get_node()->get_parameter("nominal_pos_stiffness").as_double();
     const double nominal_rot_stiffness = get_node()->get_parameter("nominal_rot_stiffness").as_double();
@@ -2241,37 +2423,52 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     tracking_pos_error_bound_ = std::max(0.0, get_node()->get_parameter("tracking_pos_error_bound").as_double());
     tracking_vel_error_bound_ = std::max(0.0, get_node()->get_parameter("tracking_vel_error_bound").as_double());
 
-    shield_plan_dt_ = std::max(get_node()->get_parameter("shield_plan_dt").as_double(), kMinDt);
-    monitor_frequency_hz_ =
-        std::max(1.0, get_node()->get_parameter("monitor_frequency_hz").as_double());
+    trajectory_generator_config_path_ =
+        cps_trajectory_generators::defaultTrajectoryGeneratorConfigPath();
+    const auto trajectory_settings =
+        loadTrajectoryGeneratorSettings(trajectory_generator_config_path_);
+
+    shield_plan_dt_ = std::max(trajectory_settings.shield_plan_dt, kMinDt);
+    monitor_frequency_hz_ = std::max(1.0, trajectory_settings.monitor_frequency_hz);
     monitor_update_period_sec_ = 1.0 / monitor_frequency_hz_;
 
-    path_retiming_search_window_sec_ = std::max(get_node()->get_parameter("path_retiming_search_window_sec").as_double(), 0.0);
-    path_retiming_search_steps_ = std::max(5, static_cast<int>(get_node()->get_parameter("path_retiming_search_steps").as_int()));
-    path_time_rate_min_ = get_node()->get_parameter("path_time_rate_min").as_double();
-    path_time_rate_max_ = std::max(path_time_rate_min_, get_node()->get_parameter("path_time_rate_max").as_double());
-    path_time_acc_limit_ = std::max(0.0, get_node()->get_parameter("path_time_acc_limit").as_double());
-    path_time_rate_target_ = std::clamp(get_node()->get_parameter("path_time_rate_target").as_double(),
-                                        path_time_rate_min_, path_time_rate_max_);
+    path_retiming_search_window_sec_ =
+        std::max(trajectory_settings.path_retiming_search_window_sec, 0.0);
+    path_retiming_search_steps_ =
+        std::max(5, trajectory_settings.path_retiming_search_steps);
+    path_time_rate_min_ = trajectory_settings.path_time_rate_min;
+    path_time_rate_max_ =
+        std::max(path_time_rate_min_, trajectory_settings.path_time_rate_max);
+    path_time_acc_limit_ =
+        std::max(0.0, trajectory_settings.path_time_acc_limit);
+    path_time_rate_target_ =
+        std::clamp(trajectory_settings.path_time_rate_target,
+                   path_time_rate_min_,
+                   path_time_rate_max_);
 
-    local_replan_horizon_steps_ = std::max(1, static_cast<int>(get_node()->get_parameter("local_replan_horizon_steps").as_int()));
-    local_replan_dt_ = std::max(get_node()->get_parameter("local_replan_dt").as_double(), kMinDt);
+    local_replan_horizon_steps_ =
+        std::max(1, trajectory_settings.local_replan_horizon_steps);
+    local_replan_dt_ = std::max(trajectory_settings.local_replan_dt, kMinDt);
     shield_intended_steps_ = std::max(
         1,
         static_cast<int>(
             std::llround(std::max(monitor_update_period_sec_, local_replan_dt_) /
                          local_replan_dt_)));
     monitor_decimation_ = shield_intended_steps_;
-    local_path_lookahead_sec_ = std::max(get_node()->get_parameter("local_path_lookahead_sec").as_double(), local_replan_dt_);
-    local_replan_max_velocity_ = std::max(1e-4, get_node()->get_parameter("local_replan_max_velocity").as_double());
-    local_replan_max_acceleration_ = std::max(1e-4, get_node()->get_parameter("local_replan_max_acceleration").as_double());
-    local_replan_max_jerk_ = std::max(1e-4, get_node()->get_parameter("local_replan_max_jerk").as_double());
+    local_path_lookahead_sec_ =
+        std::max(trajectory_settings.local_path_lookahead_sec, local_replan_dt_);
+    local_replan_max_velocity_ =
+        std::max(1e-4, trajectory_settings.local_replan_max_velocity);
+    local_replan_max_acceleration_ =
+        std::max(1e-4, trajectory_settings.local_replan_max_acceleration);
+    local_replan_max_jerk_ =
+        std::max(1e-4, trajectory_settings.local_replan_max_jerk);
     failsafe_brake_max_velocity_ =
-        std::min(1.7, std::max(1e-4, get_node()->get_parameter("failsafe_brake_max_velocity").as_double()));
+        std::min(1.7, std::max(1e-4, trajectory_settings.failsafe_brake_max_velocity));
     failsafe_brake_max_acceleration_ =
-        std::min(13.0, std::max(1e-4, get_node()->get_parameter("failsafe_brake_max_acceleration").as_double()));
+        std::min(13.0, std::max(1e-4, trajectory_settings.failsafe_brake_max_acceleration));
     failsafe_brake_max_jerk_ =
-        std::min(6500.0, std::max(1e-4, get_node()->get_parameter("failsafe_brake_max_jerk").as_double()));
+        std::min(6500.0, std::max(1e-4, trajectory_settings.failsafe_brake_max_jerk));
 
     use_dynamic_consistent_impedance_ = get_node()->get_parameter("use_dynamic_consistent_impedance").as_bool();
     torque_rate_limit_ = get_node()->get_parameter("torque_rate_limit").as_double();
@@ -2375,6 +2572,53 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   desired_position_ =
       pose.block<3, 1>(0, 3) + desired_orientation_ * tcp_offset_;
 
+  cartesian_via_point_path_.clear();
+  const auto traj_type =
+      parseTrajectoryTypeOrDefault(use_constant_reference_, reference_trajectory_type_);
+  if (traj_type == ReferenceTrajectoryType::kViaPointsSmooth) {
+    std::vector<Vector3d> waypoints;
+    waypoints.reserve(cartesian_via_points_.size() + 1);
+    waypoints.push_back(desired_position_);
+    for (const auto& point : cartesian_via_points_) {
+      const Vector3d waypoint =
+          cartesian_via_points_relative_ ? desired_position_ + point : point;
+      if ((waypoint - waypoints.back()).norm() > 1e-9) {
+        waypoints.push_back(waypoint);
+      }
+    }
+
+    if (waypoints.size() < 2) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "reference_trajectory_type=via_points_smooth but cartesian_via_points is empty. Holding the initial pose.");
+    } else {
+      LocalCartesianReplanConfig via_config;
+      via_config.horizon_steps = local_replan_horizon_steps_;
+      via_config.dt = local_replan_dt_;
+      via_config.path_lookahead_sec = local_path_lookahead_sec_;
+      via_config.max_velocity = local_replan_max_velocity_;
+      via_config.max_acceleration = local_replan_max_acceleration_;
+      via_config.max_jerk = local_replan_max_jerk_;
+      cartesian_via_point_path_ =
+          makeSmoothViaPointCartesianTrajectory(
+              waypoints,
+              desired_orientation_,
+              via_config);
+      if (cartesian_via_point_path_.empty()) {
+        RCLCPP_WARN(
+            get_node()->get_logger(),
+            "Failed to time-parameterize cartesian_via_points. Holding the initial pose.");
+      } else {
+        RCLCPP_INFO(
+            get_node()->get_logger(),
+            "Smooth via-point trajectory prepared: waypoints=%zu samples=%zu duration=%.3f s",
+            waypoints.size(),
+            cartesian_via_point_path_.size(),
+            cartesian_via_point_path_.back().t);
+      }
+    }
+  }
+
   last_commanded_sample_ = ImpedanceSample{};
   last_commanded_sample_.t = 0.0;
   last_commanded_sample_.p = desired_position_;
@@ -2410,6 +2654,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   latest_mujoco_contact_value_.store(0.0);
   latest_mujoco_contact_msg_time_.store(-1.0);
   latest_mujoco_contact_active_.store(false);
+  latest_mujoco_contact_sequence_.store(0);
+  last_logged_mujoco_contact_sequence_ = 0;
   mujoco_first_contact_seen_.store(false);
   mujoco_first_contact_wall_time_.store(-1.0);
   mujoco_first_contact_msg_time_.store(-1.0);
@@ -2473,6 +2719,17 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "prediction_csv_file: " << prediction_log_file_path_ << "\n"
                     << "arm_id: " << arm_id_ << "\n"
                     << "reference_trajectory_type: " << reference_trajectory_type_ << "\n"
+                    << "cartesian_via_points_relative: "
+                    << static_cast<int>(cartesian_via_points_relative_) << "\n"
+                    << "cartesian_via_points_count: "
+                    << cartesian_via_points_.size() << "\n"
+                    << "cartesian_via_point_path_samples: "
+                    << cartesian_via_point_path_.size() << "\n"
+                    << "cartesian_via_point_path_duration_sec: "
+                    << (cartesian_via_point_path_.empty()
+                            ? 0.0
+                            : cartesian_via_point_path_.back().t)
+                    << "\n"
                     << "use_constant_reference: " << static_cast<int>(use_constant_reference_) << "\n"
                     << "enable_safety_monitor: " << static_cast<int>(enable_safety_monitor_) << "\n"
                     << "async_safety_monitor: " << static_cast<int>(async_safety_monitor_) << "\n"
@@ -2481,6 +2738,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "monitor_update_period_sec: " << monitor_update_period_sec_ << "\n"
                     << "monitor_decimation: " << monitor_decimation_ << "\n"
                     << "shield_intended_steps: " << shield_intended_steps_ << "\n"
+                    << "trajectory_generator_config_path: "
+                    << trajectory_generator_config_path_ << "\n"
                     << "shield_plan_dt: " << shield_plan_dt_ << "\n"
                     << "contact_activation_margin: "
                     << contact_activation_margin_ << "\n"
@@ -2560,6 +2819,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "terminal_energy_unsafe,monitored_unsafe,predicted_trigger,"
         << "monitored_intended_steps,monitored_failsafe_steps,monitored_total_steps,"
         << "mujoco_contact_value,mujoco_contact_active,mujoco_contact_msg_time_sec,"
+        << "mujoco_contact_sample_seq,mujoco_contact_new_sample,"
+        << "mujoco_contact_samples_since_last_log,mujoco_contact_sample_age_sec,"
         << "mujoco_first_contact_seen,mujoco_first_contact_wall_time_sec,"
         << "mujoco_first_contact_msg_time_sec\n";
     RCLCPP_INFO(
