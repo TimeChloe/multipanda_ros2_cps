@@ -87,12 +87,6 @@ class ReachableCartesianImpedanceController
  private:
   static constexpr int kNumJoints = 7;
 
-  struct PathState {
-    double t_path{0.0};
-    double rate{0.0};
-    double accel{0.0};
-  };
-
   Matrix6d applyMatrixRateLimit(const Matrix6d& current,
                                 const Matrix6d& target,
                                 double rate_limit,
@@ -113,30 +107,11 @@ class ReachableCartesianImpedanceController
       double v_n_abs,
       const Matrix6d& D_used) const;
 
-  double estimatePathParameterTimeFromCurrentState(
-      const Vector3d& current_position,
-      double nominal_guess_time) const;
-
-  double estimatePathTimeRateFromCurrentState(
-      double path_time_anchor,
-      const Vector3d& current_linear_velocity) const;
-
-  PathState propagateOnlinePathState(const Vector3d& current_position,
-                                     const Vector3d& current_linear_velocity,
-                                     double nominal_guess_time,
-                                     double dtp) const;
-
   void publishRvizDiagnostics(double wall_time,
                               const Vector3d& current_position,
                               const Vector3d& desired_position_cur,
                               const Vector6d& ee_twist,
                               const MonitorResult& monitor);
-
-  ImpedanceSample makeNominalSample(double nominal_time,
-                                    double path_rate,
-                                    double path_accel,
-                                    const Matrix6d& K_target,
-                                    const Matrix6d& D_target) const;
 
   ImpedanceSample makeFrozenFailsafeSample(
       double nominal_time,
@@ -288,8 +263,6 @@ class ReachableCartesianImpedanceController
   std::size_t prediction_log_write_counter_{0};
 
   std::string arm_id_;
-  std::string reference_trajectory_type_{"line"};
-  bool use_constant_reference_{false};
   bool cartesian_via_points_relative_{false};
   std::vector<Vector3d> cartesian_via_points_;
   std::vector<cps_trajectory_generators::CartesianTrajectorySample>
@@ -346,8 +319,6 @@ class ReachableCartesianImpedanceController
   double monitor_frequency_hz_{100.0};
   double monitor_update_period_sec_{0.01};
 
-  double path_retiming_search_window_sec_{0.25};
-  int path_retiming_search_steps_{41};
   double path_time_rate_min_{0.0};
   double path_time_rate_max_{1.5};
   double path_time_acc_limit_{3.0};

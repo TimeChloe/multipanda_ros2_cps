@@ -130,7 +130,7 @@ def generate_launch_description():
             description='The name of the robot. Defaults to panda.'),
         DeclareLaunchArgument(
             initial_positions_param,
-            default_value='"0.0 -0.785 0.0 -2.356 0.0 1.571 0.785"',
+            default_value='"0.0 -0.578 0.0 -1.753 0.0 1.175 0.785"',
             description='Initial joint positions of the robot. Must be enclosed in quotes, and in pure number.'
                         'Defaults to the "communication_test" pose.'),
 

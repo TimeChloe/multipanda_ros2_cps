@@ -17,9 +17,6 @@ namespace {
 
 constexpr double kMinDt = 1e-6;
 constexpr double kSmallPositive = 1e-9;
-constexpr double kSmoothStartDuration = 2.0;
-constexpr double kLineMoveDuration = 1.5;
-constexpr double kLineDeltaZ = -0.55;
 constexpr const char* kTrajectoryConfigFileName =
     "reachable_cartesian_trajectory.yaml";
 
@@ -135,12 +132,6 @@ TrajectoryGeneratorSettings loadTrajectoryGeneratorSettings(
     } else if (key == "failsafe_brake_max_jerk" &&
                parseDouble(value_text, &double_value)) {
       settings.failsafe_brake_max_jerk = double_value;
-    } else if (key == "path_retiming_search_window_sec" &&
-               parseDouble(value_text, &double_value)) {
-      settings.path_retiming_search_window_sec = double_value;
-    } else if (key == "path_retiming_search_steps" &&
-               parseInt(value_text, &int_value)) {
-      settings.path_retiming_search_steps = int_value;
     } else if (key == "path_time_rate_min" &&
                parseDouble(value_text, &double_value)) {
       settings.path_time_rate_min = double_value;
@@ -157,161 +148,6 @@ TrajectoryGeneratorSettings loadTrajectoryGeneratorSettings(
   }
 
   return settings;
-}
-
-ReferenceTrajectoryType parseReferenceTrajectoryType(const std::string& name) {
-  if (name == "lissajous") {
-    return ReferenceTrajectoryType::kLissajous;
-  }
-  if (name == "constant") {
-    return ReferenceTrajectoryType::kConstant;
-  }
-  if (name == "via_points_smooth" || name == "smooth_via_points" ||
-      name == "smooth_waypoints" || name == "via_points" ||
-      name == "viapoints" || name == "waypoints") {
-    return ReferenceTrajectoryType::kViaPointsSmooth;
-  }
-  return ReferenceTrajectoryType::kLine;
-}
-
-ReferenceTrajectoryType parseTrajectoryTypeOrDefault(
-    bool use_constant_reference,
-    const std::string& name) {
-  if (use_constant_reference) {
-    return ReferenceTrajectoryType::kConstant;
-  }
-  return parseReferenceTrajectoryType(name);
-}
-
-SmoothStartProfile makeSmoothStartProfile(double t, double T) {
-  SmoothStartProfile out{};
-  if (t <= 0.0) {
-    return out;
-  }
-  if (t >= T) {
-    out.s = 1.0;
-    return out;
-  }
-
-  const double x = t / T;
-  const double x2 = x * x;
-  const double x3 = x2 * x;
-  const double x4 = x3 * x;
-  const double x5 = x4 * x;
-
-  out.s = 10.0 * x3 - 15.0 * x4 + 6.0 * x5;
-  out.ds = (30.0 * x2 - 60.0 * x3 + 30.0 * x4) / T;
-  out.dds = (60.0 * x - 180.0 * x2 + 120.0 * x3) / (T * T);
-  return out;
-}
-
-double invertSmoothStartS(double s_target) {
-  s_target = std::clamp(s_target, 0.0, 1.0);
-
-  double lo = 0.0;
-  double hi = 1.0;
-
-  for (int i = 0; i < 40; ++i) {
-    const double x = 0.5 * (lo + hi);
-    const double x2 = x * x;
-    const double x3 = x2 * x;
-    const double x4 = x3 * x;
-    const double x5 = x4 * x;
-    const double s = 10.0 * x3 - 15.0 * x4 + 6.0 * x5;
-
-    if (s < s_target) {
-      lo = x;
-    } else {
-      hi = x;
-    }
-  }
-
-  return 0.5 * (lo + hi);
-}
-
-double estimateLinePathTimeFromZ(double z,
-                                 double z_start,
-                                 double z_final,
-                                 double T_move) {
-  const double denom = z_final - z_start;
-
-  if (std::abs(denom) < 1e-9) {
-    return 0.0;
-  }
-
-  const double s = std::clamp((z - z_start) / denom, 0.0, 1.0);
-  const double x = invertSmoothStartS(s);
-
-  return std::clamp(x * T_move, 0.0, T_move);
-}
-
-TaskRefPose makeReferenceLine(double t,
-                              const Eigen::Vector3d& p0,
-                              const Eigen::Matrix3d& R0) {
-  TaskRefPose ref;
-  const SmoothStartProfile ramp = makeSmoothStartProfile(t, kLineMoveDuration);
-  ref.p = p0 + Eigen::Vector3d(0.0, 0.0, kLineDeltaZ * ramp.s);
-  ref.dp = Eigen::Vector3d(0.0, 0.0, kLineDeltaZ * ramp.ds);
-  ref.ddp = Eigen::Vector3d(0.0, 0.0, kLineDeltaZ * ramp.dds);
-  ref.R = R0;
-  return ref;
-}
-
-TaskRefPose makeReferenceLissajous(double t,
-                                   const Eigen::Vector3d& p0,
-                                   const Eigen::Matrix3d& R0) {
-  TaskRefPose ref;
-  const double wt = 2.0 * M_PI * 0.25;
-  const SmoothStartProfile ramp = makeSmoothStartProfile(t, kSmoothStartDuration);
-  constexpr double Ax = 0.08;
-  constexpr double Ay = 0.08;
-  constexpr double Az = 0.04;
-  const double ph_px = 0.0;
-  const double ph_py = M_PI / 2.0;
-  const double ph_pz = 0.0;
-
-  const Eigen::Vector3d p_base(
-      Ax * (std::sin(wt * t + ph_px) - std::sin(ph_px)),
-      Ay * (std::sin(wt * t + ph_py) - std::sin(ph_py)),
-      Az * (std::sin(0.5 * wt * t + ph_pz) - std::sin(ph_pz)));
-
-  const Eigen::Vector3d dp_base(
-      Ax * wt * std::cos(wt * t + ph_px),
-      Ay * wt * std::cos(wt * t + ph_py),
-      Az * 0.5 * wt * std::cos(0.5 * wt * t + ph_pz));
-
-  const Eigen::Vector3d ddp_base(
-      -Ax * wt * wt * std::sin(wt * t + ph_px),
-      -Ay * wt * wt * std::sin(wt * t + ph_py),
-      -Az * 0.25 * wt * wt * std::sin(0.5 * wt * t + ph_pz));
-
-  ref.p = p0 + ramp.s * p_base;
-  ref.dp = ramp.ds * p_base + ramp.s * dp_base;
-  ref.ddp = ramp.dds * p_base + 2.0 * ramp.ds * dp_base + ramp.s * ddp_base;
-  ref.R = R0;
-  return ref;
-}
-
-TaskRefPose makeReferencePose(double t,
-                              const Eigen::Vector3d& p0,
-                              const Eigen::Matrix3d& R0,
-                              ReferenceTrajectoryType traj_type) {
-  switch (traj_type) {
-    case ReferenceTrajectoryType::kLissajous:
-      return makeReferenceLissajous(t, p0, R0);
-    case ReferenceTrajectoryType::kConstant: {
-      TaskRefPose ref;
-      ref.p = p0;
-      ref.dp.setZero();
-      ref.ddp.setZero();
-      ref.R = R0;
-      return ref;
-    }
-    case ReferenceTrajectoryType::kViaPointsSmooth:
-    case ReferenceTrajectoryType::kLine:
-    default:
-      return makeReferenceLine(t, p0, R0);
-  }
 }
 
 namespace {
@@ -354,6 +190,88 @@ CartesianTrajectorySample sampleTimedPathAt(
   out.w = (1.0 - alpha) * lower->w + alpha * upper->w;
   out.dw = (1.0 - alpha) * lower->dw + alpha * upper->dw;
   return out;
+}
+
+CartesianTrajectorySample retimeTimedPathSample(
+    const std::vector<CartesianTrajectorySample>& path,
+    double path_time,
+    double path_rate,
+    double path_accel) {
+  CartesianTrajectorySample out = sampleTimedPathAt(path, path_time);
+  out.t = path_time;
+  const Eigen::Vector3d dp_ds = out.dp;
+  const Eigen::Vector3d d2p_ds2 = out.ddp;
+  const Eigen::Vector3d w_ds = out.w;
+  const Eigen::Vector3d dw_ds2 = out.dw;
+  out.dp = dp_ds * path_rate;
+  out.ddp = d2p_ds2 * path_rate * path_rate + dp_ds * path_accel;
+  out.w = w_ds * path_rate;
+  out.dw = dw_ds2 * path_rate * path_rate + w_ds * path_accel;
+  return out;
+}
+
+double estimatePathRateAtSample(
+    const CartesianTrajectorySample& planning_start,
+    const CartesianTrajectorySample& path_sample,
+    double max_path_rate) {
+  const double denom = path_sample.dp.squaredNorm();
+  if (denom < 1e-10) {
+    return 0.0;
+  }
+  const double rate = planning_start.dp.dot(path_sample.dp) / denom;
+  if (!std::isfinite(rate)) {
+    return 0.0;
+  }
+  return std::clamp(rate, 0.0, std::max(max_path_rate, 0.0));
+}
+
+double nearestPathTimeInWindow(
+    double min_path_time,
+    const CartesianTrajectorySample& planning_start,
+    const std::vector<CartesianTrajectorySample>& timed_path,
+    double lookahead_sec) {
+  if (timed_path.empty()) {
+    return 0.0;
+  }
+  const double lower_time =
+      std::clamp(min_path_time, timed_path.front().t, timed_path.back().t);
+  auto lower_it = std::lower_bound(
+      timed_path.begin(),
+      timed_path.end(),
+      lower_time,
+      [](const CartesianTrajectorySample& sample, double value) {
+        return sample.t < value;
+      });
+  if (lower_it == timed_path.end()) {
+    lower_it = timed_path.end() - 1;
+  }
+
+  const double search_end_time =
+      std::min(lower_time + std::max(lookahead_sec, kMinDt), timed_path.back().t);
+  auto search_end_it = std::upper_bound(
+      lower_it,
+      timed_path.end(),
+      search_end_time,
+      [](double value, const CartesianTrajectorySample& sample) {
+        return value < sample.t;
+      });
+  if (search_end_it == lower_it) {
+    search_end_it = std::next(lower_it);
+  }
+
+  std::size_t nearest_idx =
+      static_cast<std::size_t>(std::distance(timed_path.begin(), lower_it));
+  double nearest_dist = (timed_path[nearest_idx].p - planning_start.p).squaredNorm();
+  const std::size_t search_end_idx =
+      static_cast<std::size_t>(std::distance(timed_path.begin(), search_end_it));
+  for (std::size_t i = nearest_idx + 1; i < search_end_idx; ++i) {
+    const double d = (timed_path[i].p - planning_start.p).squaredNorm();
+    if (d < nearest_dist) {
+      nearest_idx = i;
+      nearest_dist = d;
+    }
+  }
+  return timed_path[nearest_idx].t;
 }
 
 struct SmoothPathSample {
@@ -423,203 +341,48 @@ SmoothPathSample sampleCubicHermitePath(
   return out;
 }
 
-}  // namespace
-
-std::vector<CartesianTrajectorySample> makeLocalCartesianReplan(
-    double nominal_guess_time,
-    const CartesianTrajectorySample& planning_start,
-    const Eigen::Vector3d& reference_position,
-    const Eigen::Quaterniond& reference_orientation,
-    ReferenceTrajectoryType traj_type,
-    const LocalCartesianReplanConfig& config) {
-  std::vector<CartesianTrajectorySample> samples;
-
-  const double dt = std::max(config.dt, kMinDt);
-  const int horizon_steps = std::max(1, config.horizon_steps);
-  const double lookahead_sec = std::max(config.path_lookahead_sec, dt);
-  const double max_velocity = std::max(config.max_velocity, 1e-4);
-  const double max_acceleration = std::max(config.max_acceleration, 1e-4);
-  const double max_jerk = std::max(config.max_jerk, 1e-4);
-
-  Eigen::Quaterniond reference_q = reference_orientation;
-  reference_q.normalize();
-  const Eigen::Matrix3d reference_R = reference_q.toRotationMatrix();
-
-  if (traj_type == ReferenceTrajectoryType::kLine) {
-    const double z_start = reference_position.z();
-    const double z_final = reference_position.z() + kLineDeltaZ;
-
-    const double q0_raw = planning_start.p.z();
-    const double q0 = std::clamp(q0_raw, z_final, z_start);
-
-    const double t_near =
-        estimateLinePathTimeFromZ(q0, z_start, z_final, kLineMoveDuration);
-
-    double t_goal = t_near + lookahead_sec;
-    t_goal = std::clamp(t_goal, 0.0, kLineMoveDuration);
-
-    const bool near_final_position = std::abs(q0 - z_final) < 1e-3;
-    const bool near_zero_velocity = std::abs(planning_start.dp.z()) < 1e-3;
-
-    samples.reserve(static_cast<std::size_t>(horizon_steps));
-
-    if (near_final_position && near_zero_velocity) {
-      for (int i = 0; i < horizon_steps; ++i) {
-        CartesianTrajectorySample s;
-        s.t = static_cast<double>(i + 1) * dt;
-        s.p = Eigen::Vector3d(reference_position.x(), reference_position.y(), z_final);
-        s.q = reference_q;
-        samples.push_back(s);
-      }
-      return samples;
-    }
-
-    const TaskRefPose goal_ref = makeReferenceLine(t_goal, reference_position, reference_R);
-
-    const double v0 = std::min(planning_start.dp.z(), 0.0);
-    const double a0 = planning_start.ddp.z();
-    const double q1 = std::clamp(goal_ref.p.z(), z_final, q0);
-
-    ruckig::Ruckig<1> otg;
-    ruckig::InputParameter<1> input;
-    ruckig::Trajectory<1> trajectory;
-
-    input.current_position = {q0};
-    input.current_velocity = {v0};
-    input.current_acceleration = {a0};
-
-    input.target_position = {q1};
-    input.target_velocity = {0.0};
-    input.target_acceleration = {0.0};
-
-    input.max_velocity = {max_velocity};
-    input.max_acceleration = {max_acceleration};
-    input.max_jerk = {max_jerk};
-
-    const auto result = otg.calculate(input, trajectory);
-    if (result < ruckig::Result::Working) {
-      return {};
-    }
-
-    const double duration = std::max(trajectory.get_duration(), dt);
-    const int n_steps =
-        std::min(horizon_steps, std::max(1, static_cast<int>(std::ceil(duration / dt))));
-
-    samples.clear();
-    samples.reserve(static_cast<std::size_t>(n_steps));
-
-    double previous_z = q0;
-
-    for (int i = 0; i < n_steps; ++i) {
-      const double tau = std::min(static_cast<double>(i + 1) * dt, duration);
-
-      std::array<double, 1> p{}, v{}, a{};
-      trajectory.at_time(tau, p, v, a);
-
-      double z_cmd = p[0];
-      double dz_cmd = v[0];
-      double ddz_cmd = a[0];
-
-      z_cmd = std::min(z_cmd, previous_z);
-      z_cmd = std::max(z_cmd, z_final);
-      dz_cmd = std::min(dz_cmd, 0.0);
-
-      if (z_cmd <= z_final + 1e-6) {
-        z_cmd = z_final;
-        dz_cmd = 0.0;
-        ddz_cmd = 0.0;
-      }
-
-      CartesianTrajectorySample s;
-      s.t = tau;
-      s.p = Eigen::Vector3d(reference_position.x(), reference_position.y(), z_cmd);
-      s.dp = Eigen::Vector3d(0.0, 0.0, dz_cmd);
-      s.ddp = Eigen::Vector3d(0.0, 0.0, ddz_cmd);
-      s.q = reference_q;
-      samples.push_back(s);
-
-      previous_z = z_cmd;
-    }
-
-    return samples;
+Eigen::Vector3d clampToNondecreasingSegmentProgress(
+    const Eigen::Vector3d& p,
+    const Eigen::Vector3d& segment_start,
+    const Eigen::Vector3d& segment_end,
+    double* previous_progress) {
+  if (previous_progress == nullptr) {
+    return p;
   }
 
-  const double t_near = std::max(0.0, nominal_guess_time);
-  const double t_goal = t_near + lookahead_sec;
-
-  const TaskRefPose goal_ref =
-      makeReferencePose(t_goal, reference_position, reference_R, traj_type);
-
-  Eigen::Vector3d target_velocity = goal_ref.dp;
-  const double v_norm = target_velocity.norm();
-  if (v_norm > max_velocity) {
-    target_velocity *= max_velocity / std::max(v_norm, kSmallPositive);
+  const Eigen::Vector3d segment = segment_end - segment_start;
+  const double length_sq = segment.squaredNorm();
+  if (length_sq < kSmallPositive) {
+    *previous_progress = 0.0;
+    return segment_end;
   }
 
-  ruckig::Ruckig<3> otg;
-  ruckig::InputParameter<3> input;
-  ruckig::Trajectory<3> trajectory;
+  double progress = (p - segment_start).dot(segment) / length_sq;
+  progress = std::clamp(progress, *previous_progress, 1.0);
+  *previous_progress = progress;
 
-  input.current_position = {
-      planning_start.p.x(),
-      planning_start.p.y(),
-      planning_start.p.z()};
-
-  input.current_velocity = {
-      planning_start.dp.x(),
-      planning_start.dp.y(),
-      planning_start.dp.z()};
-
-  input.current_acceleration = {
-      planning_start.ddp.x(),
-      planning_start.ddp.y(),
-      planning_start.ddp.z()};
-
-  input.target_position = {
-      goal_ref.p.x(),
-      goal_ref.p.y(),
-      goal_ref.p.z()};
-
-  input.target_velocity = {
-      target_velocity.x(),
-      target_velocity.y(),
-      target_velocity.z()};
-
-  input.target_acceleration = {0.0, 0.0, 0.0};
-
-  input.max_velocity = {max_velocity, max_velocity, max_velocity};
-  input.max_acceleration = {max_acceleration, max_acceleration, max_acceleration};
-  input.max_jerk = {max_jerk, max_jerk, max_jerk};
-
-  const auto result = otg.calculate(input, trajectory);
-  if (result < ruckig::Result::Working) {
-    return {};
-  }
-
-  const double duration = std::max(trajectory.get_duration(), dt);
-  const int n_steps =
-      std::min(horizon_steps, std::max(1, static_cast<int>(std::ceil(duration / dt))));
-
-  samples.reserve(static_cast<std::size_t>(n_steps));
-
-  for (int i = 0; i < n_steps; ++i) {
-    const double tau = std::min(static_cast<double>(i + 1) * dt, duration);
-
-    std::array<double, 3> p{}, v{}, a{};
-    trajectory.at_time(tau, p, v, a);
-
-    CartesianTrajectorySample s;
-    s.t = tau;
-    s.p = Eigen::Vector3d(p[0], p[1], p[2]);
-    s.dp = Eigen::Vector3d(v[0], v[1], v[2]);
-    s.ddp = Eigen::Vector3d(a[0], a[1], a[2]);
-    s.q = Eigen::Quaterniond(goal_ref.R);
-    s.q.normalize();
-    samples.push_back(s);
-  }
-
-  return samples;
+  return segment_start + progress * segment;
 }
+
+Eigen::Vector3d clampVelocityToNonnegativeSegmentProgress(
+    const Eigen::Vector3d& v,
+    const Eigen::Vector3d& segment_start,
+    const Eigen::Vector3d& segment_end) {
+  const Eigen::Vector3d segment = segment_end - segment_start;
+  const double length_sq = segment.squaredNorm();
+  if (length_sq < kSmallPositive) {
+    return Eigen::Vector3d::Zero();
+  }
+
+  const double progress_rate = v.dot(segment) / length_sq;
+  if (progress_rate >= 0.0) {
+    return v;
+  }
+
+  return v - progress_rate * segment;
+}
+
+}  // namespace
 
 std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
     const std::vector<Eigen::Vector3d>& waypoints,
@@ -705,21 +468,24 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
   first.q = q_ref;
   samples.push_back(first);
 
+  double previous_path_s = 0.0;
   for (int i = 0; i < n_steps; ++i) {
     const double tau = std::min(static_cast<double>(i + 1) * dt, duration);
     std::array<double, 1> s_arr{}, ds_arr{}, dds_arr{};
     trajectory.at_time(tau, s_arr, ds_arr, dds_arr);
 
-    const double s_path = std::clamp(s_arr[0], 0.0, path_length);
+    const double s_path = std::clamp(s_arr[0], previous_path_s, path_length);
+    const double ds_path = std::max(0.0, ds_arr[0]);
+    previous_path_s = s_path;
     const SmoothPathSample path_sample =
         sampleCubicHermitePath(points, u, tangents, s_path);
 
     CartesianTrajectorySample sample;
     sample.t = tau;
     sample.p = path_sample.p;
-    sample.dp = path_sample.dp_ds * ds_arr[0];
+    sample.dp = path_sample.dp_ds * ds_path;
     sample.ddp =
-        path_sample.d2p_ds2 * ds_arr[0] * ds_arr[0] +
+        path_sample.d2p_ds2 * ds_path * ds_path +
         path_sample.dp_ds * dds_arr[0];
     sample.q = q_ref;
     if (i + 1 == n_steps) {
@@ -881,6 +647,7 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
       std::min(horizon_steps, std::max(1, static_cast<int>(std::ceil(duration / dt))));
 
   samples.reserve(static_cast<std::size_t>(n_steps));
+  double previous_progress = 0.0;
   for (int i = 0; i < n_steps; ++i) {
     const double tau = std::min(static_cast<double>(i + 1) * dt, duration);
     const double alpha = std::clamp(tau / duration, 0.0, 1.0);
@@ -890,11 +657,169 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
 
     CartesianTrajectorySample s;
     s.t = (1.0 - alpha) * start_path_time + alpha * target_path_time;
-    s.p = Eigen::Vector3d(p[0], p[1], p[2]);
-    s.dp = Eigen::Vector3d(v[0], v[1], v[2]);
+    s.p = clampToNondecreasingSegmentProgress(
+        Eigen::Vector3d(p[0], p[1], p[2]),
+        planning_start.p,
+        target.p,
+        &previous_progress);
+    s.dp = clampVelocityToNonnegativeSegmentProgress(
+        Eigen::Vector3d(v[0], v[1], v[2]),
+        planning_start.p,
+        target.p);
     s.ddp = Eigen::Vector3d(a[0], a[1], a[2]);
     s.q = target.q;
     s.q.normalize();
+    samples.push_back(s);
+  }
+
+  return samples;
+}
+
+std::vector<CartesianTrajectorySample> makePathConsistentTimedPathReplan(
+    double min_path_time,
+    const CartesianTrajectorySample& planning_start,
+    const std::vector<CartesianTrajectorySample>& timed_path,
+    const PathConsistentTimedPathConfig& config) {
+  std::vector<CartesianTrajectorySample> samples;
+  if (timed_path.empty()) {
+    return samples;
+  }
+
+  const double dt = std::max(config.dt, kMinDt);
+  const int intended_steps = std::max(1, config.intended_steps);
+  const double max_rate = std::max(config.max_path_rate, 1e-4);
+  const double max_accel = std::max(config.max_path_acceleration, 1e-4);
+  const double max_jerk = std::max(config.max_path_jerk, 1e-4);
+  const double start_path_time = nearestPathTimeInWindow(
+      min_path_time, planning_start, timed_path, config.path_lookahead_sec);
+  const CartesianTrajectorySample path_start =
+      sampleTimedPathAt(timed_path, start_path_time);
+  const double start_rate =
+      estimatePathRateAtSample(planning_start, path_start, max_rate);
+  const double target_path_time = std::min(
+      std::max(start_path_time + std::max(config.path_lookahead_sec, dt),
+               start_path_time + dt),
+      timed_path.back().t);
+
+  if (target_path_time <= start_path_time + kMinDt) {
+    samples.reserve(static_cast<std::size_t>(intended_steps));
+    for (int i = 0; i < intended_steps; ++i) {
+      CartesianTrajectorySample s = sampleTimedPathAt(timed_path, timed_path.back().t);
+      s.dp.setZero();
+      s.ddp.setZero();
+      s.w.setZero();
+      s.dw.setZero();
+      samples.push_back(s);
+    }
+    return samples;
+  }
+
+  ruckig::Ruckig<1> otg;
+  ruckig::InputParameter<1> input;
+  ruckig::Trajectory<1> trajectory;
+
+  input.current_position = {start_path_time};
+  input.current_velocity = {start_rate};
+  input.current_acceleration = {0.0};
+  input.target_position = {target_path_time};
+  const bool target_is_path_end =
+      target_path_time >= timed_path.back().t - kMinDt;
+  input.target_velocity = {
+      target_is_path_end
+          ? 0.0
+          : std::clamp(config.target_path_rate, 0.0, max_rate)};
+  input.target_acceleration = {0.0};
+  input.max_velocity = {max_rate};
+  input.max_acceleration = {max_accel};
+  input.max_jerk = {max_jerk};
+
+  auto result = otg.calculate(input, trajectory);
+  if (result < ruckig::Result::Working) {
+    input.target_velocity = {0.0};
+    result = otg.calculate(input, trajectory);
+  }
+  if (result < ruckig::Result::Working) {
+    return samples;
+  }
+
+  const double duration = std::max(trajectory.get_duration(), dt);
+  const int n_steps = std::min(
+      intended_steps,
+      std::max(1, static_cast<int>(std::ceil(duration / dt))));
+  samples.reserve(static_cast<std::size_t>(n_steps));
+
+  for (int i = 0; i < n_steps; ++i) {
+    const double tau = std::min(static_cast<double>(i + 1) * dt, duration);
+    std::array<double, 1> s_arr{}, ds_arr{}, dds_arr{};
+    trajectory.at_time(tau, s_arr, ds_arr, dds_arr);
+    samples.push_back(retimeTimedPathSample(
+        timed_path,
+        std::clamp(s_arr[0], timed_path.front().t, timed_path.back().t),
+        std::clamp(ds_arr[0], 0.0, max_rate),
+        dds_arr[0]));
+  }
+
+  return samples;
+}
+
+std::vector<CartesianTrajectorySample> makePathConsistentTimedPathBrake(
+    double path_time,
+    const CartesianTrajectorySample& brake_start,
+    const std::vector<CartesianTrajectorySample>& timed_path,
+    const PathConsistentTimedPathConfig& config) {
+  std::vector<CartesianTrajectorySample> samples;
+  if (timed_path.empty()) {
+    return samples;
+  }
+
+  const double dt = std::max(config.dt, kMinDt);
+  const double max_rate = std::max(config.max_path_rate, 1e-4);
+  const double max_accel = std::max(config.max_path_acceleration, 1e-4);
+  const double max_jerk = std::max(config.max_path_jerk, 1e-4);
+  const double start_path_time =
+      std::clamp(path_time, timed_path.front().t, timed_path.back().t);
+  const CartesianTrajectorySample path_start =
+      sampleTimedPathAt(timed_path, start_path_time);
+  const double start_rate =
+      estimatePathRateAtSample(brake_start, path_start, max_rate);
+
+  ruckig::Ruckig<1> otg;
+  ruckig::InputParameter<1> input;
+  ruckig::Trajectory<1> trajectory;
+  input.control_interface = ruckig::ControlInterface::Velocity;
+  input.current_position = {start_path_time};
+  input.current_velocity = {start_rate};
+  input.current_acceleration = {0.0};
+  input.target_velocity = {0.0};
+  input.target_acceleration = {0.0};
+  input.max_velocity = {max_rate};
+  input.max_acceleration = {max_accel};
+  input.max_jerk = {max_jerk};
+
+  const auto result = otg.calculate(input, trajectory);
+  if (result < ruckig::Result::Working) {
+    return samples;
+  }
+
+  const double duration = std::max(trajectory.get_duration(), dt);
+  const int n_steps = std::max(1, static_cast<int>(std::ceil(duration / dt)));
+  samples.reserve(static_cast<std::size_t>(n_steps));
+
+  for (int i = 0; i < n_steps; ++i) {
+    const double tau = std::min(static_cast<double>(i + 1) * dt, duration);
+    std::array<double, 1> s_arr{}, ds_arr{}, dds_arr{};
+    trajectory.at_time(tau, s_arr, ds_arr, dds_arr);
+    CartesianTrajectorySample s = retimeTimedPathSample(
+        timed_path,
+        std::clamp(s_arr[0], timed_path.front().t, timed_path.back().t),
+        std::clamp(ds_arr[0], 0.0, max_rate),
+        dds_arr[0]);
+    if (i + 1 == n_steps) {
+      s.dp.setZero();
+      s.ddp.setZero();
+      s.w.setZero();
+      s.dw.setZero();
+    }
     samples.push_back(s);
   }
 

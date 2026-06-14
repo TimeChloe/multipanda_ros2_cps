@@ -198,9 +198,7 @@ reachable_cartesian_impedance_controller:
     enable_prediction_logging: true
     prediction_log_file_name: shield_prediction_trajectory.csv
 
-    use_constant_reference: false
-    reference_trajectory_type: via_points_smooth
-    # Use via_points_smooth to pass through waypoints without stopping.
+    # Cartesian via points are followed without stopping.
     # If cartesian_via_points_relative is true, each point is an offset from
     # the initial TCP pose; otherwise points are absolute world coordinates.
     cartesian_via_points_relative: true
@@ -216,22 +214,22 @@ reachable_cartesian_impedance_controller:
     # ]
     cartesian_via_points: [0.0, 0.0, -0.6]
 
-    nominal_pos_stiffness: 600.0
-    nominal_rot_stiffness: 60.0
+    nominal_pos_stiffness: 1200.0
+    nominal_rot_stiffness: 200.0
 
     # Failsafe 建议比 nominal 更软，但阻尼更大，用于安全吸收动能。
-    failsafe_pos_stiffness: 100.0
-    failsafe_rot_stiffness: 20.0
-    failsafe_pos_damping_scale: 3.0
-    failsafe_rot_damping_scale: 3.0
+    failsafe_pos_stiffness: 1200.0
+    failsafe_rot_stiffness: 200.0
+    failsafe_pos_damping_scale: 1.5
+    failsafe_rot_damping_scale: 1.5
 
     n_stiffness: 0.0
     disable_nullspace_in_failsafe: true
 
     enable_safety_monitor: true
 
-    safe_collision_energy_joule: 0.15
-    clamping_energy_budget_joule: 0.15
+    safe_collision_energy_joule: 0.05
+    clamping_energy_budget_joule: 0.05
     energy_budget_margin_joule: 0.000
     contact_activation_margin: 0.0
 

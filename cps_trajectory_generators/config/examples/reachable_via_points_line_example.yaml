@@ -1,7 +1,5 @@
 reachable_cartesian_impedance_controller:
   ros__parameters:
-    use_constant_reference: false
-    reference_trajectory_type: via_points_smooth
     cartesian_via_points_relative: true
     cartesian_via_points: [
       0.0, 0.0, -0.55
