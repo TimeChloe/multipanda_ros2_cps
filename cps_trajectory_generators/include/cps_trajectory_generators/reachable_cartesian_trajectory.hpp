@@ -35,6 +35,7 @@ struct PathConsistentTimedPathConfig {
   double max_path_acceleration{0.5};
   double max_path_jerk{5.0};
   double target_path_rate{1.0};
+  double initial_path_rate{-1.0};
 };
 
 struct TrajectoryGeneratorSettings {

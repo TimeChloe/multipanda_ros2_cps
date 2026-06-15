@@ -11,9 +11,12 @@ local_replan_max_velocity: 0.3
 local_replan_max_acceleration: 4.0
 local_replan_max_jerk: 40.0
 
-failsafe_brake_max_velocity: 0.8
-failsafe_brake_max_acceleration: 2.0
-failsafe_brake_max_jerk: 80.0
+# High but still Franka-conscious Cartesian brake limits.
+# These are intentionally close to common Franka Cartesian rate limits
+# while leaving margin for impedance tracking and torque-rate limiting.
+failsafe_brake_max_velocity: 1.5
+failsafe_brake_max_acceleration: 10.0
+failsafe_brake_max_jerk: 5000.0
 
 path_time_rate_min: 0.0
 path_time_rate_max: 1.0

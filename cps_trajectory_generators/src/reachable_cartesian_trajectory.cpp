@@ -694,8 +694,12 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathReplan(
       min_path_time, planning_start, timed_path, config.path_lookahead_sec);
   const CartesianTrajectorySample path_start =
       sampleTimedPathAt(timed_path, start_path_time);
-  const double start_rate =
+  const double estimated_start_rate =
       estimatePathRateAtSample(planning_start, path_start, max_rate);
+  const double start_rate =
+      config.initial_path_rate >= 0.0
+          ? std::clamp(config.initial_path_rate, 0.0, max_rate)
+          : estimated_start_rate;
   const double target_path_time = std::min(
       std::max(start_path_time + std::max(config.path_lookahead_sec, dt),
                start_path_time + dt),

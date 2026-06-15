@@ -214,6 +214,15 @@ inline Vector3d normalizedOrZero(const Vector3d& v) {
   return v / norm;
 }
 
+inline Vector3d clampVectorNorm(const Vector3d& v, double max_norm) {
+  const double limit = std::max(max_norm, 0.0);
+  const double norm = v.norm();
+  if (norm <= limit || norm < 1.0e-12) {
+    return v;
+  }
+  return v * (limit / norm);
+}
+
 inline Vector3d fallbackMonitorDirection(
     const Vector3d& x_pred,
     const Vector3d& v_pred,
@@ -509,7 +518,8 @@ ImpedanceSample ReachableCartesianImpedanceController::getNextFailsafeCommandFro
 std::vector<ImpedanceSample>
 ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     double nominal_guess_time,
-    const ImpedanceSample& planning_start_command) const {
+    const ImpedanceSample& planning_start_command,
+    double initial_path_rate) const {
   CartesianTrajectorySample planning_start;
   planning_start.t = planning_start_command.t;
   planning_start.p = planning_start_command.p;
@@ -541,6 +551,8 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     path_config.target_path_rate =
         std::clamp(path_time_rate_target_, path_time_rate_min_,
                    path_time_rate_max_);
+    path_config.initial_path_rate =
+        std::clamp(initial_path_rate, path_time_rate_min_, path_time_rate_max_);
 
     planned_samples = makePathConsistentTimedPathReplan(
         std::max(nominal_guess_time, commanded_path_time_),
@@ -554,6 +566,25 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
           planning_start,
           cartesian_via_point_path_,
           config);
+    }
+  }
+
+  if (!planned_samples.empty()) {
+    Vector3d previous_position = planning_start.p;
+    Vector3d previous_velocity = planning_start.dp;
+    for (auto& sample : planned_samples) {
+      const double dt = std::max(local_replan_dt_, kMinDt);
+      const Vector3d raw_velocity =
+          (sample.p - previous_position) / dt;
+      const Vector3d velocity =
+          clampVectorNorm(raw_velocity, local_replan_max_velocity_);
+      const Vector3d raw_acceleration =
+          (velocity - previous_velocity) / dt;
+      sample.dp = velocity;
+      sample.ddp =
+          clampVectorNorm(raw_acceleration, local_replan_max_acceleration_);
+      previous_position = sample.p;
+      previous_velocity = sample.dp;
     }
   }
 
@@ -585,7 +616,8 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
 // ============================================================================
 bool ReachableCartesianImpedanceController::refillIntendedBufferFromReplanner(
     double nominal_guess_time,
-    const ImpedanceSample& planning_start_command) {
+    const ImpedanceSample& planning_start_command,
+    double initial_path_rate) {
   intended_buffer_.clear();
   intended_buffer_index_ = 0;
   intended_buffer_valid_ = false;
@@ -593,7 +625,8 @@ bool ReachableCartesianImpedanceController::refillIntendedBufferFromReplanner(
   intended_buffer_ =
       makeIntendedBufferFromReplanner(
           nominal_guess_time,
-          planning_start_command);
+          planning_start_command,
+          initial_path_rate);
 
   intended_buffer_valid_ = !intended_buffer_.empty();
   return intended_buffer_valid_;
@@ -783,6 +816,48 @@ Vector6d ReachableCartesianImpedanceController::twistAtCollisionCenter(
   return collision_twist;
 }
 
+double ReachableCartesianImpedanceController::estimatePathRateFromTimedPathSample(
+    double path_time,
+    const Vector3d& cartesian_velocity) const {
+  if (cartesian_via_point_path_.empty()) {
+    return 0.0;
+  }
+
+  const double t =
+      std::clamp(path_time,
+                 cartesian_via_point_path_.front().t,
+                 cartesian_via_point_path_.back().t);
+  auto upper = std::lower_bound(
+      cartesian_via_point_path_.begin(),
+      cartesian_via_point_path_.end(),
+      t,
+      [](const CartesianTrajectorySample& sample, double value) {
+        return sample.t < value;
+      });
+
+  Vector3d path_velocity = Vector3d::Zero();
+  if (upper == cartesian_via_point_path_.begin()) {
+    path_velocity = upper->dp;
+  } else if (upper == cartesian_via_point_path_.end()) {
+    path_velocity = cartesian_via_point_path_.back().dp;
+  } else {
+    const auto lower = upper - 1;
+    const double span = std::max(upper->t - lower->t, kMinDt);
+    const double alpha = std::clamp((t - lower->t) / span, 0.0, 1.0);
+    path_velocity = (1.0 - alpha) * lower->dp + alpha * upper->dp;
+  }
+
+  const double denom = path_velocity.squaredNorm();
+  if (denom < kSmallPositive) {
+    return 0.0;
+  }
+  const double rate = cartesian_velocity.dot(path_velocity) / denom;
+  if (!std::isfinite(rate)) {
+    return 0.0;
+  }
+  return std::clamp(rate, path_time_rate_min_, path_time_rate_max_);
+}
+
 VerifiedPlan ReachableCartesianImpedanceController::makeCollisionCenterPlanForMonitor(
     const VerifiedPlan& flange_plan) const {
   VerifiedPlan plan = flange_plan;
@@ -887,7 +962,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
 
       const bool ok = refillIntendedBufferFromReplanner(
           nominal_guess_time,
-          planning_start_command);
+          planning_start_command,
+          commanded_path_rate_);
 
       if (!ok) {
         return false;
@@ -945,9 +1021,26 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     candidate_plan_valid_ = false;
 
     intended_buffer_index_ += last_verified_plan_.intended.size();
+    const double previous_path_time = commanded_path_time_;
     if (last_verified_plan_.nominal_time_anchor > 0.0) {
       commanded_path_time_ =
           std::max(commanded_path_time_, last_verified_plan_.nominal_time_anchor);
+    }
+    if (!last_verified_plan_.intended.empty()) {
+      const double plan_duration =
+          std::max(local_replan_dt_,
+                   static_cast<double>(last_verified_plan_.intended.size()) *
+                       local_replan_dt_);
+      if (last_verified_plan_.nominal_time_anchor > previous_path_time + kMinDt) {
+        commanded_path_rate_ = std::clamp(
+            (last_verified_plan_.nominal_time_anchor - previous_path_time) /
+                plan_duration,
+            path_time_rate_min_,
+            path_time_rate_max_);
+      } else if (!cartesian_via_point_path_.empty() &&
+                 commanded_path_time_ >= cartesian_via_point_path_.back().t - kMinDt) {
+        commanded_path_rate_ = 0.0;
+      }
     }
 
     mode_ = SafetyMode::kNominal;
@@ -1021,7 +1114,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
       state.intended_buffer =
           makeIntendedBufferFromReplanner(
               input.nominal_guess_time,
-              planning_start_command);
+              planning_start_command,
+              input.commanded_path_rate);
 
       state.intended_buffer_index = 0;
       state.intended_buffer_valid = !state.intended_buffer.empty();
@@ -1687,6 +1781,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       async_input.D_runtime = D_runtime_;
       async_input.last_commanded_sample = last_commanded_sample_;
       async_input.last_commanded_sample_valid = last_commanded_sample_valid_;
+      async_input.commanded_path_rate = commanded_path_rate_;
       publishAsyncMonitorInput(async_input);
       last_async_input_publish_wall_time_ = wall_time;
     }
@@ -1720,9 +1815,26 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         last_verified_plan_.valid = true;
         last_verified_plan_.intended_exec_index = 0;
         last_verified_plan_.failsafe_exec_index = 0;
+        const double previous_path_time = commanded_path_time_;
         if (last_verified_plan_.nominal_time_anchor > 0.0) {
           commanded_path_time_ =
               std::max(commanded_path_time_, last_verified_plan_.nominal_time_anchor);
+        }
+        if (!last_verified_plan_.intended.empty()) {
+          const double plan_duration =
+              std::max(local_replan_dt_,
+                       static_cast<double>(last_verified_plan_.intended.size()) *
+                           local_replan_dt_);
+          if (last_verified_plan_.nominal_time_anchor > previous_path_time + kMinDt) {
+            commanded_path_rate_ = std::clamp(
+                (last_verified_plan_.nominal_time_anchor - previous_path_time) /
+                    plan_duration,
+                path_time_rate_min_,
+                path_time_rate_max_);
+          } else if (!cartesian_via_point_path_.empty() &&
+                     commanded_path_time_ >= cartesian_via_point_path_.back().t - kMinDt) {
+            commanded_path_rate_ = 0.0;
+          }
         }
       }
     }
@@ -2326,11 +2438,11 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     local_replan_max_jerk_ =
         std::max(1e-4, trajectory_settings.local_replan_max_jerk);
     failsafe_brake_max_velocity_ =
-        std::min(1.7, std::max(1e-4, trajectory_settings.failsafe_brake_max_velocity));
+        std::max(1e-4, trajectory_settings.failsafe_brake_max_velocity);
     failsafe_brake_max_acceleration_ =
-        std::min(13.0, std::max(1e-4, trajectory_settings.failsafe_brake_max_acceleration));
+        std::max(1e-4, trajectory_settings.failsafe_brake_max_acceleration);
     failsafe_brake_max_jerk_ =
-        std::min(6500.0, std::max(1e-4, trajectory_settings.failsafe_brake_max_jerk));
+        std::max(1e-4, trajectory_settings.failsafe_brake_max_jerk);
 
     use_dynamic_consistent_impedance_ = get_node()->get_parameter("use_dynamic_consistent_impedance").as_bool();
     torque_rate_limit_ = get_node()->get_parameter("torque_rate_limit").as_double();
@@ -2490,6 +2602,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   last_commanded_sample_.D = D_nominal_;
   last_commanded_sample_.failsafe = false;
   last_commanded_sample_valid_ = true;
+  commanded_path_rate_ = 0.0;
 
   mode_ = SafetyMode::kNominal;
   failsafe_start_time_sec_ = -1.0;

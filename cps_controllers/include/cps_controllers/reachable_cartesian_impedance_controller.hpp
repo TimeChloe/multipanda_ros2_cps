@@ -126,11 +126,13 @@ class ReachableCartesianImpedanceController
 
   std::vector<ImpedanceSample> makeIntendedBufferFromReplanner(
       double nominal_guess_time,
-      const ImpedanceSample& planning_start_command) const;
+      const ImpedanceSample& planning_start_command,
+      double initial_path_rate) const;
 
   bool refillIntendedBufferFromReplanner(
       double nominal_guess_time,
-      const ImpedanceSample& planning_start_command);
+      const ImpedanceSample& planning_start_command,
+      double initial_path_rate);
 
   VerifiedPlan buildCandidatePlan(
       double wall_time,
@@ -159,6 +161,9 @@ class ReachableCartesianImpedanceController
 
   VerifiedPlan makeCollisionCenterPlanForMonitor(const VerifiedPlan& flange_plan) const;
 
+  double estimatePathRateFromTimedPathSample(double path_time,
+                                             const Vector3d& cartesian_velocity) const;
+
   ShieldDecision computeShieldDecision(double wall_time,
                                        double nominal_guess_time,
                                        const Vector3d& current_position,
@@ -185,6 +190,7 @@ class ReachableCartesianImpedanceController
 
     ImpedanceSample last_commanded_sample;
     bool last_commanded_sample_valid{false};
+    double commanded_path_rate{0.0};
   };
 
   struct AsyncMonitorOutput {
@@ -392,6 +398,7 @@ class ReachableCartesianImpedanceController
   ImpedanceSample last_commanded_sample_{};
   bool last_commanded_sample_valid_{false};
   double commanded_path_time_{0.0};
+  double commanded_path_rate_{0.0};
 
   Vector7d tau_cmd_prev_{Vector7d::Zero()};
 
