@@ -81,6 +81,12 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathReplan(
     const std::vector<CartesianTrajectorySample>& timed_path,
     const PathConsistentTimedPathConfig& config);
 
+std::vector<CartesianTrajectorySample> makePathConsistentTimedPathIntendedPrefix(
+    double min_path_time,
+    const CartesianTrajectorySample& planning_start,
+    const std::vector<CartesianTrajectorySample>& timed_path,
+    const PathConsistentTimedPathConfig& config);
+
 std::vector<CartesianTrajectorySample> makePathConsistentTimedPathBrake(
     double path_time,
     const CartesianTrajectorySample& brake_start,

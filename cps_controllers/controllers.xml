@@ -20,8 +20,8 @@
          type="cps_controllers::ReachableCartesianImpedanceController"
          base_class_type="controller_interface::ControllerInterface">
     <description>
-      Validation-oriented Cartesian impedance controller with nominal/failsafe modes,
-      reference freezing, safety monitor, and logging.
+      Reachable Cartesian impedance controller with nominal/failsafe trajectories,
+      contact monitoring, Cartesian energy-budget scaling, and logging.
     </description>
   </class>
 

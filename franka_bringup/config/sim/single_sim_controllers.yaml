@@ -195,7 +195,7 @@ reachable_cartesian_impedance_controller:
     enable_error_logging: true
     error_log_root_dir: /home/developer/multipanda_ws/src/data_log
     error_log_file_name: reachable_cartesian_impedance_validation.csv
-    enable_prediction_logging: true
+    enable_prediction_logging: false
     prediction_log_file_name: shield_prediction_trajectory.csv
 
     # Cartesian via points are followed without stopping.
@@ -220,17 +220,19 @@ reachable_cartesian_impedance_controller:
     # Failsafe 建议比 nominal 更软，但阻尼更大，用于安全吸收动能。
     failsafe_pos_stiffness: 1200.0
     failsafe_rot_stiffness: 200.0
-    failsafe_pos_damping_scale: 1.5
-    failsafe_rot_damping_scale: 1.5
+    failsafe_pos_damping_scale: 0.8
+    failsafe_rot_damping_scale: 0.8
 
     n_stiffness: 0.0
     disable_nullspace_in_failsafe: true
 
     enable_safety_monitor: true
 
-    safe_collision_energy_joule: 0.05
-    clamping_energy_budget_joule: 0.05
+    safe_collision_energy_joule: 0.10
+    clamping_energy_budget_joule: 0.10
     energy_budget_margin_joule: 0.000
+    cartesian_energy_budget_joule: 0.10
+    cartesian_energy_lambda_update_period_sec: 0.004
     contact_activation_margin: 0.0
 
     ee_collision_radius: 0.03

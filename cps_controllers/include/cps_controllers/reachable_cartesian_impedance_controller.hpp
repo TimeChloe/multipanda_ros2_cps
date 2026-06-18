@@ -59,6 +59,10 @@ struct ShieldDecision {
   ImpedanceSample command;
   MonitorResult monitor;
   VerifiedPlan evaluated_plan;
+  double monitor_total_ms{0.0};
+  double planner_ms{0.0};
+  double plan_build_ms{0.0};
+  double monitor_eval_ms{0.0};
 };
 
 class ReachableCartesianImpedanceController
@@ -127,12 +131,16 @@ class ReachableCartesianImpedanceController
   std::vector<ImpedanceSample> makeIntendedBufferFromReplanner(
       double nominal_guess_time,
       const ImpedanceSample& planning_start_command,
-      double initial_path_rate) const;
+      double initial_path_rate,
+      bool effective_time_frozen) const;
 
   bool refillIntendedBufferFromReplanner(
       double nominal_guess_time,
       const ImpedanceSample& planning_start_command,
-      double initial_path_rate);
+      double initial_path_rate,
+      bool effective_time_frozen);
+
+  void invalidateIntendedBuffer();
 
   VerifiedPlan buildCandidatePlan(
       double wall_time,
@@ -145,19 +153,21 @@ class ReachableCartesianImpedanceController
       const Matrix6d& D_runtime,
       const std::vector<ImpedanceSample>& intended_samples) const;
 
-  MonitorResult verifyCandidatePlan(const VerifiedPlan& plan,
-                                    const Vector3d& current_position,
-                                    const Quaterniond& current_orientation,
-                                    const Vector6d& ee_twist,
-                                    const Matrix7d& inertia,
-                                    const Matrix37d& Jv,
-                                    const Matrix6d& K_runtime,
-                                    const Matrix6d& D_runtime) const;
+  MonitorResult evaluateCandidatePlan(const VerifiedPlan& plan,
+                                      const Vector3d& current_position,
+                                      const Quaterniond& current_orientation,
+                                      const Vector6d& ee_twist,
+                                      const Matrix7d& inertia,
+                                      const Matrix37d& Jv,
+                                      const Matrix6d& K_runtime,
+                                      const Matrix6d& D_runtime) const;
 
   Vector3d collisionCenterOffsetWorld(const Quaterniond& orientation) const;
 
   Vector6d twistAtCollisionCenter(const Quaterniond& orientation,
                                   const Vector6d& flange_twist) const;
+
+  VerifiedPlan makeSparsePlanForMonitor(const VerifiedPlan& dense_plan) const;
 
   VerifiedPlan makeCollisionCenterPlanForMonitor(const VerifiedPlan& flange_plan) const;
 
@@ -191,6 +201,8 @@ class ReachableCartesianImpedanceController
     ImpedanceSample last_commanded_sample;
     bool last_commanded_sample_valid{false};
     double commanded_path_rate{0.0};
+    bool executing_failsafe{false};
+    bool cartesian_effective_time_frozen{false};
   };
 
   struct AsyncMonitorOutput {
@@ -233,6 +245,10 @@ class ReachableCartesianImpedanceController
       const MonitorResult& monitor,
       bool candidate_verified,
       bool executing_failsafe,
+      double monitor_total_ms,
+      double planner_ms,
+      double plan_build_ms,
+      double monitor_eval_ms,
       const char* source);
 
   Vector7d computeImpedanceTorque(const Vector7d& q,
@@ -249,10 +265,44 @@ class ReachableCartesianImpedanceController
 
   ImpedanceSample getNextFailsafeCommandFromCache(bool advance_index);
 
+  ImpedanceSample getNextVerifiedTrajectoryCommandFromCache(bool advance_index);
+
   Matrix6d computeDampingFromStiffness(
       const Matrix6d& K,
       double pos_damping_scale,
       double rot_damping_scale) const;
+
+  struct CartesianEnergyBudgetInfo {
+    bool active{false};
+    bool lambda_valid{false};
+    double scale{1.0};
+    double kinetic_energy{0.0};
+    double potential_energy{0.0};
+    double total_energy{0.0};
+  };
+
+  bool shouldRejectCandidateWithMonitor(const MonitorResult& monitor) const;
+
+  bool shouldApplyCartesianEnergyBudget(
+      const MonitorResult& monitor,
+      const ImpedanceSample& command,
+      bool executing_failsafe) const;
+
+  bool computeTaskInertia(const Matrix7d& inertia,
+                          const Matrix67d& J_geo,
+                          Matrix6d* lambda) const;
+
+  ImpedanceSample makeEffectiveTimeHoldSample(
+      const ImpedanceSample& command) const;
+
+  ImpedanceSample applyCartesianEnergyBudget(
+      const ImpedanceSample& command,
+      const Vector6d& error,
+      const Vector6d& xdot,
+      const Matrix6d& lambda,
+      bool lambda_valid,
+      bool active,
+      CartesianEnergyBudgetInfo* info) const;
 
   bool enable_error_logging_{false};
   std::string error_log_root_dir_{"/home/developer/multipanda_ws/src/data_log"};
@@ -385,6 +435,7 @@ class ReachableCartesianImpedanceController
   double last_async_input_publish_wall_time_{-1.0};
 
   VerifiedPlan last_verified_plan_{};
+  VerifiedPlan last_monitored_plan_{};
   VerifiedPlan candidate_plan_{};
   bool candidate_plan_valid_{false};
 
@@ -455,6 +506,21 @@ class ReachableCartesianImpedanceController
 
   double clamping_energy_budget_joule_{0.05};
   double energy_budget_margin_joule_{0.005};
+  double cartesian_energy_budget_joule_{0.05};
+  double cartesian_energy_lambda_update_period_sec_{0.004};
+  Matrix6d cartesian_energy_lambda_cache_{};
+  bool cartesian_energy_lambda_cache_valid_{false};
+  double cartesian_energy_lambda_cache_wall_time_{-1.0};
+  bool last_cartesian_energy_budget_active_{false};
+  bool last_cartesian_energy_budget_lambda_valid_{false};
+  double last_cartesian_energy_scale_{1.0};
+  double last_cartesian_kinetic_energy_{0.0};
+  double last_cartesian_potential_energy_{0.0};
+  double last_cartesian_control_energy_{0.0};
+  bool cartesian_effective_time_frozen_{false};
+  double cartesian_effective_time_freeze_start_wall_time_{-1.0};
+  ImpedanceSample cartesian_effective_time_hold_sample_{};
+  bool cartesian_effective_time_hold_sample_valid_{false};
   double contact_activation_margin_{0.0};
   double failsafe_min_pos_stiffness_{5.0};
 

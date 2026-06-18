@@ -766,6 +766,100 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathReplan(
   return samples;
 }
 
+std::vector<CartesianTrajectorySample> makePathConsistentTimedPathIntendedPrefix(
+    double min_path_time,
+    const CartesianTrajectorySample& planning_start,
+    const std::vector<CartesianTrajectorySample>& timed_path,
+    const PathConsistentTimedPathConfig& config) {
+  std::vector<CartesianTrajectorySample> samples;
+  if (timed_path.empty()) {
+    return samples;
+  }
+
+  const double dt = std::max(config.dt, kMinDt);
+  const int intended_steps = std::max(1, config.intended_steps);
+  const double max_rate = std::max(config.max_path_rate, 1e-4);
+  const double max_accel = std::max(config.max_path_acceleration, 1e-4);
+  const double max_jerk = std::max(config.max_path_jerk, 1e-4);
+  const double start_path_time = nearestPathTimeInWindow(
+      min_path_time, planning_start, timed_path, config.path_lookahead_sec);
+  const CartesianTrajectorySample path_start =
+      sampleTimedPathAt(timed_path, start_path_time);
+  const double estimated_start_rate =
+      estimatePathRateAtSample(planning_start, path_start, max_rate);
+  const double start_rate =
+      config.initial_path_rate >= 0.0
+          ? std::clamp(config.initial_path_rate, 0.0, max_rate)
+          : estimated_start_rate;
+  const double target_rate =
+      std::clamp(config.target_path_rate, 0.0, max_rate);
+
+  samples.reserve(static_cast<std::size_t>(intended_steps));
+  if (start_path_time >= timed_path.back().t - kMinDt) {
+    for (int i = 0; i < intended_steps; ++i) {
+      CartesianTrajectorySample s = sampleTimedPathAt(timed_path, timed_path.back().t);
+      s.dp.setZero();
+      s.ddp.setZero();
+      s.w.setZero();
+      s.dw.setZero();
+      samples.push_back(s);
+    }
+    return samples;
+  }
+
+  ruckig::Ruckig<1> otg;
+  ruckig::InputParameter<1> input;
+  ruckig::Trajectory<1> trajectory;
+
+  input.control_interface = ruckig::ControlInterface::Velocity;
+  input.current_position = {start_path_time};
+  input.current_velocity = {start_rate};
+  input.current_acceleration = {0.0};
+  input.target_velocity = {target_rate};
+  input.target_acceleration = {0.0};
+  input.max_velocity = {max_rate};
+  input.max_acceleration = {max_accel};
+  input.max_jerk = {max_jerk};
+
+  const auto result = otg.calculate(input, trajectory);
+  if (result < ruckig::Result::Working) {
+    return {};
+  }
+
+  const double duration = std::max(trajectory.get_duration(), 0.0);
+  std::array<double, 1> s_final{start_path_time};
+  std::array<double, 1> ds_final{target_rate};
+  std::array<double, 1> dds_final{0.0};
+  if (duration > kMinDt) {
+    trajectory.at_time(duration, s_final, ds_final, dds_final);
+  }
+
+  for (int i = 0; i < intended_steps; ++i) {
+    const double tau = static_cast<double>(i + 1) * dt;
+    std::array<double, 1> s_arr{}, ds_arr{}, dds_arr{};
+
+    if (duration > kMinDt && tau <= duration + kMinDt) {
+      trajectory.at_time(std::min(tau, duration), s_arr, ds_arr, dds_arr);
+    } else {
+      const double extra_time = std::max(0.0, tau - duration);
+      s_arr[0] = s_final[0] + ds_final[0] * extra_time;
+      ds_arr[0] = ds_final[0];
+      dds_arr[0] = 0.0;
+    }
+
+    const double path_time =
+        std::clamp(s_arr[0], timed_path.front().t, timed_path.back().t);
+    const bool at_path_end = path_time >= timed_path.back().t - kMinDt;
+    samples.push_back(retimeTimedPathSample(
+        timed_path,
+        path_time,
+        at_path_end ? 0.0 : std::clamp(ds_arr[0], 0.0, max_rate),
+        at_path_end ? 0.0 : dds_arr[0]));
+  }
+
+  return samples;
+}
+
 std::vector<CartesianTrajectorySample> makePathConsistentTimedPathBrake(
     double path_time,
     const CartesianTrajectorySample& brake_start,
