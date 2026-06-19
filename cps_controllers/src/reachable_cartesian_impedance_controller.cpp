@@ -20,7 +20,6 @@
 #include <cstddef>
 #include <exception>
 #include <filesystem>
-#include <functional>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -35,7 +34,6 @@
 
 #include <controller_interface/controller_interface.hpp>
 #include <franka/model.h>
-#include <franka/robot_state.h>
 #include <franka_semantic_components/franka_robot_model.hpp>
 #include <pluginlib/class_list_macros.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -632,27 +630,6 @@ ImpedanceSample ReachableCartesianImpedanceController::makeEmergencyStopCommand(
   return emergency;
 }
 
-// ============================================================================
-// Cache for the accepted intended prefix
-// ============================================================================
-ImpedanceSample ReachableCartesianImpedanceController::getNextIntendedCommandFromCache(
-    bool advance_index) {
-  if (!last_verified_plan_.valid || last_verified_plan_.intended.empty()) {
-    return ImpedanceSample{};
-  }
-  const std::size_t idx = std::min(
-      last_verified_plan_.intended_exec_index,
-      last_verified_plan_.intended.size() - 1);
-  last_verified_command_stage_ = 1;
-  last_verified_command_index_ = idx;
-  ImpedanceSample cmd = last_verified_plan_.intended[idx];
-  if (advance_index &&
-      last_verified_plan_.intended_exec_index + 1 < last_verified_plan_.intended.size()) {
-    ++last_verified_plan_.intended_exec_index;
-  }
-  return cmd;
-}
-
 ImpedanceSample ReachableCartesianImpedanceController::getNextFailsafeCommandFromCache(
     bool advance_index) {
   if (!last_verified_plan_.valid || last_verified_plan_.failsafe.empty())
@@ -842,33 +819,6 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
   }
 
   return intended_buffer;
-}
-
-// ============================================================================
-// Refill the intended cache from the trajectory generator package
-// ============================================================================
-bool ReachableCartesianImpedanceController::refillIntendedBufferFromReplanner(
-    double nominal_guess_time,
-    const ImpedanceSample& planning_start_command,
-    double initial_path_rate,
-    bool effective_time_frozen) {
-  invalidateIntendedBuffer();
-
-  intended_buffer_ =
-      makeIntendedBufferFromReplanner(
-          nominal_guess_time,
-          planning_start_command,
-          initial_path_rate,
-          effective_time_frozen);
-
-  intended_buffer_valid_ = !intended_buffer_.empty();
-  return intended_buffer_valid_;
-}
-
-void ReachableCartesianImpedanceController::invalidateIntendedBuffer() {
-  intended_buffer_valid_ = false;
-  intended_buffer_index_ = 0;
-  intended_buffer_.clear();
 }
 
 // ============================================================================
@@ -1204,6 +1154,7 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
   double plan_build_ms = 0.0;
   double monitor_eval_ms = 0.0;
   ShieldDecision dec;
+  VerifiedPlan candidate_plan;
 
   auto stamp_timing = [&]() {
     dec.monitor_total_ms =
@@ -1219,7 +1170,6 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
   };
 
   auto execute_last_verified_failsafe = [&]() {
-    invalidateIntendedBuffer();
     dec.executing_last_verified_failsafe = true;
     dec.candidate_verified = false;
     if (last_verified_plan_.valid &&
@@ -1231,61 +1181,54 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     }
   };
 
-  auto try_one_monitor_pass_with_fresh_buffer_if_needed = [&]() -> bool {
-    invalidateIntendedBuffer();
+  auto try_one_monitor_pass = [&]() -> bool {
+    ImpedanceSample planning_start_command;
+    planning_start_command.t = wall_time;
 
-    if (!intended_buffer_valid_ || intended_buffer_index_ >= intended_buffer_.size()) {
-      ImpedanceSample planning_start_command;
+    if (last_commanded_sample_valid_) {
+      planning_start_command.p = last_commanded_sample_.p;
+      planning_start_command.q = last_commanded_sample_.q;
+      planning_start_command.dp = last_commanded_sample_.dp;
+      planning_start_command.w = last_commanded_sample_.w;
+      planning_start_command.ddp = last_commanded_sample_.ddp;
+      planning_start_command.dw = last_commanded_sample_.dw;
+    } else {
+      planning_start_command.p = current_position;
+      planning_start_command.q = current_orientation;
+      planning_start_command.dp = ee_twist.head<3>();
+      planning_start_command.w = ee_twist.tail<3>();
+      planning_start_command.ddp.setZero();
+      planning_start_command.dw.setZero();
+    }
+    planning_start_command.q.normalize();
 
-      planning_start_command.t = wall_time;
+    planning_start_command.K = K_nominal_;
+    planning_start_command.D = D_nominal_;
+    planning_start_command.failsafe = false;
 
-      if (last_commanded_sample_valid_) {
-        planning_start_command.p = last_commanded_sample_.p;
-        planning_start_command.q = last_commanded_sample_.q;
-        planning_start_command.dp = last_commanded_sample_.dp;
-        planning_start_command.w = last_commanded_sample_.w;
-        planning_start_command.ddp = last_commanded_sample_.ddp;
-        planning_start_command.dw = last_commanded_sample_.dw;
-      } else {
-        planning_start_command.p = current_position;
-        planning_start_command.q = current_orientation;
-        planning_start_command.dp = ee_twist.head<3>();
-        planning_start_command.w = ee_twist.tail<3>();
-        planning_start_command.ddp.setZero();
-        planning_start_command.dw.setZero();
-      }
-      planning_start_command.q.normalize();
+    const auto planner_tic = SteadyClock::now();
+    const std::vector<ImpedanceSample> intended_buffer =
+        makeIntendedBufferFromReplanner(
+            nominal_guess_time,
+            planning_start_command,
+            commanded_path_rate_,
+            cartesian_effective_time_frozen_);
+    planner_ms +=
+        std::chrono::duration<double, std::milli>(SteadyClock::now() - planner_tic).count();
 
-      planning_start_command.K = K_nominal_;
-      planning_start_command.D = D_nominal_;
-      planning_start_command.failsafe = false;
-
-      const auto planner_tic = SteadyClock::now();
-      const bool ok = refillIntendedBufferFromReplanner(
-          nominal_guess_time,
-          planning_start_command,
-          commanded_path_rate_,
-          cartesian_effective_time_frozen_);
-      planner_ms +=
-          std::chrono::duration<double, std::milli>(SteadyClock::now() - planner_tic).count();
-
-      if (!ok) {
-        return false;
-      }
+    if (intended_buffer.empty()) {
+      return false;
     }
 
-    const std::size_t available =
-        intended_buffer_.size() - intended_buffer_index_;
     const std::size_t segment_count = std::min<std::size_t>(
         static_cast<std::size_t>(std::max(1, shield_intended_steps_)),
-        available);
+        intended_buffer.size());
     std::vector<ImpedanceSample> intended_segment(
-        intended_buffer_.begin() + static_cast<std::ptrdiff_t>(intended_buffer_index_),
-        intended_buffer_.begin() + static_cast<std::ptrdiff_t>(
-                                     intended_buffer_index_ + segment_count));
+        intended_buffer.begin(),
+        intended_buffer.begin() + static_cast<std::ptrdiff_t>(segment_count));
 
     const auto build_tic = SteadyClock::now();
-    candidate_plan_ = buildCandidatePlan(
+    candidate_plan = buildCandidatePlan(
         wall_time,
         current_position,
         current_orientation,
@@ -1297,24 +1240,19 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
         intended_segment);
     plan_build_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - build_tic).count();
-    candidate_plan_valid_ = candidate_plan_.valid;
-    if (!candidate_plan_valid_) return false;
+    if (!candidate_plan.valid) return false;
 
     const auto eval_tic = SteadyClock::now();
-    dec.monitor = evaluate_plan(candidate_plan_);
+    dec.monitor = evaluate_plan(candidate_plan);
     monitor_eval_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - eval_tic).count();
-    dec.evaluated_plan = candidate_plan_;
+    dec.evaluated_plan = candidate_plan;
     dec.has_evaluated_plan = true;
-    last_monitored_plan_ = candidate_plan_;
-    last_monitored_plan_.valid = true;
-    last_monitored_plan_.intended_exec_index = 0;
-    last_monitored_plan_.failsafe_exec_index = 0;
     dec.candidate_verified = !shouldRejectCandidateWithMonitor(dec.monitor);
     return true;
   };
 
-  const bool first_attempt = try_one_monitor_pass_with_fresh_buffer_if_needed();
+  const bool first_attempt = try_one_monitor_pass();
 
   if (!first_attempt) {
     mode_ = SafetyMode::kFailsafe;
@@ -1325,14 +1263,12 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
   }
 
   if (dec.candidate_verified) {
-    last_verified_plan_ = candidate_plan_;
+    last_verified_plan_ = candidate_plan;
     last_verified_plan_.valid = true;
     last_verified_plan_.intended_exec_index = 0;
     last_verified_plan_.failsafe_exec_index = 0;
-    candidate_plan_valid_ = false;
 
     if (!cartesian_effective_time_frozen_) {
-      intended_buffer_index_ += last_verified_plan_.intended.size();
       const double previous_path_time = commanded_path_time_;
       if (last_verified_plan_.nominal_time_anchor > 0.0) {
         commanded_path_time_ =
@@ -1373,7 +1309,7 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
 
 ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAsyncInput(
     const AsyncMonitorInput& input,
-    AsyncPlanningState& state) const {
+    VerifiedPlan& last_verified_plan) const {
   const auto decision_tic = SteadyClock::now();
   double planner_ms = 0.0;
   double plan_build_ms = 0.0;
@@ -1389,24 +1325,20 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
   };
 
   auto execute_last_verified_failsafe = [&]() {
-    state.intended_buffer_valid = false;
-    state.intended_buffer_index = 0;
-    state.intended_buffer.clear();
-
     dec.executing_last_verified_failsafe = true;
     dec.candidate_verified = false;
 
-    if (state.last_verified_plan.valid &&
-        !state.last_verified_plan.failsafe.empty()) {
+    if (last_verified_plan.valid &&
+        !last_verified_plan.failsafe.empty()) {
       const std::size_t idx = std::min(
-          state.last_verified_plan.failsafe_exec_index,
-          state.last_verified_plan.failsafe.size() - 1);
+          last_verified_plan.failsafe_exec_index,
+          last_verified_plan.failsafe.size() - 1);
 
-      dec.command = state.last_verified_plan.failsafe[idx];
+      dec.command = last_verified_plan.failsafe[idx];
 
-      if (state.last_verified_plan.failsafe_exec_index + 1 <
-          state.last_verified_plan.failsafe.size()) {
-        ++state.last_verified_plan.failsafe_exec_index;
+      if (last_verified_plan.failsafe_exec_index + 1 <
+          last_verified_plan.failsafe.size()) {
+        ++last_verified_plan.failsafe_exec_index;
       }
     } else {
       dec.command = makeEmergencyStopCommand(
@@ -1417,63 +1349,50 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
   };
 
   auto try_one_monitor_pass = [&]() -> bool {
-    state.intended_buffer_valid = false;
-    state.intended_buffer_index = 0;
-    state.intended_buffer.clear();
+    ImpedanceSample planning_start_command;
+    planning_start_command.t = input.wall_time;
 
-    if (!state.intended_buffer_valid ||
-        state.intended_buffer_index >= state.intended_buffer.size()) {
-      ImpedanceSample planning_start_command;
-      planning_start_command.t = input.wall_time;
+    if (input.last_commanded_sample_valid) {
+      planning_start_command.p = input.last_commanded_sample.p;
+      planning_start_command.q = input.last_commanded_sample.q;
+      planning_start_command.dp = input.last_commanded_sample.dp;
+      planning_start_command.w = input.last_commanded_sample.w;
+      planning_start_command.ddp = input.last_commanded_sample.ddp;
+      planning_start_command.dw = input.last_commanded_sample.dw;
+    } else {
+      planning_start_command.p = input.current_position;
+      planning_start_command.q = input.current_orientation;
+      planning_start_command.dp = input.ee_twist.head<3>();
+      planning_start_command.w = input.ee_twist.tail<3>();
+      planning_start_command.ddp.setZero();
+      planning_start_command.dw.setZero();
+    }
+    planning_start_command.q.normalize();
 
-      if (input.last_commanded_sample_valid) {
-        planning_start_command.p = input.last_commanded_sample.p;
-        planning_start_command.q = input.last_commanded_sample.q;
-        planning_start_command.dp = input.last_commanded_sample.dp;
-        planning_start_command.w = input.last_commanded_sample.w;
-        planning_start_command.ddp = input.last_commanded_sample.ddp;
-        planning_start_command.dw = input.last_commanded_sample.dw;
-      } else {
-        planning_start_command.p = input.current_position;
-        planning_start_command.q = input.current_orientation;
-        planning_start_command.dp = input.ee_twist.head<3>();
-        planning_start_command.w = input.ee_twist.tail<3>();
-        planning_start_command.ddp.setZero();
-        planning_start_command.dw.setZero();
-      }
-      planning_start_command.q.normalize();
+    planning_start_command.K = K_nominal_;
+    planning_start_command.D = D_nominal_;
+    planning_start_command.failsafe = false;
 
-      planning_start_command.K = K_nominal_;
-      planning_start_command.D = D_nominal_;
-      planning_start_command.failsafe = false;
+    const auto planner_tic = SteadyClock::now();
+    const std::vector<ImpedanceSample> intended_buffer =
+        makeIntendedBufferFromReplanner(
+            input.nominal_guess_time,
+            planning_start_command,
+            input.commanded_path_rate,
+            input.cartesian_effective_time_frozen);
+    planner_ms +=
+        std::chrono::duration<double, std::milli>(SteadyClock::now() - planner_tic).count();
 
-      const auto planner_tic = SteadyClock::now();
-      state.intended_buffer =
-          makeIntendedBufferFromReplanner(
-              input.nominal_guess_time,
-              planning_start_command,
-              input.commanded_path_rate,
-              input.cartesian_effective_time_frozen);
-      planner_ms +=
-          std::chrono::duration<double, std::milli>(SteadyClock::now() - planner_tic).count();
-
-      state.intended_buffer_index = 0;
-      state.intended_buffer_valid = !state.intended_buffer.empty();
-
-      if (!state.intended_buffer_valid) {
-        return false;
-      }
+    if (intended_buffer.empty()) {
+      return false;
     }
 
-    const std::size_t available =
-        state.intended_buffer.size() - state.intended_buffer_index;
     const std::size_t segment_count = std::min<std::size_t>(
         static_cast<std::size_t>(std::max(1, shield_intended_steps_)),
-        available);
+        intended_buffer.size());
     std::vector<ImpedanceSample> intended_segment(
-        state.intended_buffer.begin() + static_cast<std::ptrdiff_t>(state.intended_buffer_index),
-        state.intended_buffer.begin() + static_cast<std::ptrdiff_t>(
-                                        state.intended_buffer_index + segment_count));
+        intended_buffer.begin(),
+        intended_buffer.begin() + static_cast<std::ptrdiff_t>(segment_count));
 
     const auto build_tic = SteadyClock::now();
     VerifiedPlan candidate_plan = buildCandidatePlan(
@@ -1514,16 +1433,13 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
       return true;
     }
 
-    state.last_verified_plan = candidate_plan;
-    state.last_verified_plan.valid = true;
-    state.last_verified_plan.intended_exec_index = 0;
-    state.last_verified_plan.failsafe_exec_index = 0;
-    if (!input.cartesian_effective_time_frozen) {
-      state.intended_buffer_index += state.last_verified_plan.intended.size();
-    }
+    last_verified_plan = candidate_plan;
+    last_verified_plan.valid = true;
+    last_verified_plan.intended_exec_index = 0;
+    last_verified_plan.failsafe_exec_index = 0;
 
     dec.executing_last_verified_failsafe = false;
-    dec.command = state.last_verified_plan.intended.front();
+    dec.command = last_verified_plan.intended.front();
 
     return true;
   };
@@ -1584,7 +1500,7 @@ bool ReachableCartesianImpedanceController::takeAsyncMonitorOutput(
 }
 
 void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop() {
-  AsyncPlanningState state;
+  VerifiedPlan last_verified_plan;
 
   while (safety_monitor_worker_running_.load()) {
     AsyncMonitorInput input;
@@ -1609,7 +1525,7 @@ void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop() {
     output.valid = true;
     output.input = input;
     output.decision =
-        computeShieldDecisionForAsyncInput(input, state);
+        computeShieldDecisionForAsyncInput(input, last_verified_plan);
 
     {
       std::lock_guard<std::mutex> lock(async_output_mutex_);
@@ -2268,7 +2184,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       async_input.last_commanded_sample = last_commanded_sample_;
       async_input.last_commanded_sample_valid = last_commanded_sample_valid_;
       async_input.commanded_path_rate = commanded_path_rate_;
-      async_input.executing_failsafe = mode_ == SafetyMode::kFailsafe;
       async_input.cartesian_effective_time_frozen =
           cartesian_effective_time_frozen_;
       publishAsyncMonitorInput(async_input);
@@ -2307,13 +2222,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             async_output.decision.plan_build_ms,
             async_output.decision.monitor_eval_ms,
             "async");
-        if (async_output.decision.evaluated_plan.valid) {
-          last_monitored_plan_ = async_output.decision.evaluated_plan;
-          last_monitored_plan_.valid = true;
-          alignVerifiedPlanExecutionIndex(
-              &last_monitored_plan_,
-              async_plan_elapsed_steps);
-        }
       }
       if (async_output.decision.candidate_verified &&
           async_output.decision.evaluated_plan.valid) {
@@ -2362,7 +2270,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           !shouldRejectCandidateWithMonitor(shield_dec.monitor);
 
       if (async_releases_failsafe) {
-        invalidateIntendedBuffer();
         shield_dec = computeShieldDecision(wall_time, nominal_guess_time,
                                            current_position, current_orientation,
                                            ee_twist, inertia, Jv_collision);
@@ -2391,7 +2298,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         }
       } else if (shield_dec.executing_last_verified_failsafe ||
                  shouldRejectCandidateWithMonitor(shield_dec.monitor)) {
-        invalidateIntendedBuffer();
         shield_dec.executing_last_verified_failsafe = true;
         if (last_verified_plan_.valid &&
             (!last_verified_plan_.intended.empty() ||
@@ -2447,7 +2353,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         if (mode_ == SafetyMode::kFailsafe ||
             shield_dec.executing_last_verified_failsafe ||
             shouldRejectCandidateWithMonitor(shield_dec.monitor)) {
-          invalidateIntendedBuffer();
           shield_dec.executing_last_verified_failsafe = true;
           if (last_verified_plan_.valid &&
               (!last_verified_plan_.intended.empty() ||
@@ -2502,7 +2407,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     } else {
       shield_dec = last_shield_decision_;
       if (mode_ == SafetyMode::kFailsafe || shield_dec.executing_last_verified_failsafe) {
-        invalidateIntendedBuffer();
         shield_dec.executing_last_verified_failsafe = true;
         if (last_verified_plan_.valid &&
             (!last_verified_plan_.intended.empty() ||
@@ -2526,7 +2430,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   const auto toc_shield = SteadyClock::now();
 
   if (shield_dec.executing_last_verified_failsafe) {
-    invalidateIntendedBuffer();
     if (failsafe_enter_wall_time_sec_ < 0.0) {
       failsafe_enter_wall_time_sec_ = wall_time;
       failsafe_start_time_sec_ = wall_time;
@@ -2649,9 +2552,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           wall_time - cartesian_effective_time_freeze_start_wall_time_);
       commanded_path_time_ = nominal_guess_time;
       commanded_path_rate_ = 0.0;
-      intended_buffer_valid_ = false;
-      intended_buffer_index_ = 0;
-      intended_buffer_.clear();
     }
     cartesian_effective_time_frozen_ = false;
     cartesian_effective_time_freeze_start_wall_time_ = -1.0;
@@ -2719,10 +2619,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       monitor.Tn_dot_est = 0.0;
       prev_Tn_fs_valid_ = false;
     }
-    last_v_n_fs_ = v_n_now_tube;
-    last_monitor_result_ = monitor;
-    last_monitor_result_valid_ = true;
-    last_monitor_wall_time_ = wall_time;
   }
 
   last_commanded_sample_ = shield_dec.command;
@@ -2864,7 +2760,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     RCLCPP_INFO(get_node()->get_logger(),
                 "[reachable_impedance] mode=%d avg=%.3f ms min=%.3f ms max=%.3f ms overruns>1ms=%zu >2ms=%zu "
                 "model_avg/max=%.3f/%.3f shield_avg/max=%.3f/%.3f torque_avg/max=%.3f/%.3f io_avg/max=%.3f/%.3f "
-                "buf=%zu/%zu plan_valid=%d",
+                "plan_valid=%d",
                 static_cast<int>(mode_),
                 exec_sum_ms_ / n, exec_min_ms_, exec_max_ms_,
                 exec_overrun_1ms_count_, exec_overrun_2ms_count_,
@@ -2872,7 +2768,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                 prof_shield_sum_ms_ / n, prof_shield_max_ms_,
                 prof_torque_sum_ms_ / n, prof_torque_max_ms_,
                 prof_io_sum_ms_ / n, prof_io_max_ms_,
-                intended_buffer_index_, intended_buffer_.size(),
                 static_cast<int>(last_verified_plan_.valid));
     loop_counter_ = 0;
     exec_sum_ms_ = 0.0;
@@ -3330,7 +3225,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   log_write_counter_ = 0;
   prediction_log_write_counter_ = 0;
   control_update_sequence_ = 0;
-  prev_Tn_fs_ = 0.0; prev_Tn_fs_valid_ = false; last_v_n_fs_ = 0.0;
+  prev_Tn_fs_ = 0.0; prev_Tn_fs_valid_ = false;
   latest_mujoco_contact_value_.store(0.0);
   latest_mujoco_contact_msg_time_.store(-1.0);
   latest_mujoco_contact_active_.store(false);
@@ -3341,9 +3236,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   mujoco_first_contact_msg_time_.store(-1.0);
 
   monitor_counter_ = 0;
-  last_monitor_result_valid_ = false;
-  last_monitor_wall_time_ = 0.0;
-  last_monitor_result_ = MonitorResult{};
   last_cartesian_energy_budget_active_ = false;
   last_cartesian_energy_budget_lambda_valid_ = false;
   last_cartesian_energy_scale_ = 1.0;
@@ -3361,17 +3253,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   rviz_publish_counter_ = 0;
 
   last_verified_plan_ = VerifiedPlan{};
-  last_monitored_plan_ = VerifiedPlan{};
-  candidate_plan_ = VerifiedPlan{};
-  candidate_plan_valid_ = false;
   last_verified_command_stage_ = 0;
   last_verified_command_index_ = 0;
 
   commanded_path_time_ = 0.0;
-
-  intended_buffer_.clear();
-  intended_buffer_index_ = 0;
-  intended_buffer_valid_ = false;
 
   tau_cmd_prev_.setZero();
   last_shield_decision_valid_ = false;

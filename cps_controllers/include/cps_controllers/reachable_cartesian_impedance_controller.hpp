@@ -135,14 +135,6 @@ class ReachableCartesianImpedanceController
       double initial_path_rate,
       bool effective_time_frozen) const;
 
-  bool refillIntendedBufferFromReplanner(
-      double nominal_guess_time,
-      const ImpedanceSample& planning_start_command,
-      double initial_path_rate,
-      bool effective_time_frozen);
-
-  void invalidateIntendedBuffer();
-
   VerifiedPlan buildCandidatePlan(
       double wall_time,
       const Vector3d& current_position,
@@ -203,7 +195,6 @@ class ReachableCartesianImpedanceController
     ImpedanceSample last_commanded_sample;
     bool last_commanded_sample_valid{false};
     double commanded_path_rate{0.0};
-    bool executing_failsafe{false};
     bool cartesian_effective_time_frozen{false};
   };
 
@@ -215,16 +206,9 @@ class ReachableCartesianImpedanceController
     ShieldDecision decision;
   };
 
-  struct AsyncPlanningState {
-    std::vector<ImpedanceSample> intended_buffer;
-    std::size_t intended_buffer_index{0};
-    bool intended_buffer_valid{false};
-    VerifiedPlan last_verified_plan;
-  };
-
   ShieldDecision computeShieldDecisionForAsyncInput(
       const AsyncMonitorInput& input,
-      AsyncPlanningState& state) const;
+      VerifiedPlan& last_verified_plan) const;
 
   void publishAsyncMonitorInput(const AsyncMonitorInput& input);
   bool takeAsyncMonitorOutput(AsyncMonitorOutput* output);
@@ -307,8 +291,6 @@ class ReachableCartesianImpedanceController
                                   const Quaterniond& current_orientation,
                                   const ImpedanceSample& cmd,
                                   double dt);
-
-  ImpedanceSample getNextIntendedCommandFromCache(bool advance_index);
 
   ImpedanceSample getNextFailsafeCommandFromCache(bool advance_index);
 
@@ -465,12 +447,8 @@ class ReachableCartesianImpedanceController
 
   double prev_Tn_fs_{0.0};
   bool prev_Tn_fs_valid_{false};
-  double last_v_n_fs_{0.0};
 
   std::size_t monitor_counter_{0};
-  bool last_monitor_result_valid_{false};
-  double last_monitor_wall_time_{0.0};
-  MonitorResult last_monitor_result_{};
 
   bool last_shield_decision_valid_{false};
   ShieldDecision last_shield_decision_{};
@@ -493,15 +471,8 @@ class ReachableCartesianImpedanceController
   double last_async_input_publish_wall_time_{-1.0};
 
   VerifiedPlan last_verified_plan_{};
-  VerifiedPlan last_monitored_plan_{};
-  VerifiedPlan candidate_plan_{};
-  bool candidate_plan_valid_{false};
   int last_verified_command_stage_{0};
   std::size_t last_verified_command_index_{0};
-
-  std::vector<ImpedanceSample> intended_buffer_;
-  std::size_t intended_buffer_index_{0};
-  bool intended_buffer_valid_{false};
 
   // Last command actually sent to impedance controller.
   // Used as replanning start position to avoid discontinuous replans
