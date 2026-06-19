@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstddef>
 #include <exception>
 #include <filesystem>
@@ -27,6 +28,7 @@
 #include <sstream>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -641,6 +643,8 @@ ImpedanceSample ReachableCartesianImpedanceController::getNextIntendedCommandFro
   const std::size_t idx = std::min(
       last_verified_plan_.intended_exec_index,
       last_verified_plan_.intended.size() - 1);
+  last_verified_command_stage_ = 1;
+  last_verified_command_index_ = idx;
   ImpedanceSample cmd = last_verified_plan_.intended[idx];
   if (advance_index &&
       last_verified_plan_.intended_exec_index + 1 < last_verified_plan_.intended.size()) {
@@ -663,6 +667,8 @@ ImpedanceSample ReachableCartesianImpedanceController::getNextFailsafeCommandFro
       failsafe_start.t +
       static_cast<double>(last_verified_plan_.failsafe_exec_index + 1) *
           command_dt;
+  last_verified_command_stage_ = 2;
+  last_verified_command_index_ = last_verified_plan_.failsafe_exec_index;
 
   ImpedanceSample cmd;
   const auto& failsafe = last_verified_plan_.failsafe;
@@ -702,6 +708,8 @@ ImpedanceSample ReachableCartesianImpedanceController::getNextVerifiedTrajectory
   if (last_verified_plan_.intended_exec_index <
       last_verified_plan_.intended.size()) {
     const std::size_t idx = last_verified_plan_.intended_exec_index;
+    last_verified_command_stage_ = 1;
+    last_verified_command_index_ = idx;
     ImpedanceSample cmd = last_verified_plan_.intended[idx];
     if (advance_index) {
       ++last_verified_plan_.intended_exec_index;
@@ -714,6 +722,21 @@ ImpedanceSample ReachableCartesianImpedanceController::getNextVerifiedTrajectory
   }
 
   return ImpedanceSample{};
+}
+
+void ReachableCartesianImpedanceController::alignVerifiedPlanExecutionIndex(
+    VerifiedPlan* plan,
+    std::size_t elapsed_control_steps) const {
+  if (plan == nullptr || !plan->valid) {
+    return;
+  }
+
+  const std::size_t intended_size = plan->intended.size();
+  plan->intended_exec_index = std::min(elapsed_control_steps, intended_size);
+  plan->failsafe_exec_index =
+      elapsed_control_steps > intended_size
+          ? elapsed_control_steps - intended_size
+          : 0;
 }
 
 // ============================================================================
@@ -1336,7 +1359,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     mode_ = SafetyMode::kNominal;
 
     dec.executing_last_verified_failsafe = false;
-    dec.command = getNextIntendedCommandFromCache(!cartesian_effective_time_frozen_);
+    dec.command =
+        getNextVerifiedTrajectoryCommandFromCache(!cartesian_effective_time_frozen_);
     stamp_timing();
     return dec;
   }
@@ -1669,6 +1693,61 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
     return;
   }
 
+  PredictionLogRecord record;
+  record.wall_time = wall_time;
+  record.nominal_guess_time = nominal_guess_time;
+  record.current_position = current_position;
+  record.current_orientation = current_orientation;
+  record.ee_twist = ee_twist;
+  record.inertia = inertia;
+  record.Jv = Jv;
+  record.K_runtime = K_runtime;
+  record.D_runtime = D_runtime;
+  record.evaluated_plan = evaluated_plan;
+  record.monitor = monitor;
+  record.candidate_verified = candidate_verified;
+  record.executing_failsafe = executing_failsafe;
+  record.monitor_total_ms = monitor_total_ms;
+  record.planner_ms = planner_ms;
+  record.plan_build_ms = plan_build_ms;
+  record.monitor_eval_ms = monitor_eval_ms;
+  record.source = source == nullptr ? "" : source;
+
+  if (!prediction_log_mutex_.try_lock()) {
+    return;
+  }
+  if (prediction_log_queue_.size() >= prediction_log_max_queue_size_) {
+    prediction_log_queue_.pop_front();
+  }
+  prediction_log_queue_.push_back(std::move(record));
+  prediction_log_mutex_.unlock();
+  prediction_log_cv_.notify_one();
+}
+
+void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
+    double wall_time,
+    double nominal_guess_time,
+    const Vector3d& current_position,
+    const Quaterniond& current_orientation,
+    const Vector6d& ee_twist,
+    const Matrix7d& inertia,
+    const Matrix37d& Jv,
+    const Matrix6d& K_runtime,
+    const Matrix6d& D_runtime,
+    const VerifiedPlan& evaluated_plan,
+    const MonitorResult& monitor,
+    bool candidate_verified,
+    bool executing_failsafe,
+    double monitor_total_ms,
+    double planner_ms,
+    double plan_build_ms,
+    double monitor_eval_ms,
+    const char* source) {
+  if (!enable_prediction_logging_ || !prediction_log_file_.is_open() ||
+      !evaluated_plan.valid) {
+    return;
+  }
+
   struct PredictionRow {
     const char* stage{""};
     int index{0};
@@ -1884,6 +1963,74 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
   }
 }
 
+void ReachableCartesianImpedanceController::predictionLoggerWorkerLoop() {
+  while (true) {
+    PredictionLogRecord record;
+    {
+      std::unique_lock<std::mutex> lock(prediction_log_mutex_);
+      prediction_log_cv_.wait(lock, [&]() {
+        return !prediction_log_queue_.empty() ||
+               !prediction_log_worker_running_.load();
+      });
+
+      if (prediction_log_queue_.empty() &&
+          !prediction_log_worker_running_.load()) {
+        break;
+      }
+
+      record = std::move(prediction_log_queue_.front());
+      prediction_log_queue_.pop_front();
+    }
+
+    writeShieldPredictionTrajectory(
+        record.wall_time,
+        record.nominal_guess_time,
+        record.current_position,
+        record.current_orientation,
+        record.ee_twist,
+        record.inertia,
+        record.Jv,
+        record.K_runtime,
+        record.D_runtime,
+        record.evaluated_plan,
+        record.monitor,
+        record.candidate_verified,
+        record.executing_failsafe,
+        record.monitor_total_ms,
+        record.planner_ms,
+        record.plan_build_ms,
+        record.monitor_eval_ms,
+        record.source.c_str());
+  }
+}
+
+void ReachableCartesianImpedanceController::startPredictionLoggerWorker() {
+  if (!enable_prediction_logging_ || !prediction_log_file_.is_open() ||
+      prediction_log_worker_running_.load()) {
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(prediction_log_mutex_);
+    prediction_log_queue_.clear();
+  }
+
+  prediction_log_worker_running_.store(true);
+  prediction_log_worker_thread_ =
+      std::thread(&ReachableCartesianImpedanceController::predictionLoggerWorkerLoop, this);
+}
+
+void ReachableCartesianImpedanceController::stopPredictionLoggerWorker() {
+  if (!prediction_log_worker_running_.exchange(false)) {
+    return;
+  }
+
+  prediction_log_cv_.notify_all();
+  if (prediction_log_worker_thread_.joinable()) {
+    prediction_log_worker_thread_.join();
+  }
+}
+
 // ============================================================================
 // computeImpedanceTorque -- corrected dynamic-consistent true branch
 // ============================================================================
@@ -2053,6 +2200,9 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
 controller_interface::return_type ReachableCartesianImpedanceController::update(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& period) {
   const auto tic_total = SteadyClock::now();
+  const std::uint64_t control_loop_sequence = ++control_update_sequence_;
+  last_verified_command_stage_ = 0;
+  last_verified_command_index_ = 0;
 
   const double dt = std::max(period.seconds(), kMinDt);
   const double wall_time = (this->get_node()->now() - start_time_).seconds();
@@ -2105,6 +2255,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     if (publish_monitor_input) {
       AsyncMonitorInput async_input;
       async_input.sequence = async_input_sequence_.fetch_add(1) + 1;
+      async_input.control_loop_sequence = control_loop_sequence;
       async_input.wall_time = wall_time;
       async_input.nominal_guess_time = nominal_guess_time;
       async_input.current_position = current_position;
@@ -2126,6 +2277,12 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
     AsyncMonitorOutput async_output;
     if (takeAsyncMonitorOutput(&async_output)) {
+      const std::size_t async_plan_elapsed_steps =
+          control_loop_sequence >= async_output.input.control_loop_sequence
+              ? static_cast<std::size_t>(
+                    control_loop_sequence -
+                    async_output.input.control_loop_sequence)
+              : 0;
       last_shield_decision_ = async_output.decision;
       last_shield_decision_valid_ = true;
       last_async_output_wall_time_ = async_output.input_wall_time;
@@ -2153,16 +2310,18 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         if (async_output.decision.evaluated_plan.valid) {
           last_monitored_plan_ = async_output.decision.evaluated_plan;
           last_monitored_plan_.valid = true;
-          last_monitored_plan_.intended_exec_index = 0;
-          last_monitored_plan_.failsafe_exec_index = 0;
+          alignVerifiedPlanExecutionIndex(
+              &last_monitored_plan_,
+              async_plan_elapsed_steps);
         }
       }
       if (async_output.decision.candidate_verified &&
           async_output.decision.evaluated_plan.valid) {
         last_verified_plan_ = async_output.decision.evaluated_plan;
         last_verified_plan_.valid = true;
-        last_verified_plan_.intended_exec_index = 0;
-        last_verified_plan_.failsafe_exec_index = 0;
+        alignVerifiedPlanExecutionIndex(
+            &last_verified_plan_,
+            async_plan_elapsed_steps);
         if (!cartesian_effective_time_frozen_) {
           const double previous_path_time = commanded_path_time_;
           if (last_verified_plan_.nominal_time_anchor > 0.0) {
@@ -2246,7 +2405,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         shield_dec.executing_last_verified_failsafe = false;
         if (last_verified_plan_.valid && !last_verified_plan_.intended.empty()) {
           shield_dec.command =
-              getNextIntendedCommandFromCache(!cartesian_effective_time_frozen_);
+              getNextVerifiedTrajectoryCommandFromCache(!cartesian_effective_time_frozen_);
         } else {
           shield_dec.command =
               makeEmergencyStopCommand(current_position, current_orientation, wall_time);
@@ -2301,7 +2460,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         } else {
           shield_dec.executing_last_verified_failsafe = false;
           shield_dec.command =
-              getNextIntendedCommandFromCache(!cartesian_effective_time_frozen_);
+              getNextVerifiedTrajectoryCommandFromCache(!cartesian_effective_time_frozen_);
         }
         last_shield_decision_.command = shield_dec.command;
         last_shield_decision_.executing_last_verified_failsafe =
@@ -2355,7 +2514,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         shield_dec.executing_last_verified_failsafe = false;
         if (last_verified_plan_.valid && !last_verified_plan_.intended.empty())
           shield_dec.command =
-              getNextIntendedCommandFromCache(!cartesian_effective_time_frozen_);
+              getNextVerifiedTrajectoryCommandFromCache(!cartesian_effective_time_frozen_);
         else
           shield_dec.command = makeEmergencyStopCommand(current_position, current_orientation, wall_time);
       }
@@ -2594,6 +2753,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         (mujoco_contact_msg_time >= 0.0)
             ? std::max(0.0, this->get_node()->now().seconds() - mujoco_contact_msg_time)
             : -1.0;
+    const double verified_plan_age_sec =
+        last_verified_plan_.valid
+            ? std::max(0.0, wall_time - last_verified_plan_.generated_wall_time)
+            : -1.0;
 
     error_log_file_ << std::fixed << std::setprecision(9)
         << wall_time << "," << nominal_guess_time << "," << paused_nominal_time_sec_ << ","
@@ -2646,6 +2809,12 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << monitored_steps << ","
         << monitored_intended_steps << ","
         << monitored_failsafe_steps << ","
+        << control_loop_sequence << ","
+        << verified_plan_age_sec << ","
+        << last_verified_command_stage_ << ","
+        << last_verified_command_index_ << ","
+        << last_verified_plan_.intended_exec_index << ","
+        << last_verified_plan_.failsafe_exec_index << ","
         << static_cast<int>(last_cartesian_energy_budget_active_) << ","
         << static_cast<int>(cartesian_effective_time_frozen_) << ","
         << static_cast<int>(last_cartesian_energy_budget_lambda_valid_) << ","
@@ -2739,6 +2908,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<std::string>(
         "prediction_log_file_name",
         "shield_prediction_trajectory.csv");
+    auto_declare<int>("prediction_log_max_queue_size", 256);
 
     auto_declare<bool>("cartesian_via_points_relative", false);
     auto_declare<std::vector<double>>(
@@ -2830,6 +3000,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     prediction_log_file_name_ = sanitizedFileNameOrDefault(
         get_node()->get_parameter("prediction_log_file_name").as_string(),
         "shield_prediction_trajectory.csv");
+    const auto prediction_log_max_queue_size_param =
+        get_node()->get_parameter("prediction_log_max_queue_size").as_int();
+    prediction_log_max_queue_size_ = static_cast<std::size_t>(
+        std::max<int64_t>(1, prediction_log_max_queue_size_param));
 
     if (error_log_root_dir_.empty()) {
       error_log_root_dir_ = kDefaultErrorLogRootDir;
@@ -3155,6 +3329,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   prof_io_max_ms_ = 0.0;
   log_write_counter_ = 0;
   prediction_log_write_counter_ = 0;
+  control_update_sequence_ = 0;
   prev_Tn_fs_ = 0.0; prev_Tn_fs_valid_ = false; last_v_n_fs_ = 0.0;
   latest_mujoco_contact_value_.store(0.0);
   latest_mujoco_contact_msg_time_.store(-1.0);
@@ -3189,6 +3364,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   last_monitored_plan_ = VerifiedPlan{};
   candidate_plan_ = VerifiedPlan{};
   candidate_plan_valid_ = false;
+  last_verified_command_stage_ = 0;
+  last_verified_command_index_ = 0;
 
   commanded_path_time_ = 0.0;
 
@@ -3236,6 +3413,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
       run_info_file << "run_directory: " << error_log_run_dir_ << "\n"
                     << "csv_file: " << error_log_file_path_ << "\n"
                     << "prediction_csv_file: " << prediction_log_file_path_ << "\n"
+                    << "enable_prediction_logging: "
+                    << static_cast<int>(enable_prediction_logging_) << "\n"
+                    << "prediction_log_max_queue_size: "
+                    << prediction_log_max_queue_size_ << "\n"
                     << "arm_id: " << arm_id_ << "\n"
                     << "cartesian_via_points_relative: "
                     << static_cast<int>(cartesian_via_points_relative_) << "\n"
@@ -3345,6 +3526,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "collision_energy_unsafe,clamping_energy_unsafe,"
         << "terminal_energy_unsafe,monitored_unsafe,predicted_trigger,"
         << "monitored_steps,monitored_intended_steps,monitored_failsafe_steps,"
+        << "control_loop_sequence,verified_plan_age_sec,"
+        << "verified_command_stage,verified_command_index,"
+        << "verified_next_intended_exec_index,verified_next_failsafe_exec_index,"
         << "cartesian_energy_budget_active,cartesian_effective_time_frozen,"
         << "cartesian_energy_lambda_valid,"
         << "cartesian_energy_scale,cartesian_kinetic_energy,"
@@ -3399,6 +3583,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
           prediction_log_file_path_.c_str());
     }
   }
+  startPredictionLoggerWorker();
   startSafetyMonitorWorker();
   return CallbackReturn::SUCCESS;
 }
@@ -3406,6 +3591,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
 CallbackReturn ReachableCartesianImpedanceController::on_deactivate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   stopSafetyMonitorWorker();
+  stopPredictionLoggerWorker();
   if (error_log_file_.is_open()) { error_log_file_.flush(); error_log_file_.close(); }
   if (prediction_log_file_.is_open()) {
     prediction_log_file_.flush();

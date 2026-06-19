@@ -195,8 +195,9 @@ reachable_cartesian_impedance_controller:
     enable_error_logging: true
     error_log_root_dir: /home/developer/multipanda_ws/src/data_log
     error_log_file_name: reachable_cartesian_impedance_validation.csv
-    enable_prediction_logging: false
+    enable_prediction_logging: true
     prediction_log_file_name: shield_prediction_trajectory.csv
+    prediction_log_max_queue_size: 256
 
     # Cartesian via points are followed without stopping.
     # If cartesian_via_points_relative is true, each point is an offset from

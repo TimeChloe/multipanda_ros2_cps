@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstddef>
+#include <deque>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -187,6 +188,7 @@ class ReachableCartesianImpedanceController
 
   struct AsyncMonitorInput {
     std::uint64_t sequence{0};
+    std::uint64_t control_loop_sequence{0};
     double wall_time{0.0};
     double nominal_guess_time{0.0};
 
@@ -251,6 +253,51 @@ class ReachableCartesianImpedanceController
       double monitor_eval_ms,
       const char* source);
 
+  struct PredictionLogRecord {
+    double wall_time{0.0};
+    double nominal_guess_time{0.0};
+    Vector3d current_position{Vector3d::Zero()};
+    Quaterniond current_orientation{Quaterniond::Identity()};
+    Vector6d ee_twist{Vector6d::Zero()};
+    Matrix7d inertia{Matrix7d::Zero()};
+    Matrix37d Jv{Matrix37d::Zero()};
+    Matrix6d K_runtime{Matrix6d::Zero()};
+    Matrix6d D_runtime{Matrix6d::Zero()};
+    VerifiedPlan evaluated_plan{};
+    MonitorResult monitor{};
+    bool candidate_verified{false};
+    bool executing_failsafe{false};
+    double monitor_total_ms{0.0};
+    double planner_ms{0.0};
+    double plan_build_ms{0.0};
+    double monitor_eval_ms{0.0};
+    std::string source;
+  };
+
+  void writeShieldPredictionTrajectory(
+      double wall_time,
+      double nominal_guess_time,
+      const Vector3d& current_position,
+      const Quaterniond& current_orientation,
+      const Vector6d& ee_twist,
+      const Matrix7d& inertia,
+      const Matrix37d& Jv,
+      const Matrix6d& K_runtime,
+      const Matrix6d& D_runtime,
+      const VerifiedPlan& evaluated_plan,
+      const MonitorResult& monitor,
+      bool candidate_verified,
+      bool executing_failsafe,
+      double monitor_total_ms,
+      double planner_ms,
+      double plan_build_ms,
+      double monitor_eval_ms,
+      const char* source);
+
+  void predictionLoggerWorkerLoop();
+  void startPredictionLoggerWorker();
+  void stopPredictionLoggerWorker();
+
   Vector7d computeImpedanceTorque(const Vector7d& q,
                                   const Vector7d& dq,
                                   const Matrix7d& inertia,
@@ -266,6 +313,10 @@ class ReachableCartesianImpedanceController
   ImpedanceSample getNextFailsafeCommandFromCache(bool advance_index);
 
   ImpedanceSample getNextVerifiedTrajectoryCommandFromCache(bool advance_index);
+
+  void alignVerifiedPlanExecutionIndex(
+      VerifiedPlan* plan,
+      std::size_t elapsed_control_steps) const;
 
   Matrix6d computeDampingFromStiffness(
       const Matrix6d& K,
@@ -317,6 +368,12 @@ class ReachableCartesianImpedanceController
   std::string prediction_log_file_path_;
   std::ofstream prediction_log_file_;
   std::size_t prediction_log_write_counter_{0};
+  std::size_t prediction_log_max_queue_size_{256};
+  std::mutex prediction_log_mutex_;
+  std::condition_variable prediction_log_cv_;
+  std::deque<PredictionLogRecord> prediction_log_queue_;
+  std::thread prediction_log_worker_thread_;
+  std::atomic<bool> prediction_log_worker_running_{false};
 
   std::string arm_id_;
   bool cartesian_via_points_relative_{false};
@@ -421,6 +478,7 @@ class ReachableCartesianImpedanceController
   std::thread safety_monitor_worker_thread_;
   std::atomic<bool> safety_monitor_worker_running_{false};
   std::atomic<std::uint64_t> async_input_sequence_{0};
+  std::uint64_t control_update_sequence_{0};
 
   std::mutex async_input_mutex_;
   std::condition_variable async_input_cv_;
@@ -438,6 +496,8 @@ class ReachableCartesianImpedanceController
   VerifiedPlan last_monitored_plan_{};
   VerifiedPlan candidate_plan_{};
   bool candidate_plan_valid_{false};
+  int last_verified_command_stage_{0};
+  std::size_t last_verified_command_index_{0};
 
   std::vector<ImpedanceSample> intended_buffer_;
   std::size_t intended_buffer_index_{0};
