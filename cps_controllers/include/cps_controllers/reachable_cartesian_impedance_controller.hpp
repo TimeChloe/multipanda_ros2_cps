@@ -358,8 +358,8 @@ class ReachableCartesianImpedanceController
   std::atomic<bool> prediction_log_worker_running_{false};
 
   std::string arm_id_;
-  bool cartesian_via_points_relative_{false};
   std::vector<Vector3d> cartesian_via_points_;
+  std::vector<Quaterniond> cartesian_via_point_quaternions_;
   std::vector<cps_trajectory_generators::CartesianTrajectorySample>
       cartesian_via_point_path_;
 
@@ -425,9 +425,15 @@ class ReachableCartesianImpedanceController
   double local_replan_max_velocity_{0.08};
   double local_replan_max_acceleration_{0.4};
   double local_replan_max_jerk_{2.0};
+  double local_replan_max_angular_velocity_{0.8};
+  double local_replan_max_angular_acceleration_{4.0};
+  double local_replan_max_angular_jerk_{40.0};
   double failsafe_brake_max_velocity_{1.0};
   double failsafe_brake_max_acceleration_{4.0};
   double failsafe_brake_max_jerk_{80.0};
+  double failsafe_brake_max_angular_velocity_{1.5};
+  double failsafe_brake_max_angular_acceleration_{10.0};
+  double failsafe_brake_max_angular_jerk_{500.0};
   std::string trajectory_generator_config_path_;
 
   bool use_dynamic_consistent_impedance_{true};

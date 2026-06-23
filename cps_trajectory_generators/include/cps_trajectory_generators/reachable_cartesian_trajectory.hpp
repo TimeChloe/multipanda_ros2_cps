@@ -25,6 +25,9 @@ struct LocalCartesianReplanConfig {
   double max_velocity{0.08};
   double max_acceleration{0.4};
   double max_jerk{2.0};
+  double max_angular_velocity{0.8};
+  double max_angular_acceleration{4.0};
+  double max_angular_jerk{40.0};
 };
 
 struct PathConsistentTimedPathConfig {
@@ -48,10 +51,16 @@ struct TrajectoryGeneratorSettings {
   double local_replan_max_velocity{0.5};
   double local_replan_max_acceleration{1.5};
   double local_replan_max_jerk{5.0};
+  double local_replan_max_angular_velocity{0.8};
+  double local_replan_max_angular_acceleration{4.0};
+  double local_replan_max_angular_jerk{40.0};
 
   double failsafe_brake_max_velocity{0.8};
   double failsafe_brake_max_acceleration{2.0};
   double failsafe_brake_max_jerk{80.0};
+  double failsafe_brake_max_angular_velocity{1.5};
+  double failsafe_brake_max_angular_acceleration{10.0};
+  double failsafe_brake_max_angular_jerk{500.0};
 
   double path_time_rate_min{0.0};
   double path_time_rate_max{1.0};
@@ -67,6 +76,11 @@ TrajectoryGeneratorSettings loadTrajectoryGeneratorSettings(
 std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
     const std::vector<Eigen::Vector3d>& waypoints,
     const Eigen::Quaterniond& reference_orientation,
+    const LocalCartesianReplanConfig& config);
+
+std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
+    const std::vector<Eigen::Vector3d>& waypoints,
+    const std::vector<Eigen::Quaterniond>& waypoint_orientations,
     const LocalCartesianReplanConfig& config);
 
 std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(

@@ -224,6 +224,16 @@ inline Vector3d clampVectorNorm(const Vector3d& v, double max_norm) {
   return v * (limit / norm);
 }
 
+inline Quaterniond normalizedQuaternionOrIdentity(const Quaterniond& q_in) {
+  Quaterniond q = q_in;
+  const double norm = q.norm();
+  if (!std::isfinite(norm) || norm < 1.0e-12) {
+    return Quaterniond::Identity();
+  }
+  q.coeffs() /= norm;
+  return q;
+}
+
 inline double clamp01(double value) {
   return std::clamp(value, 0.0, 1.0);
 }
@@ -742,6 +752,9 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
   config.max_velocity = local_replan_max_velocity_;
   config.max_acceleration = local_replan_max_acceleration_;
   config.max_jerk = local_replan_max_jerk_;
+  config.max_angular_velocity = local_replan_max_angular_velocity_;
+  config.max_angular_acceleration = local_replan_max_angular_acceleration_;
+  config.max_angular_jerk = local_replan_max_angular_jerk_;
 
   std::vector<CartesianTrajectorySample> planned_samples;
   if (!cartesian_via_point_path_.empty()) {
@@ -913,6 +926,10 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     brake_config.max_velocity = failsafe_brake_max_velocity_;
     brake_config.max_acceleration = failsafe_brake_max_acceleration_;
     brake_config.max_jerk = failsafe_brake_max_jerk_;
+    brake_config.max_angular_velocity = failsafe_brake_max_angular_velocity_;
+    brake_config.max_angular_acceleration =
+        failsafe_brake_max_angular_acceleration_;
+    brake_config.max_angular_jerk = failsafe_brake_max_angular_jerk_;
 
     if (brake_samples.empty()) {
       brake_samples = makeCartesianBrakeTrajectory(brake_start, brake_config);
@@ -2805,9 +2822,11 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
         "shield_prediction_trajectory.csv");
     auto_declare<int>("prediction_log_max_queue_size", 256);
 
-    auto_declare<bool>("cartesian_via_points_relative", false);
     auto_declare<std::vector<double>>(
         "cartesian_via_points",
+        std::vector<double>{});
+    auto_declare<std::vector<double>>(
+        "cartesian_via_point_quaternions",
         std::vector<double>{});
 
     auto_declare<double>("nominal_pos_stiffness", 400.0);
@@ -2912,9 +2931,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
           "error_log_path is deprecated and will be ignored. Use error_log_root_dir and error_log_file_name.");
     }
 
-    cartesian_via_points_relative_ =
-        get_node()->get_parameter("cartesian_via_points_relative").as_bool();
     cartesian_via_points_.clear();
+    cartesian_via_point_quaternions_.clear();
     std::vector<double> cartesian_via_points;
     const rclcpp::Parameter via_points_param =
         get_node()->get_parameter("cartesian_via_points");
@@ -2925,18 +2943,107 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
           get_node()->get_logger(),
           "cartesian_via_points must be a double array. Ignoring this value.");
     }
-    if ((cartesian_via_points.size() % 3) != 0) {
+
+    const bool via_points_are_full_states =
+        !cartesian_via_points.empty() &&
+        (cartesian_via_points.size() % 7) == 0;
+    if (via_points_are_full_states) {
+      const std::size_t via_point_count = cartesian_via_points.size() / 7;
+      cartesian_via_points_.reserve(via_point_count);
+      cartesian_via_point_quaternions_.reserve(via_point_count);
+      for (std::size_t i = 0; i < via_point_count; ++i) {
+        cartesian_via_points_.emplace_back(
+            cartesian_via_points[7 * i + 0],
+            cartesian_via_points[7 * i + 1],
+            cartesian_via_points[7 * i + 2]);
+        const Quaterniond q(
+            cartesian_via_points[7 * i + 6],
+            cartesian_via_points[7 * i + 3],
+            cartesian_via_points[7 * i + 4],
+            cartesian_via_points[7 * i + 5]);
+        if (!std::isfinite(q.norm()) || q.norm() < 1.0e-12) {
+          RCLCPP_WARN(
+              get_node()->get_logger(),
+              "cartesian_via_points[%zu] has an invalid quaternion. Using identity quaternion.",
+              i);
+          cartesian_via_point_quaternions_.push_back(Quaterniond::Identity());
+        } else {
+          cartesian_via_point_quaternions_.push_back(
+              normalizedQuaternionOrIdentity(q));
+        }
+      }
+    } else if (!cartesian_via_points.empty() &&
+               (cartesian_via_points.size() % 3) == 0) {
       RCLCPP_WARN(
           get_node()->get_logger(),
-          "cartesian_via_points must contain triples [x0, y0, z0, ...]. Ignoring the incomplete tail.");
+          "cartesian_via_points currently expects 7 values per base-frame state [x, y, z, qx, qy, qz, qw]. Falling back to legacy 3-value base-frame positions and using the activation orientation unless cartesian_via_point_quaternions is set.");
+      const std::size_t via_point_count = cartesian_via_points.size() / 3;
+      cartesian_via_points_.reserve(via_point_count);
+      for (std::size_t i = 0; i < via_point_count; ++i) {
+        cartesian_via_points_.emplace_back(
+            cartesian_via_points[3 * i + 0],
+            cartesian_via_points[3 * i + 1],
+            cartesian_via_points[3 * i + 2]);
+      }
+    } else if (!cartesian_via_points.empty()) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "cartesian_via_points must contain 7-value base-frame states [x, y, z, qx, qy, qz, qw]. Ignoring this value.");
     }
-    const std::size_t via_point_count = cartesian_via_points.size() / 3;
-    cartesian_via_points_.reserve(via_point_count);
-    for (std::size_t i = 0; i < via_point_count; ++i) {
-      cartesian_via_points_.emplace_back(
-          cartesian_via_points[3 * i + 0],
-          cartesian_via_points[3 * i + 1],
-          cartesian_via_points[3 * i + 2]);
+
+    std::vector<double> cartesian_via_point_quaternions;
+    const rclcpp::Parameter via_quaternions_param =
+        get_node()->get_parameter("cartesian_via_point_quaternions");
+    if (via_quaternions_param.get_type() ==
+        rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY) {
+      cartesian_via_point_quaternions =
+          via_quaternions_param.as_double_array();
+    } else if (via_quaternions_param.get_type() !=
+               rclcpp::ParameterType::PARAMETER_NOT_SET) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "cartesian_via_point_quaternions must be a double array. Ignoring this value.");
+    }
+    if (via_points_are_full_states && !cartesian_via_point_quaternions.empty()) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "cartesian_via_point_quaternions is deprecated and ignored because cartesian_via_points already contains 7-value Cartesian states.");
+    } else if ((cartesian_via_point_quaternions.size() % 4) != 0) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "cartesian_via_point_quaternions must contain [x, y, z, w] groups. Ignoring the incomplete tail.");
+    }
+    const std::size_t via_quaternion_count =
+        via_points_are_full_states ? 0 : cartesian_via_point_quaternions.size() / 4;
+    if (!via_points_are_full_states) {
+      cartesian_via_point_quaternions_.reserve(
+          cartesian_via_point_quaternions_.size() + via_quaternion_count);
+      for (std::size_t i = 0; i < via_quaternion_count; ++i) {
+        const Quaterniond q(
+            cartesian_via_point_quaternions[4 * i + 3],
+            cartesian_via_point_quaternions[4 * i + 0],
+            cartesian_via_point_quaternions[4 * i + 1],
+            cartesian_via_point_quaternions[4 * i + 2]);
+        const double norm = q.norm();
+        if (!std::isfinite(norm) || norm < 1.0e-12) {
+          RCLCPP_WARN(
+              get_node()->get_logger(),
+              "cartesian_via_point_quaternions[%zu] is invalid. Using identity quaternion.",
+              i);
+          cartesian_via_point_quaternions_.push_back(Quaterniond::Identity());
+        } else {
+          cartesian_via_point_quaternions_.push_back(
+              normalizedQuaternionOrIdentity(q));
+        }
+      }
+    }
+    if (!cartesian_via_point_quaternions_.empty() &&
+        cartesian_via_point_quaternions_.size() != cartesian_via_points_.size()) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "cartesian_via_point_quaternions count (%zu) differs from cartesian_via_points count (%zu). Missing orientations keep the activation orientation; extra orientations rotate at the last Cartesian point.",
+          cartesian_via_point_quaternions_.size(),
+          cartesian_via_points_.size());
     }
 
     const double nominal_pos_stiffness = get_node()->get_parameter("nominal_pos_stiffness").as_double();
@@ -3040,12 +3147,24 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         std::max(1e-4, trajectory_settings.local_replan_max_acceleration);
     local_replan_max_jerk_ =
         std::max(1e-4, trajectory_settings.local_replan_max_jerk);
+    local_replan_max_angular_velocity_ =
+        std::max(1e-4, trajectory_settings.local_replan_max_angular_velocity);
+    local_replan_max_angular_acceleration_ =
+        std::max(1e-4, trajectory_settings.local_replan_max_angular_acceleration);
+    local_replan_max_angular_jerk_ =
+        std::max(1e-4, trajectory_settings.local_replan_max_angular_jerk);
     failsafe_brake_max_velocity_ =
         std::max(1e-4, trajectory_settings.failsafe_brake_max_velocity);
     failsafe_brake_max_acceleration_ =
         std::max(1e-4, trajectory_settings.failsafe_brake_max_acceleration);
     failsafe_brake_max_jerk_ =
         std::max(1e-4, trajectory_settings.failsafe_brake_max_jerk);
+    failsafe_brake_max_angular_velocity_ =
+        std::max(1e-4, trajectory_settings.failsafe_brake_max_angular_velocity);
+    failsafe_brake_max_angular_acceleration_ =
+        std::max(1e-4, trajectory_settings.failsafe_brake_max_angular_acceleration);
+    failsafe_brake_max_angular_jerk_ =
+        std::max(1e-4, trajectory_settings.failsafe_brake_max_angular_jerk);
 
     use_dynamic_consistent_impedance_ = get_node()->get_parameter("use_dynamic_consistent_impedance").as_bool();
     torque_rate_limit_ = get_node()->get_parameter("torque_rate_limit").as_double();
@@ -3151,13 +3270,32 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
 
   cartesian_via_point_path_.clear();
   std::vector<Vector3d> waypoints;
-  waypoints.reserve(cartesian_via_points_.size() + 1);
+  std::vector<Quaterniond> waypoint_orientations;
+  const std::size_t via_pose_count = std::max(
+      cartesian_via_points_.size(),
+      cartesian_via_point_quaternions_.size());
+  waypoints.reserve(via_pose_count + 1);
+  waypoint_orientations.reserve(via_pose_count + 1);
   waypoints.push_back(desired_position_);
-  for (const auto& point : cartesian_via_points_) {
-    const Vector3d waypoint =
-        cartesian_via_points_relative_ ? desired_position_ + point : point;
-    if ((waypoint - waypoints.back()).norm() > 1e-9) {
+  waypoint_orientations.push_back(desired_orientation_);
+  for (std::size_t i = 0; i < via_pose_count; ++i) {
+    Vector3d waypoint =
+        i < cartesian_via_points_.size()
+            ? cartesian_via_points_[i]
+            : waypoints.back();
+
+    Quaterniond waypoint_orientation = desired_orientation_;
+    if (i < cartesian_via_point_quaternions_.size()) {
+      waypoint_orientation =
+          normalizedQuaternionOrIdentity(cartesian_via_point_quaternions_[i]);
+      waypoint_orientation.normalize();
+    }
+
+    if ((waypoint - waypoints.back()).norm() > 1e-9 ||
+        std::abs(waypoint_orientation.coeffs().dot(
+            waypoint_orientations.back().coeffs())) < 1.0 - 1e-9) {
       waypoints.push_back(waypoint);
+      waypoint_orientations.push_back(waypoint_orientation);
     }
   }
 
@@ -3173,10 +3311,14 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
     via_config.max_velocity = local_replan_max_velocity_;
     via_config.max_acceleration = local_replan_max_acceleration_;
     via_config.max_jerk = local_replan_max_jerk_;
+    via_config.max_angular_velocity = local_replan_max_angular_velocity_;
+    via_config.max_angular_acceleration =
+        local_replan_max_angular_acceleration_;
+    via_config.max_angular_jerk = local_replan_max_angular_jerk_;
     cartesian_via_point_path_ =
         makeSmoothViaPointCartesianTrajectory(
             waypoints,
-            desired_orientation_,
+            waypoint_orientations,
             via_config);
     if (cartesian_via_point_path_.empty()) {
       RCLCPP_WARN(
@@ -3303,10 +3445,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "prediction_log_max_queue_size: "
                     << prediction_log_max_queue_size_ << "\n"
                     << "arm_id: " << arm_id_ << "\n"
-                    << "cartesian_via_points_relative: "
-                    << static_cast<int>(cartesian_via_points_relative_) << "\n"
                     << "cartesian_via_points_count: "
                     << cartesian_via_points_.size() << "\n"
+                    << "cartesian_via_point_quaternions_count: "
+                    << cartesian_via_point_quaternions_.size() << "\n"
                     << "cartesian_via_point_path_samples: "
                     << cartesian_via_point_path_.size() << "\n"
                     << "cartesian_via_point_path_duration_sec: "

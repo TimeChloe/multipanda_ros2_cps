@@ -200,20 +200,13 @@ reachable_cartesian_impedance_controller:
     prediction_log_max_queue_size: 256
 
     # Cartesian via points are followed without stopping.
-    # If cartesian_via_points_relative is true, each point is an offset from
-    # the initial TCP pose; otherwise points are absolute world coordinates.
-    cartesian_via_points_relative: true
-    # cartesian_via_points: [
-    #    0.056, -0.024, 0.015,
-    #    0.080, -0.080, 0.028,
-    #    0.056, -0.136, 0.037,
-    #    0.000, -0.160, 0.040,
-    #   -0.056, -0.136, 0.037,
-    #   -0.080, -0.080, 0.028,
-    #   -0.056, -0.024, 0.015,
-    #    0.000,  0.000, 0.000
-    # ]
-    cartesian_via_points: [0.0, 0.0, -0.6]
+    # Each state is a robot-base-frame pose [x, y, z, qx, qy, qz, qw].
+    cartesian_via_points: [
+      0.406957,  0.100000,  0.759912, 0.923956, -0.382499, 0.000000, 0.000000,
+      0.386957,  0.080000,  0.619912, 0.923956, -0.382499, 0.000000, 0.000000,
+      0.346957,  0.040000,  0.449912, 0.923956, -0.382499, 0.000000, 0.000000,
+      0.306957,  0.000000,  0.279912, 0.923956, -0.382499, 0.000000, 0.000000
+    ]
 
     nominal_pos_stiffness: 1200.0
     nominal_rot_stiffness: 200.0

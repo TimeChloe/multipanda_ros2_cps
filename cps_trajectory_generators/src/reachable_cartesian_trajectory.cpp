@@ -57,6 +57,64 @@ bool parseInt(const std::string& text, int* value) {
   return true;
 }
 
+Eigen::Quaterniond normalizedOrIdentity(const Eigen::Quaterniond& q_in) {
+  Eigen::Quaterniond q = q_in;
+  const double norm = q.norm();
+  if (!std::isfinite(norm) || norm < 1e-12) {
+    return Eigen::Quaterniond::Identity();
+  }
+  q.coeffs() /= norm;
+  return q;
+}
+
+Eigen::Quaterniond shortestEquivalent(
+    const Eigen::Quaterniond& reference,
+    const Eigen::Quaterniond& q_in) {
+  Eigen::Quaterniond q = normalizedOrIdentity(q_in);
+  if (q.coeffs().dot(reference.coeffs()) < 0.0) {
+    q.coeffs() *= -1.0;
+  }
+  return q;
+}
+
+Eigen::Vector3d quaternionToRotationVector(const Eigen::Quaterniond& q_in) {
+  Eigen::Quaterniond q = normalizedOrIdentity(q_in);
+  if (q.w() < 0.0) {
+    q.coeffs() *= -1.0;
+  }
+  Eigen::AngleAxisd aa(q);
+  if (!std::isfinite(aa.angle()) || aa.angle() < 1e-12) {
+    return Eigen::Vector3d::Zero();
+  }
+  return aa.axis() * aa.angle();
+}
+
+Eigen::Quaterniond rotationVectorToQuaternion(const Eigen::Vector3d& r) {
+  const double angle = r.norm();
+  if (!std::isfinite(angle) || angle < 1e-12) {
+    return Eigen::Quaterniond::Identity();
+  }
+  return Eigen::Quaterniond(Eigen::AngleAxisd(angle, r / angle));
+}
+
+Eigen::Vector3d rotationVectorBetween(
+    const Eigen::Quaterniond& from,
+    const Eigen::Quaterniond& to) {
+  const Eigen::Quaterniond q_from = normalizedOrIdentity(from);
+  const Eigen::Quaterniond q_to = shortestEquivalent(q_from, to);
+  return quaternionToRotationVector(q_to * q_from.conjugate());
+}
+
+Eigen::Vector3d clampVectorComponents(
+    const Eigen::Vector3d& v,
+    double limit) {
+  const double clamped_limit = std::max(limit, 0.0);
+  return Eigen::Vector3d(
+      std::clamp(v.x(), -clamped_limit, clamped_limit),
+      std::clamp(v.y(), -clamped_limit, clamped_limit),
+      std::clamp(v.z(), -clamped_limit, clamped_limit));
+}
+
 }  // namespace
 
 std::string defaultTrajectoryGeneratorConfigPath() {
@@ -123,6 +181,15 @@ TrajectoryGeneratorSettings loadTrajectoryGeneratorSettings(
     } else if (key == "local_replan_max_jerk" &&
                parseDouble(value_text, &double_value)) {
       settings.local_replan_max_jerk = double_value;
+    } else if (key == "local_replan_max_angular_velocity" &&
+               parseDouble(value_text, &double_value)) {
+      settings.local_replan_max_angular_velocity = double_value;
+    } else if (key == "local_replan_max_angular_acceleration" &&
+               parseDouble(value_text, &double_value)) {
+      settings.local_replan_max_angular_acceleration = double_value;
+    } else if (key == "local_replan_max_angular_jerk" &&
+               parseDouble(value_text, &double_value)) {
+      settings.local_replan_max_angular_jerk = double_value;
     } else if (key == "failsafe_brake_max_velocity" &&
                parseDouble(value_text, &double_value)) {
       settings.failsafe_brake_max_velocity = double_value;
@@ -132,6 +199,15 @@ TrajectoryGeneratorSettings loadTrajectoryGeneratorSettings(
     } else if (key == "failsafe_brake_max_jerk" &&
                parseDouble(value_text, &double_value)) {
       settings.failsafe_brake_max_jerk = double_value;
+    } else if (key == "failsafe_brake_max_angular_velocity" &&
+               parseDouble(value_text, &double_value)) {
+      settings.failsafe_brake_max_angular_velocity = double_value;
+    } else if (key == "failsafe_brake_max_angular_acceleration" &&
+               parseDouble(value_text, &double_value)) {
+      settings.failsafe_brake_max_angular_acceleration = double_value;
+    } else if (key == "failsafe_brake_max_angular_jerk" &&
+               parseDouble(value_text, &double_value)) {
+      settings.failsafe_brake_max_angular_jerk = double_value;
     } else if (key == "path_time_rate_min" &&
                parseDouble(value_text, &double_value)) {
       settings.path_time_rate_min = double_value;
@@ -214,11 +290,15 @@ double estimatePathRateAtSample(
     const CartesianTrajectorySample& planning_start,
     const CartesianTrajectorySample& path_sample,
     double max_path_rate) {
-  const double denom = path_sample.dp.squaredNorm();
+  const double denom =
+      path_sample.dp.squaredNorm() + path_sample.w.squaredNorm();
   if (denom < 1e-10) {
     return 0.0;
   }
-  const double rate = planning_start.dp.dot(path_sample.dp) / denom;
+  const double rate =
+      (planning_start.dp.dot(path_sample.dp) +
+       planning_start.w.dot(path_sample.w)) /
+      denom;
   if (!std::isfinite(rate)) {
     return 0.0;
   }
@@ -388,6 +468,17 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
     const std::vector<Eigen::Vector3d>& waypoints,
     const Eigen::Quaterniond& reference_orientation,
     const LocalCartesianReplanConfig& config) {
+  return makeSmoothViaPointCartesianTrajectory(
+      waypoints,
+      std::vector<Eigen::Quaterniond>(
+          waypoints.size(), normalizedOrIdentity(reference_orientation)),
+      config);
+}
+
+std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
+    const std::vector<Eigen::Vector3d>& waypoints,
+    const std::vector<Eigen::Quaterniond>& waypoint_orientations,
+    const LocalCartesianReplanConfig& config) {
   std::vector<CartesianTrajectorySample> samples;
   if (waypoints.empty()) {
     return samples;
@@ -395,17 +486,35 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
 
   const double dt = std::max(config.dt, kMinDt);
   const double max_velocity = std::max(config.max_velocity, 1e-4);
+  const double max_angular_velocity =
+      std::max(config.max_angular_velocity, 1e-4);
   const double max_acceleration = std::max(config.max_acceleration, 1e-4);
   const double max_jerk = std::max(config.max_jerk, 1e-4);
+  const double orientation_metric_scale = max_velocity / max_angular_velocity;
 
-  Eigen::Quaterniond q_ref = reference_orientation;
-  q_ref.normalize();
+  const Eigen::Quaterniond fallback_orientation =
+      waypoint_orientations.empty()
+          ? Eigen::Quaterniond::Identity()
+          : normalizedOrIdentity(waypoint_orientations.front());
 
   std::vector<Eigen::Vector3d> points;
+  std::vector<Eigen::Quaterniond> orientations;
   points.reserve(waypoints.size());
-  for (const auto& p : waypoints) {
-    if (points.empty() || (p - points.back()).norm() > 1e-9) {
-      points.push_back(p);
+  orientations.reserve(waypoints.size());
+  for (std::size_t i = 0; i < waypoints.size(); ++i) {
+    Eigen::Quaterniond q =
+        i < waypoint_orientations.size()
+            ? normalizedOrIdentity(waypoint_orientations[i])
+            : fallback_orientation;
+    if (!orientations.empty()) {
+      q = shortestEquivalent(orientations.back(), q);
+    }
+
+    if (points.empty() ||
+        (waypoints[i] - points.back()).norm() > 1e-9 ||
+        rotationVectorBetween(orientations.back(), q).norm() > 1e-9) {
+      points.push_back(waypoints[i]);
+      orientations.push_back(q);
     }
   }
 
@@ -416,14 +525,19 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
     CartesianTrajectorySample s;
     s.t = 0.0;
     s.p = points.front();
-    s.q = q_ref;
+    s.q = orientations.front();
     samples.push_back(s);
     return samples;
   }
 
   std::vector<double> u(points.size(), 0.0);
   for (std::size_t i = 1; i < points.size(); ++i) {
-    u[i] = u[i - 1] + std::max((points[i] - points[i - 1]).norm(), kMinDt);
+    const double position_step = (points[i] - points[i - 1]).norm();
+    const double angular_step =
+        rotationVectorBetween(orientations[i - 1], orientations[i]).norm();
+    const double full_state_step = std::hypot(
+        position_step, orientation_metric_scale * angular_step);
+    u[i] = u[i - 1] + std::max(full_state_step, kMinDt);
   }
   const double path_length = std::max(u.back(), kMinDt);
 
@@ -435,6 +549,28 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
   for (std::size_t i = 1; i + 1 < points.size(); ++i) {
     tangents[i] =
         (points[i + 1] - points[i - 1]) /
+        std::max(u[i + 1] - u[i - 1], kMinDt);
+  }
+
+  const Eigen::Quaterniond q_ref = orientations.front();
+  std::vector<Eigen::Vector3d> rotation_vectors(
+      points.size(), Eigen::Vector3d::Zero());
+  for (std::size_t i = 1; i < orientations.size(); ++i) {
+    rotation_vectors[i] = rotationVectorBetween(q_ref, orientations[i]);
+  }
+
+  std::vector<Eigen::Vector3d> rotation_tangents(
+      rotation_vectors.size(), Eigen::Vector3d::Zero());
+  rotation_tangents.front() =
+      (rotation_vectors[1] - rotation_vectors[0]) /
+      std::max(u[1] - u[0], kMinDt);
+  rotation_tangents.back() =
+      (rotation_vectors.back() -
+       rotation_vectors[rotation_vectors.size() - 2]) /
+      std::max(u.back() - u[u.size() - 2], kMinDt);
+  for (std::size_t i = 1; i + 1 < rotation_vectors.size(); ++i) {
+    rotation_tangents[i] =
+        (rotation_vectors[i + 1] - rotation_vectors[i - 1]) /
         std::max(u[i + 1] - u[i - 1], kMinDt);
   }
 
@@ -465,7 +601,7 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
   CartesianTrajectorySample first;
   first.t = 0.0;
   first.p = points.front();
-  first.q = q_ref;
+  first.q = orientations.front();
   samples.push_back(first);
 
   double previous_path_s = 0.0;
@@ -479,6 +615,9 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
     previous_path_s = s_path;
     const SmoothPathSample path_sample =
         sampleCubicHermitePath(points, u, tangents, s_path);
+    const SmoothPathSample orientation_sample =
+        sampleCubicHermitePath(
+            rotation_vectors, u, rotation_tangents, s_path);
 
     CartesianTrajectorySample sample;
     sample.t = tau;
@@ -487,11 +626,20 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
     sample.ddp =
         path_sample.d2p_ds2 * ds_path * ds_path +
         path_sample.dp_ds * dds_arr[0];
-    sample.q = q_ref;
+    sample.q = rotationVectorToQuaternion(orientation_sample.p) * q_ref;
+    sample.q.normalize();
+    sample.w = orientation_sample.dp_ds * ds_path;
+    sample.dw =
+        orientation_sample.d2p_ds2 * ds_path * ds_path +
+        orientation_sample.dp_ds * dds_arr[0];
     if (i + 1 == n_steps) {
       sample.p = points.back();
       sample.dp.setZero();
       sample.ddp.setZero();
+      sample.q = orientations.back();
+      sample.q.normalize();
+      sample.w.setZero();
+      sample.dw.setZero();
     }
     samples.push_back(sample);
   }
@@ -515,6 +663,12 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
   const double max_velocity = std::max(config.max_velocity, 1e-4);
   const double max_acceleration = std::max(config.max_acceleration, 1e-4);
   const double max_jerk = std::max(config.max_jerk, 1e-4);
+  const double max_angular_velocity =
+      std::max(config.max_angular_velocity, 1e-4);
+  const double max_angular_acceleration =
+      std::max(config.max_angular_acceleration, 1e-4);
+  const double max_angular_jerk =
+      std::max(config.max_angular_jerk, 1e-4);
 
   const double lower_time = std::clamp(
       min_path_time,
@@ -570,7 +724,9 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
   const bool at_end =
       target_path_time >= timed_path.back().t - dt &&
       (planning_start.p - timed_path.back().p).norm() < 1e-3 &&
-      planning_start.dp.norm() < 1e-3;
+      planning_start.dp.norm() < 1e-3 &&
+      rotationVectorBetween(planning_start.q, timed_path.back().q).norm() < 1e-3 &&
+      planning_start.w.norm() < 1e-3;
 
   if (at_end) {
     samples.reserve(static_cast<std::size_t>(horizon_steps));
@@ -579,49 +735,85 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
       s.t = timed_path.back().t;
       s.dp.setZero();
       s.ddp.setZero();
+      s.w.setZero();
+      s.dw.setZero();
       samples.push_back(s);
     }
     return samples;
   }
 
-  ruckig::Ruckig<3> otg;
-  ruckig::InputParameter<3> input;
-  ruckig::Trajectory<3> trajectory;
+  const Eigen::Quaterniond planning_start_orientation =
+      normalizedOrIdentity(planning_start.q);
+  const Eigen::Vector3d target_rotation =
+      rotationVectorBetween(planning_start_orientation, target.q);
+
+  ruckig::Ruckig<6> otg;
+  ruckig::InputParameter<6> input;
+  ruckig::Trajectory<6> trajectory;
 
   input.current_position = {
       planning_start.p.x(),
       planning_start.p.y(),
-      planning_start.p.z()};
+      planning_start.p.z(),
+      0.0,
+      0.0,
+      0.0};
   input.current_velocity = {
       planning_start.dp.x(),
       planning_start.dp.y(),
-      planning_start.dp.z()};
+      planning_start.dp.z(),
+      planning_start.w.x(),
+      planning_start.w.y(),
+      planning_start.w.z()};
   input.current_acceleration = {
       planning_start.ddp.x(),
       planning_start.ddp.y(),
-      planning_start.ddp.z()};
+      planning_start.ddp.z(),
+      planning_start.dw.x(),
+      planning_start.dw.y(),
+      planning_start.dw.z()};
 
   input.target_position = {
       target.p.x(),
       target.p.y(),
-      target.p.z()};
+      target.p.z(),
+      target_rotation.x(),
+      target_rotation.y(),
+      target_rotation.z()};
+  const Eigen::Vector3d target_w =
+      clampVectorComponents(target.w, max_angular_velocity);
+  const Eigen::Vector3d target_dw =
+      clampVectorComponents(target.dw, max_angular_acceleration);
   input.target_velocity = {
       std::clamp(target.dp.x(), -max_velocity, max_velocity),
       std::clamp(target.dp.y(), -max_velocity, max_velocity),
-      std::clamp(target.dp.z(), -max_velocity, max_velocity)};
+      std::clamp(target.dp.z(), -max_velocity, max_velocity),
+      target_w.x(),
+      target_w.y(),
+      target_w.z()};
   input.target_acceleration = {
       std::clamp(target.ddp.x(), -max_acceleration, max_acceleration),
       std::clamp(target.ddp.y(), -max_acceleration, max_acceleration),
-      std::clamp(target.ddp.z(), -max_acceleration, max_acceleration)};
+      std::clamp(target.ddp.z(), -max_acceleration, max_acceleration),
+      target_dw.x(),
+      target_dw.y(),
+      target_dw.z()};
 
-  input.max_velocity = {max_velocity, max_velocity, max_velocity};
-  input.max_acceleration = {max_acceleration, max_acceleration, max_acceleration};
-  input.max_jerk = {max_jerk, max_jerk, max_jerk};
+  input.max_velocity = {
+      max_velocity, max_velocity, max_velocity,
+      max_angular_velocity, max_angular_velocity, max_angular_velocity};
+  input.max_acceleration = {
+      max_acceleration, max_acceleration, max_acceleration,
+      max_angular_acceleration, max_angular_acceleration,
+      max_angular_acceleration};
+  input.max_jerk = {
+      max_jerk, max_jerk, max_jerk,
+      max_angular_jerk, max_angular_jerk, max_angular_jerk};
 
   auto result = otg.calculate(input, trajectory);
   if (result < ruckig::Result::Working) {
-    input.target_velocity = {0.0, 0.0, 0.0};
-    input.target_acceleration = {0.0, 0.0, 0.0};
+    input.target_velocity = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    input.target_acceleration = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     result = otg.calculate(input, trajectory);
   }
   if (result < ruckig::Result::Working) {
@@ -635,8 +827,19 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
       s.dp = (target.p - planning_start.p) /
              std::max(static_cast<double>(horizon_steps) * dt, kMinDt);
       s.ddp.setZero();
-      s.q = target.q;
+      s.q = planning_start_orientation.slerp(alpha, target.q);
       s.q.normalize();
+      s.w = target_rotation /
+            std::max(static_cast<double>(horizon_steps) * dt, kMinDt);
+      s.dw.setZero();
+      if (i + 1 == horizon_steps) {
+        s.p = target.p;
+        s.dp.setZero();
+        s.q = target.q;
+        s.q.normalize();
+        s.w = target.w;
+        s.dw = target.dw;
+      }
       samples.push_back(s);
     }
     return samples;
@@ -652,7 +855,7 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
     const double tau = std::min(static_cast<double>(i + 1) * dt, duration);
     const double alpha = std::clamp(tau / duration, 0.0, 1.0);
 
-    std::array<double, 3> p{}, v{}, a{};
+    std::array<double, 6> p{}, v{}, a{};
     trajectory.at_time(tau, p, v, a);
 
     CartesianTrajectorySample s;
@@ -667,8 +870,18 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
         planning_start.p,
         target.p);
     s.ddp = Eigen::Vector3d(a[0], a[1], a[2]);
-    s.q = target.q;
+    s.q =
+        rotationVectorToQuaternion(Eigen::Vector3d(p[3], p[4], p[5])) *
+        planning_start_orientation;
     s.q.normalize();
+    s.w = Eigen::Vector3d(v[3], v[4], v[5]);
+    s.dw = Eigen::Vector3d(a[3], a[4], a[5]);
+    if (tau >= duration - kMinDt) {
+      s.q = target.q;
+      s.q.normalize();
+      s.w = target.w;
+      s.dw = target.dw;
+    }
     samples.push_back(s);
   }
 
@@ -933,34 +1146,59 @@ std::vector<CartesianTrajectorySample> makeCartesianBrakeTrajectory(
   const double max_velocity = std::max(config.max_velocity, 1e-4);
   const double max_acceleration = std::max(config.max_acceleration, 1e-4);
   const double max_jerk = std::max(config.max_jerk, 1e-4);
+  const double max_angular_velocity =
+      std::max(config.max_angular_velocity, 1e-4);
+  const double max_angular_acceleration =
+      std::max(config.max_angular_acceleration, 1e-4);
+  const double max_angular_jerk =
+      std::max(config.max_angular_jerk, 1e-4);
 
-  ruckig::Ruckig<3> otg;
-  ruckig::InputParameter<3> input;
-  ruckig::Trajectory<3> trajectory;
+  const Eigen::Quaterniond brake_start_orientation =
+      normalizedOrIdentity(brake_start.q);
+
+  ruckig::Ruckig<6> otg;
+  ruckig::InputParameter<6> input;
+  ruckig::Trajectory<6> trajectory;
 
   input.control_interface = ruckig::ControlInterface::Velocity;
 
   input.current_position = {
       brake_start.p.x(),
       brake_start.p.y(),
-      brake_start.p.z()};
+      brake_start.p.z(),
+      0.0,
+      0.0,
+      0.0};
 
   input.current_velocity = {
       brake_start.dp.x(),
       brake_start.dp.y(),
-      brake_start.dp.z()};
+      brake_start.dp.z(),
+      brake_start.w.x(),
+      brake_start.w.y(),
+      brake_start.w.z()};
 
   input.current_acceleration = {
       brake_start.ddp.x(),
       brake_start.ddp.y(),
-      brake_start.ddp.z()};
+      brake_start.ddp.z(),
+      brake_start.dw.x(),
+      brake_start.dw.y(),
+      brake_start.dw.z()};
 
-  input.target_velocity = {0.0, 0.0, 0.0};
-  input.target_acceleration = {0.0, 0.0, 0.0};
+  input.target_velocity = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  input.target_acceleration = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 
-  input.max_velocity = {max_velocity, max_velocity, max_velocity};
-  input.max_acceleration = {max_acceleration, max_acceleration, max_acceleration};
-  input.max_jerk = {max_jerk, max_jerk, max_jerk};
+  input.max_velocity = {
+      max_velocity, max_velocity, max_velocity,
+      max_angular_velocity, max_angular_velocity, max_angular_velocity};
+  input.max_acceleration = {
+      max_acceleration, max_acceleration, max_acceleration,
+      max_angular_acceleration, max_angular_acceleration,
+      max_angular_acceleration};
+  input.max_jerk = {
+      max_jerk, max_jerk, max_jerk,
+      max_angular_jerk, max_angular_jerk, max_angular_jerk};
 
   const auto result = otg.calculate(input, trajectory);
   if (result < ruckig::Result::Working) {
@@ -976,7 +1214,7 @@ std::vector<CartesianTrajectorySample> makeCartesianBrakeTrajectory(
   for (int i = 0; i < n_steps; ++i) {
     const double tau = std::min(static_cast<double>(i + 1) * dt, duration);
 
-    std::array<double, 3> p{}, v{}, a{};
+    std::array<double, 6> p{}, v{}, a{};
     trajectory.at_time(tau, p, v, a);
 
     CartesianTrajectorySample s;
@@ -984,11 +1222,17 @@ std::vector<CartesianTrajectorySample> makeCartesianBrakeTrajectory(
     s.p = Eigen::Vector3d(p[0], p[1], p[2]);
     s.dp = Eigen::Vector3d(v[0], v[1], v[2]);
     s.ddp = Eigen::Vector3d(a[0], a[1], a[2]);
-    s.q = brake_start.q;
+    s.q =
+        rotationVectorToQuaternion(Eigen::Vector3d(p[3], p[4], p[5])) *
+        brake_start_orientation;
     s.q.normalize();
+    s.w = Eigen::Vector3d(v[3], v[4], v[5]);
+    s.dw = Eigen::Vector3d(a[3], a[4], a[5]);
     if (i + 1 == n_steps) {
       s.dp.setZero();
       s.ddp.setZero();
+      s.w.setZero();
+      s.dw.setZero();
     }
     samples.push_back(s);
   }
