@@ -1,0 +1,16 @@
+reachable_cartesian_impedance_controller:
+  ros__parameters:
+    cartesian_via_points_relative: true
+    cartesian_via_points: [
+      0.00,  0.00,  0.08,
+      0.00,  0.00, -0.08,
+      0.00,  0.00, -0.25,
+      0.00,  0.00, -0.42
+    ]
+    cartesian_via_point_quaternions_relative: true
+    cartesian_via_point_quaternions: [
+      0.0, 0.0, 0.0, 1.0,
+      0.0, 0.0, 0.0, 1.0,
+      0.0, 0.0, 0.0, 1.0,
+      0.0, 0.0, 0.0, 1.0
+    ]
