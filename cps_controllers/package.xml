@@ -11,6 +11,7 @@
 
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
   <depend>rclcpp_lifecycle</depend>
   <depend>controller_interface</depend>
   <depend>hardware_interface</depend>
@@ -22,6 +23,7 @@
   <depend>mujoco_ros_msgs</depend>
   <depend>pinocchio</depend>
   <depend>visualization_msgs</depend>
+  <depend>panda_motion_generator_msgs</depend>
   <depend>cps_human_workspace</depend>
   <depend>cps_safety_monitor</depend>
   <depend>cps_trajectory_generators</depend>

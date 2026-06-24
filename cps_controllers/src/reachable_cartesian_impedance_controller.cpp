@@ -40,6 +40,7 @@
 #include <rclcpp_lifecycle/state.hpp>
 
 #include <geometry_msgs/msg/point.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <std_msgs/msg/color_rgba.hpp>
 #include <visualization_msgs/msg/marker.hpp>
@@ -71,6 +72,9 @@ using Quaterniond = Eigen::Quaterniond;
 using SteadyClock = std::chrono::steady_clock;
 using Marker = visualization_msgs::msg::Marker;
 using MarkerArray = visualization_msgs::msg::MarkerArray;
+using CartesianViaMotionAction =
+    panda_motion_generator_msgs::action::CartesianViaMotion;
+using SimpleActionResult = panda_motion_generator_msgs::msg::SimpleActionResult;
 using CartesianTrajectorySample = cps_trajectory_generators::CartesianTrajectorySample;
 using LocalCartesianReplanConfig = cps_trajectory_generators::LocalCartesianReplanConfig;
 using PathConsistentTimedPathConfig =
@@ -232,6 +236,14 @@ inline Quaterniond normalizedQuaternionOrIdentity(const Quaterniond& q_in) {
   }
   q.coeffs() /= norm;
   return q;
+}
+
+inline std::shared_ptr<CartesianViaMotionAction::Result>
+makeCartesianViaMotionActionResult(int32_t state, const std::string& message) {
+  auto result = std::make_shared<CartesianViaMotionAction::Result>();
+  result->result.state = state;
+  result->result.error = message;
+  return result;
 }
 
 inline double clamp01(double value) {
@@ -756,8 +768,14 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
   config.max_angular_acceleration = local_replan_max_angular_acceleration_;
   config.max_angular_jerk = local_replan_max_angular_jerk_;
 
+  std::vector<CartesianTrajectorySample> active_path;
+  {
+    std::lock_guard<std::mutex> lock(cartesian_via_point_path_mutex_);
+    active_path = cartesian_via_point_path_;
+  }
+
   std::vector<CartesianTrajectorySample> planned_samples;
-  if (!cartesian_via_point_path_.empty()) {
+  if (!active_path.empty()) {
     PathConsistentTimedPathConfig path_config;
     path_config.intended_steps = std::max(1, shield_intended_steps_);
     path_config.dt = local_replan_dt_;
@@ -780,14 +798,14 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     planned_samples = makePathConsistentTimedPathIntendedPrefix(
         path_start_time,
         planning_start,
-        cartesian_via_point_path_,
+        active_path,
         path_config);
 
     if (planned_samples.empty()) {
       planned_samples = makeLocalCartesianReplanFromTimedPath(
           path_start_time,
           planning_start,
-          cartesian_via_point_path_,
+          active_path,
           config);
     }
   }
@@ -902,8 +920,14 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     brake_start.w = freeze_anchor.w;
     brake_start.dw = freeze_anchor.dw;
 
+    std::vector<CartesianTrajectorySample> active_path;
+    {
+      std::lock_guard<std::mutex> lock(cartesian_via_point_path_mutex_);
+      active_path = cartesian_via_point_path_;
+    }
+
     std::vector<CartesianTrajectorySample> brake_samples;
-    if (!cartesian_via_point_path_.empty()) {
+    if (!active_path.empty()) {
       PathConsistentTimedPathConfig path_brake_config;
       path_brake_config.dt = failsafe_plan_dt;
       path_brake_config.path_lookahead_sec = local_path_lookahead_sec_;
@@ -917,7 +941,7 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
       brake_samples = makePathConsistentTimedPathBrake(
           plan.nominal_time_anchor,
           brake_start,
-          cartesian_via_point_path_,
+          active_path,
           path_brake_config);
     }
 
@@ -1025,27 +1049,32 @@ Vector6d ReachableCartesianImpedanceController::twistAtCollisionCenter(
 double ReachableCartesianImpedanceController::estimatePathRateFromTimedPathSample(
     double path_time,
     const Vector3d& cartesian_velocity) const {
-  if (cartesian_via_point_path_.empty()) {
+  std::vector<CartesianTrajectorySample> path;
+  {
+    std::lock_guard<std::mutex> lock(cartesian_via_point_path_mutex_);
+    path = cartesian_via_point_path_;
+  }
+  if (path.empty()) {
     return 0.0;
   }
 
   const double t =
       std::clamp(path_time,
-                 cartesian_via_point_path_.front().t,
-                 cartesian_via_point_path_.back().t);
+                 path.front().t,
+                 path.back().t);
   auto upper = std::lower_bound(
-      cartesian_via_point_path_.begin(),
-      cartesian_via_point_path_.end(),
+      path.begin(),
+      path.end(),
       t,
       [](const CartesianTrajectorySample& sample, double value) {
         return sample.t < value;
       });
 
   Vector3d path_velocity = Vector3d::Zero();
-  if (upper == cartesian_via_point_path_.begin()) {
+  if (upper == path.begin()) {
     path_velocity = upper->dp;
-  } else if (upper == cartesian_via_point_path_.end()) {
-    path_velocity = cartesian_via_point_path_.back().dp;
+  } else if (upper == path.end()) {
+    path_velocity = path.back().dp;
   } else {
     const auto lower = upper - 1;
     const double span = std::max(upper->t - lower->t, kMinDt);
@@ -1302,9 +1331,17 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
                   plan_duration,
               path_time_rate_min_,
               path_time_rate_max_);
-        } else if (!cartesian_via_point_path_.empty() &&
-                   commanded_path_time_ >= cartesian_via_point_path_.back().t - kMinDt) {
-          commanded_path_rate_ = 0.0;
+        } else {
+          bool active_path_finished = false;
+          {
+            std::lock_guard<std::mutex> lock(cartesian_via_point_path_mutex_);
+            active_path_finished =
+                !cartesian_via_point_path_.empty() &&
+                commanded_path_time_ >= cartesian_via_point_path_.back().t - kMinDt;
+          }
+          if (active_path_finished) {
+            commanded_path_rate_ = 0.0;
+          }
         }
       }
     }
@@ -1516,6 +1553,421 @@ bool ReachableCartesianImpedanceController::takeAsyncMonitorOutput(
   return has_new_output;
 }
 
+bool ReachableCartesianImpedanceController::takePendingCartesianViaPoints(
+    std::vector<Vector3d>* points,
+    std::vector<Quaterniond>* orientations,
+    std::shared_ptr<CartesianViaMotionGoalHandle>* goal_handle,
+    std::uint64_t* sequence) {
+  if (points == nullptr || orientations == nullptr ||
+      goal_handle == nullptr || sequence == nullptr) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(pending_cartesian_via_points_mutex_);
+  if (!pending_cartesian_via_points_available_) {
+    return false;
+  }
+
+  *points = pending_cartesian_via_points_;
+  *orientations = pending_cartesian_via_point_quaternions_;
+  *goal_handle = pending_cartesian_via_points_goal_handle_;
+  *sequence = pending_cartesian_via_points_sequence_;
+  pending_cartesian_via_points_available_ = false;
+  pending_cartesian_via_points_goal_handle_.reset();
+  return true;
+}
+
+std::vector<CartesianTrajectorySample>
+ReachableCartesianImpedanceController::buildCartesianViaPointPath(
+    const Vector3d& start_position,
+    const Quaterniond& start_orientation,
+    const std::vector<Vector3d>& via_points,
+    const std::vector<Quaterniond>& via_orientations,
+    std::size_t* waypoint_count) const {
+  std::vector<Vector3d> waypoints;
+  std::vector<Quaterniond> waypoint_orientations;
+  const std::size_t via_pose_count =
+      std::max(via_points.size(), via_orientations.size());
+  waypoints.reserve(via_pose_count + 1);
+  waypoint_orientations.reserve(via_pose_count + 1);
+
+  Quaterniond normalized_start_orientation =
+      normalizedQuaternionOrIdentity(start_orientation);
+  normalized_start_orientation.normalize();
+  waypoints.push_back(start_position);
+  waypoint_orientations.push_back(normalized_start_orientation);
+
+  for (std::size_t i = 0; i < via_pose_count; ++i) {
+    const Vector3d waypoint =
+        i < via_points.size() ? via_points[i] : waypoints.back();
+
+    Quaterniond waypoint_orientation = normalized_start_orientation;
+    if (i < via_orientations.size()) {
+      waypoint_orientation = normalizedQuaternionOrIdentity(via_orientations[i]);
+      waypoint_orientation.normalize();
+    }
+
+    if ((waypoint - waypoints.back()).norm() > 1e-9 ||
+        std::abs(waypoint_orientation.coeffs().dot(
+            waypoint_orientations.back().coeffs())) < 1.0 - 1e-9) {
+      waypoints.push_back(waypoint);
+      waypoint_orientations.push_back(waypoint_orientation);
+    }
+  }
+
+  if (waypoint_count != nullptr) {
+    *waypoint_count = waypoints.size();
+  }
+  if (waypoints.size() < 2) {
+    return {};
+  }
+
+  LocalCartesianReplanConfig via_config;
+  via_config.horizon_steps = local_replan_horizon_steps_;
+  via_config.dt = local_replan_dt_;
+  via_config.path_lookahead_sec = local_path_lookahead_sec_;
+  via_config.max_velocity = local_replan_max_velocity_;
+  via_config.max_acceleration = local_replan_max_acceleration_;
+  via_config.max_jerk = local_replan_max_jerk_;
+  via_config.max_angular_velocity = local_replan_max_angular_velocity_;
+  via_config.max_angular_acceleration = local_replan_max_angular_acceleration_;
+  via_config.max_angular_jerk = local_replan_max_angular_jerk_;
+  return makeSmoothViaPointCartesianTrajectory(
+      waypoints,
+      waypoint_orientations,
+      via_config);
+}
+
+void ReachableCartesianImpedanceController::acceptPendingCartesianViaPoints(
+    const Vector3d& current_position,
+    const Quaterniond& current_orientation,
+    double wall_time) {
+  std::vector<Vector3d> via_points;
+  std::vector<Quaterniond> via_orientations;
+  std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle;
+  std::uint64_t sequence = 0;
+  if (!takePendingCartesianViaPoints(
+          &via_points, &via_orientations, &goal_handle, &sequence)) {
+    return;
+  }
+
+  std::size_t waypoint_count = 0;
+  std::vector<CartesianTrajectorySample> path =
+      buildCartesianViaPointPath(
+          current_position,
+          current_orientation,
+          via_points,
+          via_orientations,
+          &waypoint_count);
+
+  if (path.empty()) {
+    RCLCPP_WARN(
+        get_node()->get_logger(),
+        "Received cartesian_via_points message %lu, but no valid path could be time-parameterized. Keeping the current path.",
+        static_cast<unsigned long>(sequence));
+    if (goal_handle && goal_handle->is_active()) {
+      goal_handle->abort(makeCartesianViaMotionActionResult(
+          SimpleActionResult::REJECTED,
+          "No valid Cartesian via-point path could be time-parameterized."));
+    }
+    return;
+  }
+
+  cartesian_via_points_ = std::move(via_points);
+  cartesian_via_point_quaternions_ = std::move(via_orientations);
+  {
+    std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
+    cartesian_via_point_path_ = std::move(path);
+  }
+
+  resetViaPointExecutionState(current_position, current_orientation, wall_time);
+
+  std::shared_ptr<CartesianViaMotionGoalHandle> previous_active_goal;
+  {
+    std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
+    previous_active_goal = active_cartesian_via_points_goal_handle_;
+    active_cartesian_via_points_goal_handle_ = goal_handle;
+    cartesian_via_points_action_last_feedback_wall_time_ = -1.0;
+  }
+  if (previous_active_goal &&
+      previous_active_goal != goal_handle &&
+      previous_active_goal->is_active()) {
+    previous_active_goal->abort(makeCartesianViaMotionActionResult(
+        SimpleActionResult::ABORTED,
+        "Cartesian via-point goal was replaced by a newer via-point command."));
+  }
+
+  std::vector<CartesianTrajectorySample> path_snapshot;
+  {
+    std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
+    path_snapshot = cartesian_via_point_path_;
+  }
+  RCLCPP_INFO(
+      get_node()->get_logger(),
+      "Accepted cartesian_via_points message %lu: poses=%zu waypoints=%zu samples=%zu duration=%.3f s",
+      static_cast<unsigned long>(sequence),
+      cartesian_via_points_.size(),
+      waypoint_count,
+      path_snapshot.size(),
+      path_snapshot.empty() ? 0.0 : path_snapshot.back().t);
+}
+
+void ReachableCartesianImpedanceController::resetViaPointExecutionState(
+    const Vector3d& current_position,
+    const Quaterniond& current_orientation,
+    double wall_time) {
+  paused_nominal_time_sec_ = wall_time;
+  failsafe_start_time_sec_ = -1.0;
+  failsafe_enter_wall_time_sec_ = -1.0;
+  commanded_path_time_ = 0.0;
+  commanded_path_rate_ = 0.0;
+  mode_ = SafetyMode::kNominal;
+
+  last_verified_plan_ = VerifiedPlan{};
+  last_verified_command_stage_ = 0;
+  last_verified_command_index_ = 0;
+  last_shield_decision_valid_ = false;
+  last_async_output_valid_ = false;
+  last_async_output_wall_time_ = -1.0;
+  last_async_input_publish_wall_time_ = -1.0;
+  cartesian_effective_time_frozen_ = false;
+  cartesian_effective_time_freeze_start_wall_time_ = -1.0;
+  cartesian_effective_time_hold_sample_valid_ = false;
+
+  {
+    std::lock_guard<std::mutex> input_lock(async_input_mutex_);
+    async_input_pending_ = false;
+  }
+  {
+    std::lock_guard<std::mutex> output_lock(async_output_mutex_);
+    latest_async_output_ = AsyncMonitorOutput{};
+    last_consumed_async_output_sequence_ = 0;
+  }
+
+  last_commanded_sample_ = ImpedanceSample{};
+  last_commanded_sample_.t = 0.0;
+  last_commanded_sample_.p = current_position;
+  last_commanded_sample_.dp.setZero();
+  last_commanded_sample_.ddp.setZero();
+  last_commanded_sample_.q = normalizedQuaternionOrIdentity(current_orientation);
+  last_commanded_sample_.w.setZero();
+  last_commanded_sample_.dw.setZero();
+  last_commanded_sample_.K = K_nominal_;
+  last_commanded_sample_.D = D_nominal_;
+  last_commanded_sample_.failsafe = false;
+  last_commanded_sample_valid_ = true;
+}
+
+void ReachableCartesianImpedanceController::updateCartesianViaPointsActionStatus(
+    const Vector3d& current_position,
+    const Quaterniond& current_orientation,
+    double wall_time) {
+  std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle;
+  {
+    std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
+    goal_handle = active_cartesian_via_points_goal_handle_;
+  }
+
+  if (!goal_handle) {
+    return;
+  }
+
+  if (goal_handle->is_canceling()) {
+    {
+      std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
+      cartesian_via_point_path_.clear();
+    }
+    cartesian_via_points_.clear();
+    cartesian_via_point_quaternions_.clear();
+    resetViaPointExecutionState(current_position, current_orientation, wall_time);
+    goal_handle->canceled(makeCartesianViaMotionActionResult(
+        SimpleActionResult::PREEMPTED,
+        "Cartesian via-point goal was canceled."));
+    {
+      std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
+      if (active_cartesian_via_points_goal_handle_ == goal_handle) {
+        active_cartesian_via_points_goal_handle_.reset();
+      }
+    }
+    return;
+  }
+
+  if (!goal_handle->is_active()) {
+    std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
+    if (active_cartesian_via_points_goal_handle_ == goal_handle) {
+      active_cartesian_via_points_goal_handle_.reset();
+    }
+    return;
+  }
+
+  double path_duration = 0.0;
+  {
+    std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
+    if (!cartesian_via_point_path_.empty()) {
+      path_duration = cartesian_via_point_path_.back().t;
+    }
+  }
+
+  if (path_duration <= kMinDt) {
+    return;
+  }
+
+  const double progress =
+      std::clamp(commanded_path_time_ / path_duration, 0.0, 1.0);
+  bool should_publish_feedback = false;
+  {
+    std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
+    should_publish_feedback =
+        cartesian_via_points_action_last_feedback_wall_time_ < 0.0 ||
+        wall_time - cartesian_via_points_action_last_feedback_wall_time_ >=
+            cartesian_via_points_action_feedback_period_sec_;
+    if (should_publish_feedback) {
+      cartesian_via_points_action_last_feedback_wall_time_ = wall_time;
+    }
+  }
+
+  if (should_publish_feedback) {
+    auto feedback = std::make_shared<CartesianViaMotion::Feedback>();
+    feedback->progress = static_cast<float>(progress);
+    feedback->time_to_completion =
+        static_cast<float>(std::max(0.0, path_duration - commanded_path_time_));
+    goal_handle->publish_feedback(feedback);
+  }
+
+  const bool path_finished =
+      commanded_path_time_ >= path_duration - kMinDt &&
+      mode_ == SafetyMode::kNominal &&
+      !cartesian_effective_time_frozen_;
+  if (!path_finished) {
+    return;
+  }
+
+  goal_handle->succeed(makeCartesianViaMotionActionResult(
+      SimpleActionResult::SUCCESS,
+      "Cartesian via-point goal completed."));
+  {
+    std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
+    if (active_cartesian_via_points_goal_handle_ == goal_handle) {
+      active_cartesian_via_points_goal_handle_.reset();
+    }
+  }
+}
+
+rclcpp_action::GoalResponse
+ReachableCartesianImpedanceController::handleCartesianViaPointsActionGoal(
+    const rclcpp_action::GoalUUID& uuid,
+    std::shared_ptr<const CartesianViaMotion::Goal> goal) {
+  (void)uuid;
+  if (!goal || goal->via_poses.empty()) {
+    RCLCPP_WARN(
+        get_node()->get_logger(),
+        "Rejecting Cartesian via-point action goal because it contains no poses.");
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+
+  for (std::size_t i = 0; i < goal->via_poses.size(); ++i) {
+    const auto& pose = goal->via_poses[i];
+    const Vector3d position(
+        pose.position.x,
+        pose.position.y,
+        pose.position.z);
+    const Quaterniond orientation(
+        pose.orientation.w,
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z);
+    if (!std::isfinite(position.x()) ||
+        !std::isfinite(position.y()) ||
+        !std::isfinite(position.z())) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "Rejecting Cartesian via-point action goal because pose %zu has a non-finite position.",
+          i);
+      return rclcpp_action::GoalResponse::REJECT;
+    }
+    const double orientation_norm = orientation.norm();
+    if (!std::isfinite(orientation_norm) || orientation_norm < 1.0e-12) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "Rejecting Cartesian via-point action goal because pose %zu has an invalid quaternion.",
+          i);
+      return rclcpp_action::GoalResponse::REJECT;
+    }
+  }
+
+  return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::CancelResponse
+ReachableCartesianImpedanceController::handleCartesianViaPointsActionCancel(
+    const std::shared_ptr<CartesianViaMotionGoalHandle> /*goal_handle*/) {
+  return rclcpp_action::CancelResponse::ACCEPT;
+}
+
+void ReachableCartesianImpedanceController::handleCartesianViaPointsActionAccepted(
+    const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle) {
+  if (!goal_handle) {
+    return;
+  }
+
+  const auto goal = goal_handle->get_goal();
+  std::vector<Vector3d> points;
+  std::vector<Quaterniond> orientations;
+  points.reserve(goal->via_poses.size());
+  orientations.reserve(goal->via_poses.size());
+
+  for (const auto& pose : goal->via_poses) {
+    points.emplace_back(pose.position.x, pose.position.y, pose.position.z);
+    orientations.push_back(normalizedQuaternionOrIdentity(Quaterniond(
+        pose.orientation.w,
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z)));
+  }
+
+  std::shared_ptr<CartesianViaMotionGoalHandle> previous_pending_goal;
+  std::uint64_t sequence = 0;
+  {
+    std::lock_guard<std::mutex> lock(pending_cartesian_via_points_mutex_);
+    previous_pending_goal = pending_cartesian_via_points_goal_handle_;
+    pending_cartesian_via_points_ = std::move(points);
+    pending_cartesian_via_point_quaternions_ = std::move(orientations);
+    pending_cartesian_via_points_goal_handle_ = goal_handle;
+    sequence = ++pending_cartesian_via_points_sequence_;
+    pending_cartesian_via_points_available_ = true;
+  }
+
+  std::shared_ptr<CartesianViaMotionGoalHandle> previous_active_goal;
+  {
+    std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
+    previous_active_goal = active_cartesian_via_points_goal_handle_;
+    if (previous_active_goal && previous_active_goal != goal_handle) {
+      active_cartesian_via_points_goal_handle_.reset();
+    }
+  }
+
+  if (previous_pending_goal &&
+      previous_pending_goal != goal_handle &&
+      previous_pending_goal->is_active()) {
+    previous_pending_goal->abort(makeCartesianViaMotionActionResult(
+        SimpleActionResult::ABORTED,
+        "Cartesian via-point goal was replaced by a newer action goal."));
+  }
+  if (previous_active_goal &&
+      previous_active_goal != goal_handle &&
+      previous_active_goal->is_active()) {
+    previous_active_goal->abort(makeCartesianViaMotionActionResult(
+        SimpleActionResult::ABORTED,
+        "Cartesian via-point goal was replaced by a newer action goal."));
+  }
+
+  RCLCPP_INFO(
+      get_node()->get_logger(),
+      "Queued Cartesian via-point action goal %lu with %zu poses.",
+      static_cast<unsigned long>(sequence),
+      goal->via_poses.size());
+}
+
 void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop() {
   VerifiedPlan last_verified_plan;
 
@@ -1578,6 +2030,85 @@ void ReachableCartesianImpedanceController::stopSafetyMonitorWorker() {
   if (safety_monitor_worker_thread_.joinable()) {
     safety_monitor_worker_thread_.join();
   }
+}
+
+void ReachableCartesianImpedanceController::handleCartesianViaPoints(
+    const geometry_msgs::msg::PoseArray::SharedPtr msg) {
+  if (!msg) {
+    return;
+  }
+
+  const std::string& frame_id = msg->header.frame_id;
+  if (!frame_id.empty() && frame_id != rviz_frame_id_) {
+    RCLCPP_WARN(
+        get_node()->get_logger(),
+        "Received cartesian_via_points in frame '%s'. Interpreting poses as robot base frame '%s'.",
+        frame_id.c_str(),
+        rviz_frame_id_.c_str());
+  }
+
+  std::vector<Vector3d> points;
+  std::vector<Quaterniond> orientations;
+  points.reserve(msg->poses.size());
+  orientations.reserve(msg->poses.size());
+
+  for (std::size_t i = 0; i < msg->poses.size(); ++i) {
+    const auto& pose = msg->poses[i];
+    const Vector3d position(
+        pose.position.x,
+        pose.position.y,
+        pose.position.z);
+    const Quaterniond orientation(
+        pose.orientation.w,
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z);
+
+    if (!std::isfinite(position.x()) ||
+        !std::isfinite(position.y()) ||
+        !std::isfinite(position.z())) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "Ignoring cartesian_via_points message because pose %zu has a non-finite position.",
+          i);
+      return;
+    }
+
+    const double orientation_norm = orientation.norm();
+    if (!std::isfinite(orientation_norm) || orientation_norm < 1.0e-12) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "Ignoring cartesian_via_points message because pose %zu has an invalid quaternion.",
+          i);
+      return;
+    }
+
+    points.push_back(position);
+    orientations.push_back(normalizedQuaternionOrIdentity(orientation));
+  }
+
+  if (points.empty()) {
+    RCLCPP_WARN(
+        get_node()->get_logger(),
+        "Ignoring empty cartesian_via_points PoseArray message.");
+    return;
+  }
+
+  std::uint64_t sequence = 0;
+  {
+    std::lock_guard<std::mutex> lock(pending_cartesian_via_points_mutex_);
+    pending_cartesian_via_points_ = std::move(points);
+    pending_cartesian_via_point_quaternions_ = std::move(orientations);
+    pending_cartesian_via_points_goal_handle_.reset();
+    sequence = ++pending_cartesian_via_points_sequence_;
+    pending_cartesian_via_points_available_ = true;
+  }
+
+  RCLCPP_INFO(
+      get_node()->get_logger(),
+      "Queued cartesian_via_points message %lu with %zu base-frame poses.",
+      static_cast<unsigned long>(sequence),
+      msg->poses.size());
 }
 
 void ReachableCartesianImpedanceController::handleMujocoContactSensor(
@@ -2168,6 +2699,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       Jv - skewSymmetric(collisionCenterOffsetWorld(current_orientation)) * Jw;
   const auto toc_model = SteadyClock::now();
 
+  acceptPendingCartesianViaPoints(current_position, current_orientation, wall_time);
+
   double paused_total = paused_nominal_time_sec_;
   if (failsafe_enter_wall_time_sec_ >= 0.0)
     paused_total += std::max(0.0, wall_time - failsafe_enter_wall_time_sec_);
@@ -2264,9 +2797,17 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                       plan_duration,
                   path_time_rate_min_,
                   path_time_rate_max_);
-            } else if (!cartesian_via_point_path_.empty() &&
-                       commanded_path_time_ >= cartesian_via_point_path_.back().t - kMinDt) {
-              commanded_path_rate_ = 0.0;
+            } else {
+              bool active_path_finished = false;
+              {
+                std::lock_guard<std::mutex> lock(cartesian_via_point_path_mutex_);
+                active_path_finished =
+                    !cartesian_via_point_path_.empty() &&
+                    commanded_path_time_ >= cartesian_via_point_path_.back().t - kMinDt;
+              }
+              if (active_path_finished) {
+                commanded_path_rate_ = 0.0;
+              }
             }
           }
         }
@@ -2650,6 +3191,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   for (int i = 0; i < kNumJoints; ++i) command_interfaces_[i].set_value(tau_cmd(i));
 
   publishRvizDiagnostics(wall_time, collision_center, desired_position_cur, ee_collision_twist, monitor);
+  updateCartesianViaPointsActionStatus(
+      current_position,
+      current_orientation,
+      wall_time);
 
   if (enable_error_logging_ && error_log_file_.is_open()) {
     const double mujoco_contact_msg_time =
@@ -2822,12 +3367,28 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
         "shield_prediction_trajectory.csv");
     auto_declare<int>("prediction_log_max_queue_size", 256);
 
-    auto_declare<std::vector<double>>(
-        "cartesian_via_points",
-        std::vector<double>{});
-    auto_declare<std::vector<double>>(
-        "cartesian_via_point_quaternions",
-        std::vector<double>{});
+    auto_declare<std::string>(
+        "cartesian_via_points_topic",
+        "cartesian_via_points");
+    auto_declare<std::string>(
+        "startup_via_points_source",
+        "yaml");
+    auto_declare<std::string>(
+        "cartesian_via_points_action_name",
+        "~/follow_cartesian_via_points");
+    auto_declare<double>(
+        "cartesian_via_points_action_feedback_period_sec",
+        0.1);
+    const std::string startup_via_points_source =
+        get_node()->get_parameter("startup_via_points_source").as_string();
+    if (startup_via_points_source != "action") {
+      auto_declare<std::vector<double>>(
+          "cartesian_via_points",
+          std::vector<double>{});
+      auto_declare<std::vector<double>>(
+          "cartesian_via_point_quaternions",
+          std::vector<double>{});
+    }
 
     auto_declare<double>("nominal_pos_stiffness", 400.0);
     auto_declare<double>("nominal_rot_stiffness", 20.0);
@@ -2931,17 +3492,38 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
           "error_log_path is deprecated and will be ignored. Use error_log_root_dir and error_log_file_name.");
     }
 
+    cartesian_via_points_topic_ =
+        get_node()->get_parameter("cartesian_via_points_topic").as_string();
+    startup_via_points_source_ =
+        get_node()->get_parameter("startup_via_points_source").as_string();
+    if (startup_via_points_source_ != "yaml" &&
+        startup_via_points_source_ != "action") {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "startup_via_points_source must be 'yaml' or 'action'. Falling back to 'yaml'.");
+      startup_via_points_source_ = "yaml";
+    }
+    cartesian_via_points_action_name_ =
+        get_node()->get_parameter("cartesian_via_points_action_name").as_string();
+    cartesian_via_points_action_feedback_period_sec_ =
+        std::max(
+            0.0,
+            get_node()
+                ->get_parameter("cartesian_via_points_action_feedback_period_sec")
+                .as_double());
     cartesian_via_points_.clear();
     cartesian_via_point_quaternions_.clear();
     std::vector<double> cartesian_via_points;
-    const rclcpp::Parameter via_points_param =
-        get_node()->get_parameter("cartesian_via_points");
-    if (via_points_param.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY) {
-      cartesian_via_points = via_points_param.as_double_array();
-    } else if (via_points_param.get_type() != rclcpp::ParameterType::PARAMETER_NOT_SET) {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "cartesian_via_points must be a double array. Ignoring this value.");
+    if (startup_via_points_source_ != "action") {
+      const rclcpp::Parameter via_points_param =
+          get_node()->get_parameter("cartesian_via_points");
+      if (via_points_param.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY) {
+        cartesian_via_points = via_points_param.as_double_array();
+      } else if (via_points_param.get_type() != rclcpp::ParameterType::PARAMETER_NOT_SET) {
+        RCLCPP_WARN(
+            get_node()->get_logger(),
+            "cartesian_via_points must be a double array. Ignoring this value.");
+      }
     }
 
     const bool via_points_are_full_states =
@@ -2992,17 +3574,19 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     }
 
     std::vector<double> cartesian_via_point_quaternions;
-    const rclcpp::Parameter via_quaternions_param =
-        get_node()->get_parameter("cartesian_via_point_quaternions");
-    if (via_quaternions_param.get_type() ==
-        rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY) {
-      cartesian_via_point_quaternions =
-          via_quaternions_param.as_double_array();
-    } else if (via_quaternions_param.get_type() !=
-               rclcpp::ParameterType::PARAMETER_NOT_SET) {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "cartesian_via_point_quaternions must be a double array. Ignoring this value.");
+    if (startup_via_points_source_ != "action") {
+      const rclcpp::Parameter via_quaternions_param =
+          get_node()->get_parameter("cartesian_via_point_quaternions");
+      if (via_quaternions_param.get_type() ==
+          rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY) {
+        cartesian_via_point_quaternions =
+            via_quaternions_param.as_double_array();
+      } else if (via_quaternions_param.get_type() !=
+                 rclcpp::ParameterType::PARAMETER_NOT_SET) {
+        RCLCPP_WARN(
+            get_node()->get_logger(),
+            "cartesian_via_point_quaternions must be a double array. Ignoring this value.");
+      }
     }
     if (via_points_are_full_states && !cartesian_via_point_quaternions.empty()) {
       RCLCPP_WARN(
@@ -3219,6 +3803,52 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
       mujoco_contact_sub_.reset();
     }
 
+    if (!cartesian_via_points_topic_.empty()) {
+      cartesian_via_points_sub_ =
+          get_node()->create_subscription<geometry_msgs::msg::PoseArray>(
+              cartesian_via_points_topic_,
+              rclcpp::QoS(1),
+              std::bind(
+                  &ReachableCartesianImpedanceController::handleCartesianViaPoints,
+                  this,
+                  std::placeholders::_1));
+      RCLCPP_INFO(
+          get_node()->get_logger(),
+          "Listening for Cartesian via points on '%s' as geometry_msgs/msg/PoseArray.",
+          cartesian_via_points_topic_.c_str());
+    } else {
+      cartesian_via_points_sub_.reset();
+    }
+
+    if (!cartesian_via_points_action_name_.empty()) {
+      cartesian_via_points_action_server_ =
+          rclcpp_action::create_server<CartesianViaMotion>(
+              get_node(),
+              cartesian_via_points_action_name_,
+              std::bind(
+                  &ReachableCartesianImpedanceController::
+                      handleCartesianViaPointsActionGoal,
+                  this,
+                  std::placeholders::_1,
+                  std::placeholders::_2),
+              std::bind(
+                  &ReachableCartesianImpedanceController::
+                      handleCartesianViaPointsActionCancel,
+                  this,
+                  std::placeholders::_1),
+              std::bind(
+                  &ReachableCartesianImpedanceController::
+                      handleCartesianViaPointsActionAccepted,
+                  this,
+                  std::placeholders::_1));
+      RCLCPP_INFO(
+          get_node()->get_logger(),
+          "Listening for Cartesian via-point action goals on '%s'.",
+          cartesian_via_points_action_name_.c_str());
+    } else {
+      cartesian_via_points_action_server_.reset();
+    }
+
     K_nominal_.setZero(); D_nominal_.setZero();
     K_f_target_.setZero(); D_f_target_.setZero();
     K_nominal_.topLeftCorner<3, 3>() = nominal_pos_stiffness * Matrix3d::Identity();
@@ -3268,70 +3898,47 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   desired_position_ =
       pose.block<3, 1>(0, 3) + desired_orientation_ * tcp_offset_;
 
-  cartesian_via_point_path_.clear();
-  std::vector<Vector3d> waypoints;
-  std::vector<Quaterniond> waypoint_orientations;
-  const std::size_t via_pose_count = std::max(
-      cartesian_via_points_.size(),
-      cartesian_via_point_quaternions_.size());
-  waypoints.reserve(via_pose_count + 1);
-  waypoint_orientations.reserve(via_pose_count + 1);
-  waypoints.push_back(desired_position_);
-  waypoint_orientations.push_back(desired_orientation_);
-  for (std::size_t i = 0; i < via_pose_count; ++i) {
-    Vector3d waypoint =
-        i < cartesian_via_points_.size()
-            ? cartesian_via_points_[i]
-            : waypoints.back();
+  const bool use_yaml_startup_via_points =
+      startup_via_points_source_ == "yaml";
+  const std::vector<Vector3d> startup_via_points =
+      use_yaml_startup_via_points ? cartesian_via_points_
+                                  : std::vector<Vector3d>{};
+  const std::vector<Quaterniond> startup_via_orientations =
+      use_yaml_startup_via_points ? cartesian_via_point_quaternions_
+                                  : std::vector<Quaterniond>{};
 
-    Quaterniond waypoint_orientation = desired_orientation_;
-    if (i < cartesian_via_point_quaternions_.size()) {
-      waypoint_orientation =
-          normalizedQuaternionOrIdentity(cartesian_via_point_quaternions_[i]);
-      waypoint_orientation.normalize();
-    }
-
-    if ((waypoint - waypoints.back()).norm() > 1e-9 ||
-        std::abs(waypoint_orientation.coeffs().dot(
-            waypoint_orientations.back().coeffs())) < 1.0 - 1e-9) {
-      waypoints.push_back(waypoint);
-      waypoint_orientations.push_back(waypoint_orientation);
-    }
+  std::size_t waypoint_count = 0;
+  std::vector<CartesianTrajectorySample> startup_path =
+      buildCartesianViaPointPath(
+          desired_position_,
+          desired_orientation_,
+          startup_via_points,
+          startup_via_orientations,
+          &waypoint_count);
+  {
+    std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
+    cartesian_via_point_path_ = startup_path;
   }
 
-  if (waypoints.size() < 2) {
+  if (!use_yaml_startup_via_points) {
+    RCLCPP_INFO(
+        get_node()->get_logger(),
+        "startup_via_points_source is 'action'. Holding the initial pose until a CartesianViaMotion action goal is received.");
+  } else if (waypoint_count < 2) {
     RCLCPP_WARN(
         get_node()->get_logger(),
-        "cartesian_via_points is empty. Holding the initial pose.");
+        "cartesian_via_points is empty. Holding the initial pose until a CartesianViaMotion action goal or PoseArray is received.");
+  } else if (startup_path.empty()) {
+    RCLCPP_WARN(
+        get_node()->get_logger(),
+        "Failed to time-parameterize startup cartesian_via_points. Holding the initial pose until a CartesianViaMotion action goal or PoseArray is received.");
   } else {
-    LocalCartesianReplanConfig via_config;
-    via_config.horizon_steps = local_replan_horizon_steps_;
-    via_config.dt = local_replan_dt_;
-    via_config.path_lookahead_sec = local_path_lookahead_sec_;
-    via_config.max_velocity = local_replan_max_velocity_;
-    via_config.max_acceleration = local_replan_max_acceleration_;
-    via_config.max_jerk = local_replan_max_jerk_;
-    via_config.max_angular_velocity = local_replan_max_angular_velocity_;
-    via_config.max_angular_acceleration =
-        local_replan_max_angular_acceleration_;
-    via_config.max_angular_jerk = local_replan_max_angular_jerk_;
-    cartesian_via_point_path_ =
-        makeSmoothViaPointCartesianTrajectory(
-            waypoints,
-            waypoint_orientations,
-            via_config);
-    if (cartesian_via_point_path_.empty()) {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "Failed to time-parameterize cartesian_via_points. Holding the initial pose.");
-    } else {
-      RCLCPP_INFO(
-          get_node()->get_logger(),
-          "Smooth via-point trajectory prepared: waypoints=%zu samples=%zu duration=%.3f s",
-          waypoints.size(),
-          cartesian_via_point_path_.size(),
-          cartesian_via_point_path_.back().t);
-    }
+    RCLCPP_INFO(
+        get_node()->get_logger(),
+        "Startup via-point trajectory prepared: waypoints=%zu samples=%zu duration=%.3f s",
+        waypoint_count,
+        startup_path.size(),
+        startup_path.back().t);
   }
 
   last_commanded_sample_ = ImpedanceSample{};
@@ -3437,6 +4044,11 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         std::filesystem::path(error_log_run_dir_) / "run_info.txt";
     std::ofstream run_info_file(run_info_path, std::ios::out | std::ios::trunc);
     if (run_info_file.is_open()) {
+      std::vector<CartesianTrajectorySample> path_snapshot;
+      {
+        std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
+        path_snapshot = cartesian_via_point_path_;
+      }
       run_info_file << "run_directory: " << error_log_run_dir_ << "\n"
                     << "csv_file: " << error_log_file_path_ << "\n"
                     << "prediction_csv_file: " << prediction_log_file_path_ << "\n"
@@ -3449,12 +4061,14 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << cartesian_via_points_.size() << "\n"
                     << "cartesian_via_point_quaternions_count: "
                     << cartesian_via_point_quaternions_.size() << "\n"
+                    << "cartesian_via_points_topic: "
+                    << cartesian_via_points_topic_ << "\n"
                     << "cartesian_via_point_path_samples: "
-                    << cartesian_via_point_path_.size() << "\n"
+                    << path_snapshot.size() << "\n"
                     << "cartesian_via_point_path_duration_sec: "
-                    << (cartesian_via_point_path_.empty()
+                    << (path_snapshot.empty()
                             ? 0.0
-                            : cartesian_via_point_path_.back().t)
+                            : path_snapshot.back().t)
                     << "\n"
                     << "enable_safety_monitor: " << static_cast<int>(enable_safety_monitor_) << "\n"
                     << "async_safety_monitor: " << static_cast<int>(async_safety_monitor_) << "\n"

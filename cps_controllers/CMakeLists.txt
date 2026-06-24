@@ -13,6 +13,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(controller_interface REQUIRED)
 find_package(hardware_interface REQUIRED)
@@ -24,6 +25,7 @@ find_package(franka_msgs REQUIRED)
 find_package(mujoco_ros_msgs REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(panda_motion_generator_msgs REQUIRED)
 find_package(cps_human_workspace REQUIRED)
 find_package(cps_safety_monitor REQUIRED)
 find_package(cps_trajectory_generators REQUIRED)
@@ -52,6 +54,7 @@ ament_target_dependencies(${PROJECT_NAME}
   hardware_interface
   pluginlib
   rclcpp
+  rclcpp_action
   rclcpp_lifecycle
   realtime_tools
   franka_semantic_components
@@ -60,6 +63,7 @@ ament_target_dependencies(${PROJECT_NAME}
   franka_msgs
   mujoco_ros_msgs
   visualization_msgs
+  panda_motion_generator_msgs
   cps_human_workspace
   cps_safety_monitor
   cps_trajectory_generators
@@ -95,6 +99,7 @@ ament_export_dependencies(
   hardware_interface
   pluginlib
   rclcpp
+  rclcpp_action
   rclcpp_lifecycle
   realtime_tools
   franka_semantic_components
@@ -103,6 +108,7 @@ ament_export_dependencies(
   franka_msgs
   pinocchio
   visualization_msgs
+  panda_motion_generator_msgs
   cps_human_workspace
   cps_safety_monitor
   cps_trajectory_generators

@@ -15,8 +15,11 @@
 #include <Eigen/Dense>
 
 #include <controller_interface/controller_interface.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>
 #include <mujoco_ros_msgs/msg/scalar_stamped.hpp>
+#include <panda_motion_generator_msgs/action/cartesian_via_motion.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
 #include <rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
@@ -69,6 +72,10 @@ struct ShieldDecision {
 class ReachableCartesianImpedanceController
     : public controller_interface::ControllerInterface {
  public:
+  using CartesianViaMotion = panda_motion_generator_msgs::action::CartesianViaMotion;
+  using CartesianViaMotionGoalHandle =
+      rclcpp_action::ServerGoalHandle<CartesianViaMotion>;
+
   ~ReachableCartesianImpedanceController() override;
 
   controller_interface::InterfaceConfiguration command_interface_configuration() const override;
@@ -212,9 +219,41 @@ class ReachableCartesianImpedanceController
 
   void publishAsyncMonitorInput(const AsyncMonitorInput& input);
   bool takeAsyncMonitorOutput(AsyncMonitorOutput* output);
+  bool takePendingCartesianViaPoints(
+      std::vector<Vector3d>* points,
+      std::vector<Quaterniond>* orientations,
+      std::shared_ptr<CartesianViaMotionGoalHandle>* goal_handle,
+      std::uint64_t* sequence);
+  std::vector<cps_trajectory_generators::CartesianTrajectorySample>
+  buildCartesianViaPointPath(
+      const Vector3d& start_position,
+      const Quaterniond& start_orientation,
+      const std::vector<Vector3d>& via_points,
+      const std::vector<Quaterniond>& via_orientations,
+      std::size_t* waypoint_count) const;
+  void acceptPendingCartesianViaPoints(
+      const Vector3d& current_position,
+      const Quaterniond& current_orientation,
+      double wall_time);
+  void resetViaPointExecutionState(const Vector3d& current_position,
+                                   const Quaterniond& current_orientation,
+                                   double wall_time);
+  void updateCartesianViaPointsActionStatus(
+      const Vector3d& current_position,
+      const Quaterniond& current_orientation,
+      double wall_time);
+  rclcpp_action::GoalResponse handleCartesianViaPointsActionGoal(
+      const rclcpp_action::GoalUUID& uuid,
+      std::shared_ptr<const CartesianViaMotion::Goal> goal);
+  rclcpp_action::CancelResponse handleCartesianViaPointsActionCancel(
+      const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle);
+  void handleCartesianViaPointsActionAccepted(
+      const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle);
   void safetyMonitorWorkerLoop();
   void startSafetyMonitorWorker();
   void stopSafetyMonitorWorker();
+  void handleCartesianViaPoints(
+      const geometry_msgs::msg::PoseArray::SharedPtr msg);
   void handleMujocoContactSensor(
       const mujoco_ros_msgs::msg::ScalarStamped::SharedPtr msg);
   void logShieldPredictionTrajectory(
@@ -362,6 +401,26 @@ class ReachableCartesianImpedanceController
   std::vector<Quaterniond> cartesian_via_point_quaternions_;
   std::vector<cps_trajectory_generators::CartesianTrajectorySample>
       cartesian_via_point_path_;
+  mutable std::mutex cartesian_via_point_path_mutex_;
+  std::string cartesian_via_points_topic_{"cartesian_via_points"};
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr
+      cartesian_via_points_sub_;
+  std::string startup_via_points_source_{"yaml"};
+  std::string cartesian_via_points_action_name_{"~/follow_cartesian_via_points"};
+  rclcpp_action::Server<CartesianViaMotion>::SharedPtr
+      cartesian_via_points_action_server_;
+  std::mutex pending_cartesian_via_points_mutex_;
+  std::vector<Vector3d> pending_cartesian_via_points_;
+  std::vector<Quaterniond> pending_cartesian_via_point_quaternions_;
+  std::shared_ptr<CartesianViaMotionGoalHandle>
+      pending_cartesian_via_points_goal_handle_;
+  std::uint64_t pending_cartesian_via_points_sequence_{0};
+  bool pending_cartesian_via_points_available_{false};
+  std::mutex cartesian_via_points_action_mutex_;
+  std::shared_ptr<CartesianViaMotionGoalHandle>
+      active_cartesian_via_points_goal_handle_;
+  double cartesian_via_points_action_last_feedback_wall_time_{-1.0};
+  double cartesian_via_points_action_feedback_period_sec_{0.1};
 
   std::unique_ptr<franka_semantic_components::FrankaRobotModel> franka_robot_model_;
 
