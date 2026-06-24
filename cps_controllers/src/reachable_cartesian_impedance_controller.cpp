@@ -391,10 +391,10 @@ bool ReachableCartesianImpedanceController::shouldApplyCartesianEnergyBudget(
     const MonitorResult& monitor,
     const ImpedanceSample& command,
     bool executing_failsafe) const {
+  (void)command;
   return enable_safety_monitor_ &&
          monitor.nominal_contact_sample_found &&
-         !executing_failsafe &&
-         !command.failsafe;
+         !executing_failsafe;
 }
 
 bool ReachableCartesianImpedanceController::computeTaskInertia(
