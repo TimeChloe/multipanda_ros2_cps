@@ -243,8 +243,8 @@ reachable_cartesian_impedance_controller:
     mujoco_contact_sensor_topic: /panda_metal_ball_touch
     mujoco_contact_threshold: 1.0e-6
 
-    k_rate_limit: 500000.0
-    d_rate_limit: 50000.0
+    k_rate_limit: 1000000.0
+    d_rate_limit: 100000.0
 
     # torque-rate / conservative monitor fallback terms
     tau_rate_limit: 1000.0

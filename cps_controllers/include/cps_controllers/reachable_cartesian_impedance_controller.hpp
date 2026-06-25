@@ -140,7 +140,7 @@ class ReachableCartesianImpedanceController
       double nominal_guess_time,
       const ImpedanceSample& planning_start_command,
       double initial_path_rate,
-      bool effective_time_frozen) const;
+      double commanded_path_time) const;
 
   VerifiedPlan buildCandidatePlan(
       double wall_time,
@@ -202,8 +202,8 @@ class ReachableCartesianImpedanceController
 
     ImpedanceSample last_commanded_sample;
     bool last_commanded_sample_valid{false};
+    double commanded_path_time{0.0};
     double commanded_path_rate{0.0};
-    bool cartesian_effective_time_frozen{false};
   };
 
   struct AsyncMonitorOutput {

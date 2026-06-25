@@ -748,7 +748,7 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     double nominal_guess_time,
     const ImpedanceSample& planning_start_command,
     double initial_path_rate,
-    bool effective_time_frozen) const {
+    double commanded_path_time) const {
   CartesianTrajectorySample planning_start;
   planning_start.t = planning_start_command.t;
   planning_start.p = planning_start_command.p;
@@ -793,9 +793,7 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
         std::clamp(initial_path_rate, path_time_rate_min_, path_time_rate_max_);
 
     const double path_start_time =
-        effective_time_frozen
-            ? nominal_guess_time
-            : std::max(nominal_guess_time, commanded_path_time_);
+        std::max(nominal_guess_time, commanded_path_time);
 
     planned_samples = makePathConsistentTimedPathIntendedPrefix(
         path_start_time,
@@ -1262,7 +1260,7 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
             nominal_guess_time,
             planning_start_command,
             commanded_path_rate_,
-            cartesian_effective_time_frozen_);
+            commanded_path_time_);
     planner_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - planner_tic).count();
 
@@ -1437,7 +1435,7 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
             input.nominal_guess_time,
             planning_start_command,
             input.commanded_path_rate,
-            input.cartesian_effective_time_frozen);
+            input.commanded_path_time);
     planner_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - planner_tic).count();
 
@@ -2755,9 +2753,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       async_input.D_runtime = D_runtime_;
       async_input.last_commanded_sample = last_commanded_sample_;
       async_input.last_commanded_sample_valid = last_commanded_sample_valid_;
+      async_input.commanded_path_time = commanded_path_time_;
       async_input.commanded_path_rate = commanded_path_rate_;
-      async_input.cartesian_effective_time_frozen =
-          cartesian_effective_time_frozen_;
       publishAsyncMonitorInput(async_input);
       last_async_input_publish_wall_time_ = wall_time;
     }
