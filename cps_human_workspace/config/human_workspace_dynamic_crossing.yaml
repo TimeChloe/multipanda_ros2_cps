@@ -1,0 +1,15 @@
+plane_normal: [0.0, 0.0, -1.0]
+sphere_center: [0.306957, -0.16, 0.30]
+motion_radius: 0.09
+hand_radius: 0.04
+
+# Moving reachable-set example inspired by SaRA-Shield's time-interval
+# human reachability checks. The local monitor still uses one conservative
+# hand/workspace sphere, but its center is evaluated at each monitored
+# trajectory interval.
+center_motion:
+  velocity: [0.0, 0.0, 0.0]
+  sinusoid_amplitude: [0.0, 0.16, 0.0]
+  sinusoid_frequency_hz: 0.16
+  sinusoid_phase_rad: -1.57079632679
+  time_offset_sec: 0.0

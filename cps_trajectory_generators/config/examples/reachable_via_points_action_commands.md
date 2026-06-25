@@ -64,3 +64,9 @@ ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian
   panda_motion_generator_msgs/action/CartesianViaMotion \
   "$(cat cps_trajectory_generators/config/examples/reachable_via_points_table_center_high_action_goal.yaml)"
 ```
+
+```bash
+ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian_via_points \
+  panda_motion_generator_msgs/action/CartesianViaMotion \
+  "$(cat cps_trajectory_generators/config/examples/reachable_via_points_dynamic_human_crossing_action_goal.yaml)"
+```

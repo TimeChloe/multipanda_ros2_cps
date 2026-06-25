@@ -110,6 +110,7 @@ struct SafetyMonitorConfig {
   Matrix6d K_runtime{Matrix6d::Zero()};
   Matrix6d D_runtime{Matrix6d::Zero()};
 
+  double wall_time_sec{0.0};
   double k_rate_limit{5000.0};
   double d_rate_limit{500.0};
   double safe_collision_energy_joule{0.05};

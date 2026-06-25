@@ -203,10 +203,11 @@ reachable_cartesian_impedance_controller:
     # Each state is a robot-base-frame pose [x, y, z, qx, qy, qz, qw].
     # Options: "yaml" starts from cartesian_via_points below; "action" waits
     # for a CartesianViaMotion action goal.
-    startup_via_points_source: "yaml"
+    human_workspace_config_path: /home/developer/multipanda_ws/src/cps_human_workspace/config/human_workspace_dynamic_crossing.yaml
+    startup_via_points_source: "action"
     cartesian_via_points_action_name: "~/follow_cartesian_via_points"
     cartesian_via_points_action_feedback_period_sec: 0.1
-    cartesian_via_points: [0.306957, 0.000000, 0.099912, 0.923956, -0.382499, 0.000000, 0.000000]
+    # cartesian_via_points: [0.306957, 0.000000, 0.099912, 0.923956, -0.382499, 0.000000, 0.000000]
     # Leave cartesian_via_points unset in action mode. ROS2 cannot infer the
     # type of an empty YAML sequence here.
     # cartesian_via_points: []

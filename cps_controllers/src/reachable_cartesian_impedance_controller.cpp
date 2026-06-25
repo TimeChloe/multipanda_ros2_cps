@@ -289,13 +289,14 @@ inline cps_safety_monitor::ImpedanceSample interpolateImpedanceSample(
 inline Vector3d fallbackMonitorDirection(
     const Vector3d& x_pred,
     const Vector3d& v_pred,
-    const cps_human_workspace::HumanWorkspace& human_workspace) {
+    const cps_human_workspace::HumanWorkspace& human_workspace,
+    double time_sec) {
   Vector3d direction = normalizedOrZero(v_pred);
   if (direction.squaredNorm() > 0.0) {
     return direction;
   }
 
-  direction = normalizedOrZero(human_workspace.center() - x_pred);
+  direction = normalizedOrZero(human_workspace.centerAtTime(time_sec) - x_pred);
   if (direction.squaredNorm() > 0.0) {
     return direction;
   }
@@ -308,7 +309,8 @@ inline Vector3d commandMonitorDirection(
     const Vector3d& previous_command_position,
     const Vector3d& x_pred,
     const Vector3d& v_pred,
-    const cps_human_workspace::HumanWorkspace& human_workspace) {
+    const cps_human_workspace::HumanWorkspace& human_workspace,
+    double time_sec) {
   Vector3d direction = normalizedOrZero(sample.dp);
   if (direction.squaredNorm() > 0.0) {
     return direction;
@@ -324,7 +326,7 @@ inline Vector3d commandMonitorDirection(
     return direction;
   }
 
-  return fallbackMonitorDirection(x_pred, v_pred, human_workspace);
+  return fallbackMonitorDirection(x_pred, v_pred, human_workspace, time_sec);
 }
 
 }  // namespace
@@ -515,7 +517,6 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
     double wall_time, const Vector3d& current_position,
     const Vector3d& desired_position_cur, const Vector6d& ee_twist,
     const MonitorResult& monitor) {
-  (void)wall_time;
   (void)ee_twist;
   if (!rviz_enable_markers_ || !rviz_marker_pub_) return;
   ++rviz_publish_counter_;
@@ -525,6 +526,7 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
   const auto stamp = get_node()->now();
   const std::string& frame_id = rviz_frame_id_;
   const Vector3d n = human_workspace_.normal();
+  const Vector3d human_center = human_workspace_.centerAtTime(wall_time);
   auto setupMarker = [&](Marker& m, int id, const std::string& ns, int type) {
     m.header.frame_id = frame_id; m.header.stamp = stamp;
     m.ns = ns; m.id = id; m.type = type; m.action = Marker::ADD;
@@ -535,7 +537,7 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
   const Quaterniond q_plane = rotationMatrixToQuaternion(R_plane);
 
   { Marker m; setupMarker(m, 0, "reachable_plane", Marker::CUBE);
-    m.pose.position = toPoint(human_workspace_.center());
+    m.pose.position = toPoint(human_center);
     m.pose.orientation = toQuatMsg(q_plane);
     m.scale.x = rviz_plane_size_; m.scale.y = rviz_plane_size_; m.scale.z = rviz_plane_thickness_;
     m.color = makeColor(0.1f, 0.6f, 1.0f, 0.12f);
@@ -543,17 +545,17 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
   { Marker m; setupMarker(m, 1, "reachable_plane_normal", Marker::ARROW);
     m.scale.x = rviz_arrow_shaft_diameter_; m.scale.y = rviz_arrow_head_diameter_; m.scale.z = rviz_arrow_head_length_;
     m.color = makeColor(0.1f, 0.6f, 1.0f, 0.9f);
-    const Vector3d p0 = human_workspace_.center();
+    const Vector3d p0 = human_center;
     const Vector3d p1 = p0 + rviz_normal_arrow_length_ * n;
     m.points.push_back(toPoint(p0)); m.points.push_back(toPoint(p1));
     arr.markers.push_back(m); }
   { Marker m; setupMarker(m, 2, "reachable_hand_motion_sphere", Marker::SPHERE);
-    m.pose.position = toPoint(human_workspace_.center()); m.pose.orientation.w = 1.0;
+    m.pose.position = toPoint(human_center); m.pose.orientation.w = 1.0;
     m.scale.x = m.scale.y = m.scale.z = 2.0 * human_workspace_.motionRadius();
     m.color = makeColor(1.0f, 0.8f, 0.1f, 0.20f);
     arr.markers.push_back(m); }
   { Marker m; setupMarker(m, 3, "reachable_hand_inflated_sphere", Marker::SPHERE);
-    m.pose.position = toPoint(human_workspace_.center()); m.pose.orientation.w = 1.0;
+    m.pose.position = toPoint(human_center); m.pose.orientation.w = 1.0;
     const double inflated_radius = human_workspace_.inflatedHandRadius();
     m.scale.x = m.scale.y = m.scale.z = 2.0 * inflated_radius;
     m.color = makeColor(1.0f, 0.3f, 0.2f, 0.10f);
@@ -1013,11 +1015,13 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
 
 SafetyMonitorConfig ReachableCartesianImpedanceController::makeSafetyMonitorConfig(
     const Matrix6d& K_runtime,
-    const Matrix6d& D_runtime) const {
+    const Matrix6d& D_runtime,
+    double wall_time) const {
   SafetyMonitorConfig config;
   config.human_workspace = human_workspace_;
   config.K_runtime = K_runtime;
   config.D_runtime = D_runtime;
+  config.wall_time_sec = wall_time;
   config.k_rate_limit = k_rate_limit_;
   config.d_rate_limit = d_rate_limit_;
   config.safe_collision_energy_joule = safe_collision_energy_joule_;
@@ -1185,7 +1189,7 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
       collision_twist,
       inertia,
       Jv,
-      makeSafetyMonitorConfig(K_runtime, D_runtime));
+      makeSafetyMonitorConfig(K_runtime, D_runtime, plan.generated_wall_time));
 }
 
 // ============================================================================
@@ -2228,6 +2232,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     double d_pred{0.0};
     double d_next{0.0};
     double d_segment{0.0};
+    Vector3d human_center_start{Vector3d::Zero()};
+    Vector3d human_center_end{Vector3d::Zero()};
     bool contact_possible{false};
     double k_n{0.0};
     double e_n{0.0};
@@ -2272,6 +2278,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
                         const ImpedanceSample& flange_sample,
                         const ImpedanceSample& collision_sample,
                         double dtp) {
+    const double segment_start_time_sec = wall_time + t_prev;
+    const double segment_end_time_sec = wall_time + collision_sample.t;
     K_exec = applyMatrixRateLimit(K_exec, collision_sample.K, k_rate_limit_, dtp);
     D_exec = applyMatrixRateLimit(D_exec, collision_sample.D, d_rate_limit_, dtp);
 
@@ -2304,13 +2312,21 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     row.x_next = x_next;
     row.v_next = v_next;
     row.a_pred = a_pred;
+    row.human_center_start = human_workspace_.centerAtTime(segment_start_time_sec);
+    row.human_center_end = human_workspace_.centerAtTime(segment_end_time_sec);
     row.d_pred =
-        human_workspace_.signedDistanceToInflatedSphere(x_pred, inflated_contact_radius);
+        human_workspace_.signedDistanceToInflatedSphere(
+            x_pred, inflated_contact_radius, segment_start_time_sec);
     row.d_next =
-        human_workspace_.signedDistanceToInflatedSphere(x_next, inflated_contact_radius);
+        human_workspace_.signedDistanceToInflatedSphere(
+            x_next, inflated_contact_radius, segment_end_time_sec);
     row.d_segment =
         human_workspace_.signedDistanceSegmentToInflatedSphere(
-            x_pred, x_next, inflated_contact_radius);
+            x_pred,
+            x_next,
+            inflated_contact_radius,
+            segment_start_time_sec,
+            segment_end_time_sec);
     row.contact_possible = row.d_segment <= 0.0;
     const Vector3d monitor_direction =
         commandMonitorDirection(
@@ -2318,7 +2334,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
             previous_command_position,
             x_pred,
             v_pred,
-            human_workspace_);
+            human_workspace_,
+            segment_end_time_sec);
     const double denom =
         (monitor_direction.transpose() * task_inertia_inv * monitor_direction)(0, 0);
     const double m_eff_dir = 1.0 / std::max(denom, kSmallPositive);
@@ -2371,7 +2388,9 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   const double actual_collision_distance =
       human_workspace_.signedDistanceToInflatedSphere(
           collision_center,
-          inflated_contact_radius);
+          inflated_contact_radius,
+          wall_time);
+  const Vector3d actual_human_center = human_workspace_.centerAtTime(wall_time);
 
   prediction_log_file_ << std::fixed << std::setprecision(9);
   for (const auto& row : rows) {
@@ -2399,6 +2418,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         << row.sample_t << "," << row.dt << ","
         << current_position(0) << "," << current_position(1) << "," << current_position(2) << ","
         << collision_center(0) << "," << collision_center(1) << "," << collision_center(2) << ","
+        << actual_human_center(0) << "," << actual_human_center(1) << "," << actual_human_center(2) << ","
         << actual_collision_distance << ","
         << row.flange_target_p(0) << "," << row.flange_target_p(1) << "," << row.flange_target_p(2) << ","
         << row.collision_target_p(0) << "," << row.collision_target_p(1) << "," << row.collision_target_p(2) << ","
@@ -2407,6 +2427,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         << row.x_next(0) << "," << row.x_next(1) << "," << row.x_next(2) << ","
         << row.v_next(0) << "," << row.v_next(1) << "," << row.v_next(2) << ","
         << row.a_pred(0) << "," << row.a_pred(1) << "," << row.a_pred(2) << ","
+        << row.human_center_start(0) << "," << row.human_center_start(1) << "," << row.human_center_start(2) << ","
+        << row.human_center_end(0) << "," << row.human_center_end(1) << "," << row.human_center_end(2) << ","
         << row.d_pred << "," << row.d_next << "," << row.d_segment << ","
         << static_cast<int>(row.contact_possible) << ","
         << row.k_n << "," << row.e_n << "," << row.v_n << ","
@@ -3150,7 +3172,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             current_command.p,
             collision_center,
             ee_collision_twist.head<3>(),
-            human_workspace_);
+            human_workspace_,
+            wall_time);
     Matrix3d task_inertia_inv = Jv_collision * inertia.inverse() * Jv_collision.transpose();
     task_inertia_inv.diagonal().array() += kSmallPositive;
     const double denom =
@@ -3197,6 +3220,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       wall_time);
 
   if (enable_error_logging_ && error_log_file_.is_open()) {
+    const Vector3d human_center = human_workspace_.centerAtTime(wall_time);
     const double mujoco_contact_msg_time =
         latest_mujoco_contact_msg_time_.load(std::memory_order_relaxed);
     const std::uint64_t mujoco_contact_sequence =
@@ -3226,6 +3250,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << current_position(0) << "," << current_position(1) << "," << current_position(2) << ","
         << ee_twist(0) << "," << ee_twist(1) << "," << ee_twist(2) << ","
         << collision_center(0) << "," << collision_center(1) << "," << collision_center(2) << ","
+        << human_center(0) << "," << human_center(1) << "," << human_center(2) << ","
         << ee_collision_twist(0) << "," << ee_collision_twist(1) << "," << ee_collision_twist(2) << ","
         << desired_linear_velocity_cur(0) << "," << desired_linear_velocity_cur(1) << "," << desired_linear_velocity_cur(2) << ","
         << error(0) << "," << error(1) << "," << error(2) << ","
@@ -4049,6 +4074,12 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
         path_snapshot = cartesian_via_point_path_;
       }
+      std::string human_workspace_config_path =
+          get_node()->get_parameter("human_workspace_config_path").as_string();
+      if (human_workspace_config_path.empty()) {
+        human_workspace_config_path =
+            cps_human_workspace::HumanWorkspace::defaultConfigPath();
+      }
       run_info_file << "run_directory: " << error_log_run_dir_ << "\n"
                     << "csv_file: " << error_log_file_path_ << "\n"
                     << "prediction_csv_file: " << prediction_log_file_path_ << "\n"
@@ -4120,10 +4151,26 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << human_workspace_.center().x() << ", "
                     << human_workspace_.center().y() << ", "
                     << human_workspace_.center().z() << "]\n"
+                    << "human_center_motion_enabled: "
+                    << static_cast<int>(human_workspace_.hasMovingCenter()) << "\n"
+                    << "human_center_linear_velocity: ["
+                    << human_workspace_.centerLinearVelocity().x() << ", "
+                    << human_workspace_.centerLinearVelocity().y() << ", "
+                    << human_workspace_.centerLinearVelocity().z() << "]\n"
+                    << "human_center_sinusoid_amplitude: ["
+                    << human_workspace_.centerSinusoidAmplitude().x() << ", "
+                    << human_workspace_.centerSinusoidAmplitude().y() << ", "
+                    << human_workspace_.centerSinusoidAmplitude().z() << "]\n"
+                    << "human_center_sinusoid_frequency_hz: "
+                    << human_workspace_.centerSinusoidFrequencyHz() << "\n"
+                    << "human_center_sinusoid_phase_rad: "
+                    << human_workspace_.centerSinusoidPhaseRad() << "\n"
+                    << "human_center_motion_time_offset_sec: "
+                    << human_workspace_.centerMotionTimeOffsetSec() << "\n"
                     << "human_motion_radius: " << human_workspace_.motionRadius() << "\n"
                     << "human_hand_radius: " << human_workspace_.handRadius() << "\n"
                     << "human_workspace_config_path: "
-                    << cps_human_workspace::HumanWorkspace::defaultConfigPath() << "\n";
+                    << human_workspace_config_path << "\n";
     }
 
     error_log_file_.open(error_log_file_path_, std::ios::out | std::ios::trunc);
@@ -4141,6 +4188,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "cur_vx,cur_vy,cur_vz,cur_wx,cur_wy,cur_wz,"
         << "tcp_px,tcp_py,tcp_pz,tcp_vx,tcp_vy,tcp_vz,"
         << "collision_center_px,collision_center_py,collision_center_pz,"
+        << "human_center_px,human_center_py,human_center_pz,"
         << "collision_center_vx,collision_center_vy,collision_center_vz,"
         << "des_vx,des_vy,des_vz,"
         << "err_px,err_py,err_pz,err_rx,err_ry,err_rz,"
@@ -4204,6 +4252,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
           << "stage,index,is_failsafe_sample,sample_t,dt,"
           << "actual_tcp_px,actual_tcp_py,actual_tcp_pz,"
           << "actual_collision_px,actual_collision_py,actual_collision_pz,"
+          << "actual_human_center_px,actual_human_center_py,actual_human_center_pz,"
           << "actual_collision_distance,"
           << "flange_target_px,flange_target_py,flange_target_pz,"
           << "collision_target_px,collision_target_py,collision_target_pz,"
@@ -4212,6 +4261,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
           << "pred_next_px,pred_next_py,pred_next_pz,"
           << "pred_next_vx,pred_next_vy,pred_next_vz,"
           << "pred_ax,pred_ay,pred_az,"
+          << "human_center_start_px,human_center_start_py,human_center_start_pz,"
+          << "human_center_end_px,human_center_end_py,human_center_end_pz,"
           << "distance_start,distance_next,distance_segment,"
           << "contact_possible,k_n,e_n,v_n,T_n_ub,V_potential_ub,"
           << "is_worst_T,is_worst_V,"

@@ -39,13 +39,14 @@ Vector3d normalizedOrZero(const Vector3d& v) {
 
 Vector3d fallbackDirection(const Vector3d& x_pred,
                            const Vector3d& v_pred,
-                           const cps_human_workspace::HumanWorkspace& human_workspace) {
+                           const cps_human_workspace::HumanWorkspace& human_workspace,
+                           double time_sec) {
   Vector3d direction = normalizedOrZero(v_pred);
   if (direction.squaredNorm() > 0.0) {
     return direction;
   }
 
-  direction = normalizedOrZero(human_workspace.center() - x_pred);
+  direction = normalizedOrZero(human_workspace.centerAtTime(time_sec) - x_pred);
   if (direction.squaredNorm() > 0.0) {
     return direction;
   }
@@ -57,7 +58,8 @@ Vector3d commandDirection(const ImpedanceSample& s,
                           const Vector3d& previous_command_position,
                           const Vector3d& x_pred,
                           const Vector3d& v_pred,
-                          const cps_human_workspace::HumanWorkspace& human_workspace) {
+                          const cps_human_workspace::HumanWorkspace& human_workspace,
+                          double time_sec) {
   Vector3d direction = normalizedOrZero(s.dp);
   if (direction.squaredNorm() > 0.0) {
     return direction;
@@ -73,28 +75,33 @@ Vector3d commandDirection(const ImpedanceSample& s,
     return direction;
   }
 
-  return fallbackDirection(x_pred, v_pred, human_workspace);
+  return fallbackDirection(x_pred, v_pred, human_workspace, time_sec);
 }
 
 Vector3d initialCommandDirection(const VerifiedPlan& plan,
                                  const Vector3d& current_position,
                                  const Vector3d& current_velocity,
-                                 const cps_human_workspace::HumanWorkspace& human_workspace) {
+                                 const cps_human_workspace::HumanWorkspace& human_workspace,
+                                 double time_sec) {
   if (!plan.intended.empty()) {
+    const double sample_time_sec = time_sec + plan.intended.front().t;
     return commandDirection(plan.intended.front(),
                             plan.anchor.p,
                             current_position,
                             current_velocity,
-                            human_workspace);
+                            human_workspace,
+                            sample_time_sec);
   }
   if (!plan.failsafe.empty()) {
+    const double sample_time_sec = time_sec + plan.failsafe.front().t;
     return commandDirection(plan.failsafe.front(),
                             plan.anchor.p,
                             current_position,
                             current_velocity,
-                            human_workspace);
+                            human_workspace,
+                            sample_time_sec);
   }
-  return fallbackDirection(current_position, current_velocity, human_workspace);
+  return fallbackDirection(current_position, current_velocity, human_workspace, time_sec);
 }
 
 }  // namespace
@@ -114,7 +121,12 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   task_inertia_inv.diagonal().array() += kLambdaReg;
 
   const Vector3d direction_now =
-      initialCommandDirection(plan, current_position, v_pred, config.human_workspace);
+      initialCommandDirection(
+          plan,
+          current_position,
+          v_pred,
+          config.human_workspace,
+          config.wall_time_sec);
   const double denom0 = (direction_now.transpose() * task_inertia_inv * direction_now)(0, 0);
   out.m_eff_n = 1.0 / std::max(denom0, kSmallPositive);
 
@@ -146,7 +158,8 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   out.plane_distance_now =
       config.human_workspace.signedDistanceToInflatedSphere(
           current_position,
-          inflated_contact_radius);
+          inflated_contact_radius,
+          config.wall_time_sec);
 
   out.plane_distance_min = out.plane_distance_now;
 
@@ -171,7 +184,12 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   bool terminal_sample_found = false;
   Vector3d previous_command_position = plan.anchor.p;
 
+  double t_prev = plan.anchor.t;
+
   auto eval_sample = [&](const ImpedanceSample& s, double dtp) {
+    const double segment_start_time_sec = config.wall_time_sec + t_prev;
+    const double segment_end_time_sec = config.wall_time_sec + s.t;
+
     K_exec = applyMatrixRateLimit(K_exec, s.K, config.k_rate_limit, dtp);
     D_exec = applyMatrixRateLimit(D_exec, s.D, config.d_rate_limit, dtp);
 
@@ -197,18 +215,22 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     const double d_pred =
         config.human_workspace.signedDistanceToInflatedSphere(
             x_pred,
-            inflated_contact_radius);
+            inflated_contact_radius,
+            segment_start_time_sec);
 
     const double d_next =
         config.human_workspace.signedDistanceToInflatedSphere(
             x_next,
-            inflated_contact_radius);
+            inflated_contact_radius,
+            segment_end_time_sec);
 
     const double d_segment =
         config.human_workspace.signedDistanceSegmentToInflatedSphere(
             x_pred,
             x_next,
-            inflated_contact_radius);
+            inflated_contact_radius,
+            segment_start_time_sec,
+            segment_end_time_sec);
 
     out.plane_distance_min = std::min(out.plane_distance_min, d_segment);
 
@@ -220,7 +242,8 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
             previous_command_position,
             x_pred,
             v_pred,
-            config.human_workspace);
+            config.human_workspace,
+            segment_end_time_sec);
     const double denom = (direction.transpose() * task_inertia_inv * direction)(0, 0);
     const double m_eff = 1.0 / std::max(denom, kSmallPositive);
     const double k_n =
@@ -259,6 +282,8 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
             x_pred,
             x_next,
             inflated_contact_radius,
+            segment_start_time_sec,
+            segment_end_time_sec,
             &x_contact);
 
         out.nominal_contact_sample_found = true;
@@ -280,8 +305,6 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     v_pred = v_next;
     previous_command_position = s.p;
   };
-
-  double t_prev = plan.anchor.t;
 
   for (const auto& s : plan.intended) {
     const double dtp = std::max(s.t - t_prev, kMinDt);

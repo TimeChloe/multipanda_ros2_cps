@@ -74,6 +74,7 @@ Matrix3d makePlaneFrameFromNormal(const Vector3d& normal_in) {
 class HumanWorkspaceVisualizer : public rclcpp::Node {
  public:
   HumanWorkspaceVisualizer() : Node("human_workspace_visualizer") {
+    start_time_ = now();
     const std::string config_path =
         declare_parameter<std::string>("human_workspace_config_path", "");
     frame_id_ = declare_parameter<std::string>("frame_id", "panda_link0");
@@ -152,7 +153,9 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     }
 
     MarkerArray array;
-    const Vector3d center = workspace_.center();
+    const double elapsed_time_sec =
+        std::max(0.0, (now() - start_time_).seconds());
+    const Vector3d center = workspace_.centerAtTime(elapsed_time_sec);
     const Vector3d normal = workspace_.normal();
     const Quaterniond plane_orientation(makePlaneFrameFromNormal(normal));
 
@@ -310,6 +313,7 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
   double arrow_shaft_diameter_{0.01};
   double arrow_head_diameter_{0.02};
   double arrow_head_length_{0.03};
+  rclcpp::Time start_time_;
   rclcpp::Publisher<MarkerArray>::SharedPtr marker_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;

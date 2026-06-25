@@ -183,7 +183,8 @@ class ReachableCartesianImpedanceController
                                        const Matrix37d& Jv);
 
   SafetyMonitorConfig makeSafetyMonitorConfig(const Matrix6d& K_runtime,
-                                              const Matrix6d& D_runtime) const;
+                                              const Matrix6d& D_runtime,
+                                              double wall_time) const;
 
   struct AsyncMonitorInput {
     std::uint64_t sequence{0};
