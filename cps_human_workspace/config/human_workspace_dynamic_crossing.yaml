@@ -1,4 +1,4 @@
-plane_normal: [0.0, 0.0, -1.0]
+workspace_direction: [0.0, 0.0, -1.0]
 sphere_center: [0.306957, -0.16, 0.30]
 motion_radius: 0.09
 hand_radius: 0.04

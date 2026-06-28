@@ -47,8 +47,14 @@ using Quaterniond = Eigen::Quaterniond;
 
 enum class SafetyMode {
   kNominal = 0,
-  kFailsafe = 1
+  kLastVerifiedMonitored = 1,
+  kNominalContactPossible = 2
 };
+
+inline bool isNominalSafetyMode(SafetyMode mode) {
+  return mode == SafetyMode::kNominal ||
+         mode == SafetyMode::kNominalContactPossible;
+}
 
 using MonitorResult = cps_safety_monitor::MonitorResult;
 using ImpedanceSample = cps_safety_monitor::ImpedanceSample;
@@ -57,7 +63,7 @@ using SafetyMonitorConfig = cps_safety_monitor::SafetyMonitorConfig;
 
 struct ShieldDecision {
   bool candidate_verified{false};
-  bool executing_last_verified_failsafe{false};
+  bool executing_last_verified_monitored{false};
   bool has_evaluated_plan{false};
 
   ImpedanceSample command;
@@ -270,7 +276,7 @@ class ReachableCartesianImpedanceController
       const VerifiedPlan& evaluated_plan,
       const MonitorResult& monitor,
       bool candidate_verified,
-      bool executing_failsafe,
+      bool executing_last_verified_monitored,
       double monitor_total_ms,
       double planner_ms,
       double plan_build_ms,
@@ -290,7 +296,7 @@ class ReachableCartesianImpedanceController
     VerifiedPlan evaluated_plan{};
     MonitorResult monitor{};
     bool candidate_verified{false};
-    bool executing_failsafe{false};
+    bool executing_last_verified_monitored{false};
     double monitor_total_ms{0.0};
     double planner_ms{0.0};
     double plan_build_ms{0.0};
@@ -311,7 +317,7 @@ class ReachableCartesianImpedanceController
       const VerifiedPlan& evaluated_plan,
       const MonitorResult& monitor,
       bool candidate_verified,
-      bool executing_failsafe,
+      bool executing_last_verified_monitored,
       double monitor_total_ms,
       double planner_ms,
       double plan_build_ms,
@@ -359,7 +365,7 @@ class ReachableCartesianImpedanceController
   bool shouldApplyCartesianEnergyBudget(
       const MonitorResult& monitor,
       const ImpedanceSample& command,
-      bool executing_failsafe) const;
+      bool executing_last_verified_monitored) const;
 
   bool computeTaskInertia(const Matrix7d& inertia,
                           const Matrix67d& J_geo,
@@ -385,6 +391,7 @@ class ReachableCartesianImpedanceController
   std::string error_log_file_path_;
   std::ofstream error_log_file_;
   std::size_t log_write_counter_{0};
+  bool command_recording_active_{false};
   bool enable_prediction_logging_{true};
   std::string prediction_log_file_name_{"shield_prediction_trajectory.csv"};
   std::string prediction_log_file_path_;
@@ -559,8 +566,6 @@ class ReachableCartesianImpedanceController
 
   double rviz_marker_lifetime_sec_{0.2};
 
-  double rviz_plane_size_{0.8};
-  double rviz_plane_thickness_{0.003};
   double rviz_normal_arrow_length_{0.20};
   double rviz_velocity_arrow_scale_{0.25};
 

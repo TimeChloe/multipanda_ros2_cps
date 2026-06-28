@@ -53,6 +53,10 @@ def generate_launch_description():
     xml_file = os.path.join(get_package_share_directory('franka_description'), 'mujoco', 'franka', scene_file)
     mjros_config_file = os.path.join(get_package_share_directory('franka_bringup'), 'config', 'sim',
                                      'single_sim_controllers.yaml')
+    human_workspace_config_file = os.path.join(
+        get_package_share_directory('cps_human_workspace'),
+        'config',
+        'human_workspace_dynamic_crossing.yaml')
     franka_bringup_path = get_package_share_directory('franka_bringup')
     ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
                 # See the ros2_control_plugins_example_with_ns.yaml file for more details.
@@ -102,6 +106,7 @@ def generate_launch_description():
         parameters=[
             {
                 'use_sim_time': True,
+                'human_workspace_config_path': human_workspace_config_file,
                 'frame_id': 'panda_link0',
                 'marker_topic': 'human_workspace/markers',
                 'ee_frame_id': 'panda_link8',

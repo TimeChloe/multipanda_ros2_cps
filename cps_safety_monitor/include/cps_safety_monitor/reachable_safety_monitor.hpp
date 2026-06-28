@@ -24,16 +24,18 @@ struct MonitorResult {
   bool monitored_contact_possible{false};
   bool contact_relevant_for_energy{false};
   bool monitored_unsafe{false};
+  // Current monitored trajectory failed future-contact verification.
   bool predicted_trigger{false};
 
-  double plane_distance_now{0.0};
-  double plane_distance_min{0.0};
+  double workspace_distance_now{0.0};
+  double workspace_distance_min{0.0};
 
   double m_eff_n{0.0};
   double v_n_now{0.0};
   double Tn_now{0.0};
   double v_safe{0.0};
 
+  // First contact predicted on the whole monitored path: intended + failsafe.
   bool nominal_contact_sample_found{false};
   double nominal_contact_time{0.0};
   double nominal_contact_distance{0.0};
@@ -42,7 +44,7 @@ struct MonitorResult {
   Vector3d nominal_contact_point_world{Vector3d::Zero()};
 
   double worst_case_contact_time{0.0};
-  double worst_case_plane_distance_at_candidate{0.0};
+  double worst_case_workspace_distance_at_candidate{0.0};
   double worst_case_nominal_forward_progress{0.0};
 
   double worst_case_v_n_ub{0.0};
@@ -51,7 +53,7 @@ struct MonitorResult {
   double worst_case_a_brake{0.0};
   double worst_case_a_net{0.0};
 
-  double h_geom{0.0};
+  double workspace_distance_margin{0.0};
   double h_monitored_energy{0.0};
 
   double v_n_now_tube{0.0};

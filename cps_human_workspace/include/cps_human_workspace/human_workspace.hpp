@@ -15,7 +15,7 @@ using Vector3d = Eigen::Matrix<double, 3, 1>;
 class HumanWorkspace {
  public:
   struct Parameters {
-    Vector3d plane_normal{Vector3d(0.0, 0.0, 1.0)};
+    Vector3d workspace_direction{Vector3d(0.0, 0.0, 1.0)};
     Vector3d sphere_center{Vector3d(0.0, 0.0, 0.2)};
     Vector3d center_velocity{Vector3d::Zero()};
     Vector3d center_sinusoid_amplitude{Vector3d::Zero()};
@@ -42,7 +42,8 @@ class HumanWorkspace {
 
   void setParameters(const Parameters& parameters);
 
-  const Vector3d& normal() const { return parameters_.plane_normal; }
+  const Vector3d& direction() const { return parameters_.workspace_direction; }
+  const Vector3d& normal() const { return direction(); }
   const Vector3d& center() const { return parameters_.sphere_center; }
   Vector3d centerAtTime(double time_sec) const;
   Vector3d centerVelocityAtTime(double time_sec) const;

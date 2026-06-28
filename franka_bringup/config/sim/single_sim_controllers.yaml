@@ -232,7 +232,7 @@ reachable_cartesian_impedance_controller:
     energy_budget_margin_joule: 0.000
     cartesian_energy_budget_joule: 0.10
     cartesian_energy_lambda_update_period_sec: 0.004
-    contact_activation_margin: 0.0
+    contact_activation_margin: 0.00
 
     ee_collision_radius: 0.03
     tcp_offset: [0.0, 0.0, 0.06]
@@ -267,8 +267,6 @@ reachable_cartesian_impedance_controller:
     rviz_frame_id: panda_link0
     rviz_marker_decimation: 10
     rviz_marker_lifetime_sec: 0.2
-    rviz_plane_size: 0.8
-    rviz_plane_thickness: 0.003
     rviz_normal_arrow_length: 0.20
     rviz_velocity_arrow_scale: 0.25
     rviz_arrow_shaft_diameter: 0.01

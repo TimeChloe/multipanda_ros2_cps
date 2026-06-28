@@ -41,7 +41,6 @@
 
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
-#include <geometry_msgs/msg/quaternion.hpp>
 #include <std_msgs/msg/color_rgba.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -84,6 +83,13 @@ using cps_trajectory_generators::makeLocalCartesianReplanFromTimedPath;
 using cps_trajectory_generators::makePathConsistentTimedPathBrake;
 using cps_trajectory_generators::makePathConsistentTimedPathIntendedPrefix;
 using cps_trajectory_generators::makeSmoothViaPointCartesianTrajectory;
+
+cps_controllers::SafetyMode nominalSafetyModeForMonitor(
+    const cps_safety_monitor::MonitorResult& monitor) {
+  return monitor.contact_relevant_for_energy
+             ? cps_controllers::SafetyMode::kNominalContactPossible
+             : cps_controllers::SafetyMode::kNominal;
+}
 
 Matrix3d skewSymmetric(const Vector3d& v) {
   Matrix3d S;
@@ -190,27 +196,6 @@ inline geometry_msgs::msg::Point toPoint(const Vector3d& p) {
   return msg;
 }
 
-inline geometry_msgs::msg::Quaternion toQuatMsg(const Quaterniond& q) {
-  geometry_msgs::msg::Quaternion msg;
-  msg.x = q.x(); msg.y = q.y(); msg.z = q.z(); msg.w = q.w();
-  return msg;
-}
-
-inline Quaterniond rotationMatrixToQuaternion(const Matrix3d& R) {
-  Quaterniond q(R); q.normalize();
-  return q;
-}
-
-inline Matrix3d makePlaneFrameFromNormal(const Vector3d& n_in) {
-  const Vector3d n = n_in.normalized();
-  Vector3d ref = std::abs(n.z()) < 0.9 ? Vector3d::UnitZ() : Vector3d::UnitX();
-  Vector3d x = ref.cross(n).normalized();
-  Vector3d y = n.cross(x).normalized();
-  Matrix3d R;
-  R.col(0) = x; R.col(1) = y; R.col(2) = n;
-  return R;
-}
-
 inline Vector3d normalizedOrZero(const Vector3d& v) {
   const double norm = v.norm();
   if (norm < 1.0e-9) {
@@ -301,7 +286,7 @@ inline Vector3d fallbackMonitorDirection(
     return direction;
   }
 
-  return human_workspace.normal();
+  return human_workspace.direction();
 }
 
 inline Vector3d commandMonitorDirection(
@@ -385,18 +370,19 @@ bool ReachableCartesianImpedanceController::shouldRejectCandidateWithMonitor(
     return false;
   }
 
-  // Nominal contact is handled by the Cartesian energy-budget controller.
-  return monitor.predicted_trigger && !monitor.nominal_contact_sample_found;
+  // Use the current monitored trajectory when verification passes; fall back to
+  // the last verified trajectory only when future-contact verification fails.
+  return monitor.predicted_trigger;
 }
 
 bool ReachableCartesianImpedanceController::shouldApplyCartesianEnergyBudget(
     const MonitorResult& monitor,
     const ImpedanceSample& command,
-    bool executing_failsafe) const {
+    bool executing_last_verified_monitored) const {
   (void)command;
   return enable_safety_monitor_ &&
-         monitor.nominal_contact_sample_found &&
-         !executing_failsafe;
+         monitor.contact_relevant_for_energy &&
+         !executing_last_verified_monitored;
 }
 
 bool ReachableCartesianImpedanceController::computeTaskInertia(
@@ -525,7 +511,7 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
   MarkerArray arr;
   const auto stamp = get_node()->now();
   const std::string& frame_id = rviz_frame_id_;
-  const Vector3d n = human_workspace_.normal();
+  const Vector3d n = human_workspace_.direction();
   const Vector3d human_center = human_workspace_.centerAtTime(wall_time);
   auto setupMarker = [&](Marker& m, int id, const std::string& ns, int type) {
     m.header.frame_id = frame_id; m.header.stamp = stamp;
@@ -533,16 +519,7 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
     m.lifetime = rclcpp::Duration::from_seconds(rviz_marker_lifetime_sec_);
   };
 
-  const Matrix3d R_plane = makePlaneFrameFromNormal(n);
-  const Quaterniond q_plane = rotationMatrixToQuaternion(R_plane);
-
-  { Marker m; setupMarker(m, 0, "reachable_plane", Marker::CUBE);
-    m.pose.position = toPoint(human_center);
-    m.pose.orientation = toQuatMsg(q_plane);
-    m.scale.x = rviz_plane_size_; m.scale.y = rviz_plane_size_; m.scale.z = rviz_plane_thickness_;
-    m.color = makeColor(0.1f, 0.6f, 1.0f, 0.12f);
-    arr.markers.push_back(m); }
-  { Marker m; setupMarker(m, 1, "reachable_plane_normal", Marker::ARROW);
+  { Marker m; setupMarker(m, 1, "reachable_workspace_direction", Marker::ARROW);
     m.scale.x = rviz_arrow_shaft_diameter_; m.scale.y = rviz_arrow_head_diameter_; m.scale.z = rviz_arrow_head_length_;
     m.color = makeColor(0.1f, 0.6f, 1.0f, 0.9f);
     const Vector3d p0 = human_center;
@@ -1217,8 +1194,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
         plan, current_position, current_orientation, ee_twist, inertia, Jv, K_runtime_, D_runtime_);
   };
 
-  auto execute_last_verified_failsafe = [&]() {
-    dec.executing_last_verified_failsafe = true;
+  auto execute_last_verified_monitored = [&]() {
+    dec.executing_last_verified_monitored = true;
     dec.candidate_verified = false;
     if (last_verified_plan_.valid &&
         (!last_verified_plan_.intended.empty() ||
@@ -1264,9 +1241,7 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     planner_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - planner_tic).count();
 
-    if (intended_buffer.empty()) {
-      return false;
-    }
+    if (intended_buffer.empty()) return false;
 
     const std::size_t segment_count = std::min<std::size_t>(
         static_cast<std::size_t>(std::max(1, shield_intended_steps_)),
@@ -1303,9 +1278,13 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
   const bool first_attempt = try_one_monitor_pass();
 
   if (!first_attempt) {
-    mode_ = SafetyMode::kFailsafe;
-
-    execute_last_verified_failsafe();
+    mode_ = SafetyMode::kNominal;
+    dec.executing_last_verified_monitored = false;
+    dec.candidate_verified = false;
+    dec.command = makeEmergencyStopCommand(
+        current_position,
+        current_orientation,
+        wall_time);
     stamp_timing();
     return dec;
   }
@@ -1348,17 +1327,17 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
       }
     }
 
-    mode_ = SafetyMode::kNominal;
+    mode_ = nominalSafetyModeForMonitor(dec.monitor);
 
-    dec.executing_last_verified_failsafe = false;
+    dec.executing_last_verified_monitored = false;
     dec.command =
         getNextVerifiedTrajectoryCommandFromCache(!cartesian_effective_time_frozen_);
     stamp_timing();
     return dec;
   }
 
-  mode_ = SafetyMode::kFailsafe;
-  execute_last_verified_failsafe();
+  mode_ = SafetyMode::kLastVerifiedMonitored;
+  execute_last_verified_monitored();
   stamp_timing();
   return dec;
 }
@@ -1380,22 +1359,73 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
     dec.monitor_eval_ms = monitor_eval_ms;
   };
 
-  auto execute_last_verified_failsafe = [&]() {
-    dec.executing_last_verified_failsafe = true;
+  auto get_next_verified_monitored_command =
+      [&](bool advance_index) -> ImpedanceSample {
+    if (!last_verified_plan.valid) {
+      return ImpedanceSample{};
+    }
+
+    if (last_verified_plan.intended_exec_index <
+        last_verified_plan.intended.size()) {
+      const std::size_t idx = last_verified_plan.intended_exec_index;
+      ImpedanceSample cmd = last_verified_plan.intended[idx];
+      if (advance_index) {
+        ++last_verified_plan.intended_exec_index;
+      }
+      return cmd;
+    }
+
+    if (last_verified_plan.failsafe.empty()) {
+      return ImpedanceSample{};
+    }
+
+    const ImpedanceSample& failsafe_start =
+        last_verified_plan.intended.empty()
+            ? last_verified_plan.anchor
+            : last_verified_plan.intended.back();
+    const double command_dt = std::max(local_replan_dt_, kMinDt);
+    const double command_time =
+        failsafe_start.t +
+        static_cast<double>(last_verified_plan.failsafe_exec_index + 1) *
+            command_dt;
+
+    ImpedanceSample cmd;
+    const auto& failsafe = last_verified_plan.failsafe;
+    if (command_time <= failsafe.front().t) {
+      cmd = interpolateImpedanceSample(
+          failsafe_start,
+          failsafe.front(),
+          command_time);
+    } else if (command_time >= failsafe.back().t) {
+      cmd = failsafe.back();
+      cmd.t = command_time;
+    } else {
+      const auto upper = std::lower_bound(
+          failsafe.begin(),
+          failsafe.end(),
+          command_time,
+          [](const ImpedanceSample& sample, double value) {
+            return sample.t < value;
+          });
+      const auto lower = upper - 1;
+      cmd = interpolateImpedanceSample(*lower, *upper, command_time);
+    }
+    cmd.failsafe = true;
+
+    if (advance_index) {
+      ++last_verified_plan.failsafe_exec_index;
+    }
+    return cmd;
+  };
+
+  auto execute_last_verified_monitored = [&]() {
+    dec.executing_last_verified_monitored = true;
     dec.candidate_verified = false;
 
     if (last_verified_plan.valid &&
-        !last_verified_plan.failsafe.empty()) {
-      const std::size_t idx = std::min(
-          last_verified_plan.failsafe_exec_index,
-          last_verified_plan.failsafe.size() - 1);
-
-      dec.command = last_verified_plan.failsafe[idx];
-
-      if (last_verified_plan.failsafe_exec_index + 1 <
-          last_verified_plan.failsafe.size()) {
-        ++last_verified_plan.failsafe_exec_index;
-      }
+        (!last_verified_plan.intended.empty() ||
+         !last_verified_plan.failsafe.empty())) {
+      dec.command = get_next_verified_monitored_command(true);
     } else {
       dec.command = makeEmergencyStopCommand(
           input.current_position,
@@ -1439,9 +1469,7 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
     planner_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - planner_tic).count();
 
-    if (intended_buffer.empty()) {
-      return false;
-    }
+    if (intended_buffer.empty()) return false;
 
     const std::size_t segment_count = std::min<std::size_t>(
         static_cast<std::size_t>(std::max(1, shield_intended_steps_)),
@@ -1494,7 +1522,7 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
     last_verified_plan.intended_exec_index = 0;
     last_verified_plan.failsafe_exec_index = 0;
 
-    dec.executing_last_verified_failsafe = false;
+    dec.executing_last_verified_monitored = false;
     dec.command = last_verified_plan.intended.front();
 
     return true;
@@ -1503,7 +1531,12 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
   const bool first_attempt = try_one_monitor_pass();
 
   if (!first_attempt) {
-    execute_last_verified_failsafe();
+    dec.executing_last_verified_monitored = false;
+    dec.candidate_verified = false;
+    dec.command = makeEmergencyStopCommand(
+        input.current_position,
+        input.current_orientation,
+        input.wall_time);
     stamp_timing();
     return dec;
   }
@@ -1513,7 +1546,7 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
     return dec;
   }
 
-  execute_last_verified_failsafe();
+  execute_last_verified_monitored();
   stamp_timing();
   return dec;
 }
@@ -1683,6 +1716,7 @@ void ReachableCartesianImpedanceController::acceptPendingCartesianViaPoints(
   }
 
   resetViaPointExecutionState(current_position, current_orientation, wall_time);
+  command_recording_active_ = true;
 
   std::shared_ptr<CartesianViaMotionGoalHandle> previous_active_goal;
   {
@@ -1838,7 +1872,7 @@ void ReachableCartesianImpedanceController::updateCartesianViaPointsActionStatus
 
   const bool path_finished =
       commanded_path_time_ >= path_duration - kMinDt &&
-      mode_ == SafetyMode::kNominal &&
+      isNominalSafetyMode(mode_) &&
       !cartesian_effective_time_frozen_;
   if (!path_finished) {
     return;
@@ -2148,13 +2182,14 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
     const VerifiedPlan& evaluated_plan,
     const MonitorResult& monitor,
     bool candidate_verified,
-    bool executing_failsafe,
+    bool executing_last_verified_monitored,
     double monitor_total_ms,
     double planner_ms,
     double plan_build_ms,
     double monitor_eval_ms,
     const char* source) {
   if (!enable_prediction_logging_ || !prediction_log_file_.is_open() ||
+      !command_recording_active_ ||
       !evaluated_plan.valid) {
     return;
   }
@@ -2172,7 +2207,7 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
   record.evaluated_plan = evaluated_plan;
   record.monitor = monitor;
   record.candidate_verified = candidate_verified;
-  record.executing_failsafe = executing_failsafe;
+  record.executing_last_verified_monitored = executing_last_verified_monitored;
   record.monitor_total_ms = monitor_total_ms;
   record.planner_ms = planner_ms;
   record.plan_build_ms = plan_build_ms;
@@ -2203,7 +2238,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     const VerifiedPlan& evaluated_plan,
     const MonitorResult& monitor,
     bool candidate_verified,
-    bool executing_failsafe,
+    bool executing_last_verified_monitored,
     double monitor_total_ms,
     double planner_ms,
     double plan_build_ms,
@@ -2404,9 +2439,9 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         << planner_ms << ","
         << plan_build_ms << ","
         << monitor_eval_ms << ","
-        << (executing_failsafe ? 1 : 0) << ","
+        << (executing_last_verified_monitored ? 1 : 0) << ","
         << static_cast<int>(candidate_verified) << ","
-        << static_cast<int>(executing_failsafe) << ","
+        << static_cast<int>(executing_last_verified_monitored) << ","
         << static_cast<int>(monitor.predicted_trigger) << ","
         << static_cast<int>(monitor.monitored_contact_possible) << ","
         << monitor_plan.intended.size() << ","
@@ -2437,7 +2472,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         << monitor.worst_case_Tn_ub << ","
         << monitor.worst_case_V_potential_ub << ","
         << monitor.terminal_energy_ub << ","
-        << monitor.h_geom << ","
+        << monitor.workspace_distance_margin << ","
         << monitor.h_clamping_energy << "\n";
   }
 
@@ -2479,7 +2514,7 @@ void ReachableCartesianImpedanceController::predictionLoggerWorkerLoop() {
         record.evaluated_plan,
         record.monitor,
         record.candidate_verified,
-        record.executing_failsafe,
+        record.executing_last_verified_monitored,
         record.monitor_total_ms,
         record.planner_ms,
         record.plan_build_ms,
@@ -2785,7 +2820,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             async_output.decision.evaluated_plan,
             async_output.decision.monitor,
             async_output.decision.candidate_verified,
-            async_output.decision.executing_last_verified_failsafe,
+            async_output.decision.executing_last_verified_monitored,
             async_output.decision.monitor_total_ms,
             async_output.decision.planner_ms,
             async_output.decision.plan_build_ms,
@@ -2842,8 +2877,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     if (output_is_fresh) {
       shield_dec = last_shield_decision_;
       const bool async_releases_failsafe =
-          mode_ == SafetyMode::kFailsafe &&
-          !shield_dec.executing_last_verified_failsafe &&
+          mode_ == SafetyMode::kLastVerifiedMonitored &&
+          !shield_dec.executing_last_verified_monitored &&
           !shouldRejectCandidateWithMonitor(shield_dec.monitor);
 
       if (async_releases_failsafe) {
@@ -2866,16 +2901,16 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
               shield_dec.evaluated_plan,
               shield_dec.monitor,
               shield_dec.candidate_verified,
-              shield_dec.executing_last_verified_failsafe,
+              shield_dec.executing_last_verified_monitored,
               shield_dec.monitor_total_ms,
               shield_dec.planner_ms,
               shield_dec.plan_build_ms,
               shield_dec.monitor_eval_ms,
               "async_failsafe_release_sync");
         }
-      } else if (shield_dec.executing_last_verified_failsafe ||
+      } else if (shield_dec.executing_last_verified_monitored ||
                  shouldRejectCandidateWithMonitor(shield_dec.monitor)) {
-        shield_dec.executing_last_verified_failsafe = true;
+        shield_dec.executing_last_verified_monitored = true;
         if (last_verified_plan_.valid &&
             (!last_verified_plan_.intended.empty() ||
              !last_verified_plan_.failsafe.empty())) {
@@ -2885,7 +2920,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
               makeEmergencyStopCommand(current_position, current_orientation, wall_time);
         }
       } else {
-        shield_dec.executing_last_verified_failsafe = false;
+        shield_dec.executing_last_verified_monitored = false;
         if (last_verified_plan_.valid && !last_verified_plan_.intended.empty()) {
           shield_dec.command =
               getNextVerifiedTrajectoryCommandFromCache(!cartesian_effective_time_frozen_);
@@ -2918,7 +2953,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
               shield_dec.evaluated_plan,
               shield_dec.monitor,
               shield_dec.candidate_verified,
-              shield_dec.executing_last_verified_failsafe,
+              shield_dec.executing_last_verified_monitored,
               shield_dec.monitor_total_ms,
               shield_dec.planner_ms,
               shield_dec.plan_build_ms,
@@ -2927,10 +2962,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         }
       } else {
         shield_dec = last_shield_decision_;
-        if (mode_ == SafetyMode::kFailsafe ||
-            shield_dec.executing_last_verified_failsafe ||
+        if (mode_ == SafetyMode::kLastVerifiedMonitored ||
+            shield_dec.executing_last_verified_monitored ||
             shouldRejectCandidateWithMonitor(shield_dec.monitor)) {
-          shield_dec.executing_last_verified_failsafe = true;
+          shield_dec.executing_last_verified_monitored = true;
           if (last_verified_plan_.valid &&
               (!last_verified_plan_.intended.empty() ||
                !last_verified_plan_.failsafe.empty())) {
@@ -2940,13 +2975,13 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                 makeEmergencyStopCommand(current_position, current_orientation, wall_time);
           }
         } else {
-          shield_dec.executing_last_verified_failsafe = false;
+          shield_dec.executing_last_verified_monitored = false;
           shield_dec.command =
               getNextVerifiedTrajectoryCommandFromCache(!cartesian_effective_time_frozen_);
         }
         last_shield_decision_.command = shield_dec.command;
-        last_shield_decision_.executing_last_verified_failsafe =
-            shield_dec.executing_last_verified_failsafe;
+        last_shield_decision_.executing_last_verified_monitored =
+            shield_dec.executing_last_verified_monitored;
       }
     }
   } else {
@@ -2974,7 +3009,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             shield_dec.evaluated_plan,
             shield_dec.monitor,
             shield_dec.candidate_verified,
-            shield_dec.executing_last_verified_failsafe,
+            shield_dec.executing_last_verified_monitored,
             shield_dec.monitor_total_ms,
             shield_dec.planner_ms,
             shield_dec.plan_build_ms,
@@ -2983,8 +3018,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       }
     } else {
       shield_dec = last_shield_decision_;
-      if (mode_ == SafetyMode::kFailsafe || shield_dec.executing_last_verified_failsafe) {
-        shield_dec.executing_last_verified_failsafe = true;
+      if (mode_ == SafetyMode::kLastVerifiedMonitored || shield_dec.executing_last_verified_monitored) {
+        shield_dec.executing_last_verified_monitored = true;
         if (last_verified_plan_.valid &&
             (!last_verified_plan_.intended.empty() ||
              !last_verified_plan_.failsafe.empty()))
@@ -2992,7 +3027,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         else
           shield_dec.command = makeEmergencyStopCommand(current_position, current_orientation, wall_time);
       } else {
-        shield_dec.executing_last_verified_failsafe = false;
+        shield_dec.executing_last_verified_monitored = false;
         if (last_verified_plan_.valid && !last_verified_plan_.intended.empty())
           shield_dec.command =
               getNextVerifiedTrajectoryCommandFromCache(!cartesian_effective_time_frozen_);
@@ -3000,24 +3035,24 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           shield_dec.command = makeEmergencyStopCommand(current_position, current_orientation, wall_time);
       }
       last_shield_decision_.command = shield_dec.command;
-      last_shield_decision_.executing_last_verified_failsafe =
-          shield_dec.executing_last_verified_failsafe;
+      last_shield_decision_.executing_last_verified_monitored =
+          shield_dec.executing_last_verified_monitored;
     }
   }
   const auto toc_shield = SteadyClock::now();
 
-  if (shield_dec.executing_last_verified_failsafe) {
+  if (shield_dec.executing_last_verified_monitored) {
     if (failsafe_enter_wall_time_sec_ < 0.0) {
       failsafe_enter_wall_time_sec_ = wall_time;
       failsafe_start_time_sec_ = wall_time;
     }
-    mode_ = SafetyMode::kFailsafe;
+    mode_ = SafetyMode::kLastVerifiedMonitored;
   } else {
     if (failsafe_enter_wall_time_sec_ >= 0.0) {
       paused_nominal_time_sec_ += std::max(0.0, wall_time - failsafe_enter_wall_time_sec_);
       failsafe_enter_wall_time_sec_ = -1.0;
     }
-    mode_ = SafetyMode::kNominal;
+    mode_ = nominalSafetyModeForMonitor(shield_dec.monitor);
   }
 
   const std::size_t monitored_intended_steps =
@@ -3037,7 +3072,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       shouldApplyCartesianEnergyBudget(
           monitor,
           shield_dec.command,
-          shield_dec.executing_last_verified_failsafe);
+          shield_dec.executing_last_verified_monitored);
   Matrix6d cartesian_lambda = Matrix6d::Zero();
   bool cartesian_lambda_valid = false;
   if (use_cartesian_energy_budget) {
@@ -3187,7 +3222,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                      monitor.v_n_now * monitor.v_n_now;
     monitor.v_n_now_tube = v_n_now_tube;
     monitor.Tn_now_tube  = Tn_now_tube;
-    if (mode_ == SafetyMode::kFailsafe) {
+    if (mode_ == SafetyMode::kLastVerifiedMonitored) {
       if (prev_Tn_fs_valid_)
         monitor.Tn_dot_est = (Tn_now_tube - prev_Tn_fs_) / std::max(dt, kMinDt);
       else
@@ -3216,7 +3251,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       current_orientation,
       wall_time);
 
-  if (enable_error_logging_ && error_log_file_.is_open()) {
+  if (enable_error_logging_ && command_recording_active_ && error_log_file_.is_open()) {
     const Vector3d human_center = human_workspace_.centerAtTime(wall_time);
     const double mujoco_contact_msg_time =
         latest_mujoco_contact_msg_time_.load(std::memory_order_relaxed);
@@ -3261,16 +3296,16 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << torque_rate_max_cmd_delta_nm_last_ << ","
         << K_runtime_(0, 0) << "," << K_runtime_(1, 1) << "," << K_runtime_(2, 2) << ","
         << D_runtime_(0, 0) << "," << D_runtime_(1, 1) << "," << D_runtime_(2, 2) << ","
-        << monitor.plane_distance_now << "," << monitor.plane_distance_min << ","
+        << monitor.workspace_distance_now << "," << monitor.workspace_distance_min << ","
         << monitor.m_eff_n << "," << monitor.v_n_now << "," << monitor.Tn_now << "," << monitor.v_safe << ","
         << static_cast<int>(monitor.nominal_contact_sample_found) << ","
         << monitor.nominal_contact_time << "," << monitor.nominal_contact_distance << ","
         << monitor.v_n_contact_nominal << "," << monitor.Tn_contact_nominal << ","
-        << monitor.worst_case_contact_time << "," << monitor.worst_case_plane_distance_at_candidate << ","
+        << monitor.worst_case_contact_time << "," << monitor.worst_case_workspace_distance_at_candidate << ","
         << monitor.worst_case_nominal_forward_progress << ","
         << monitor.worst_case_v_n_ub << "," << monitor.worst_case_Tn_ub << ","
         << monitor.worst_case_a_pos << "," << monitor.worst_case_a_brake << "," << monitor.worst_case_a_net << ","
-        << monitor.h_geom << "," << monitor.h_monitored_energy << ","
+        << monitor.workspace_distance_margin << "," << monitor.h_monitored_energy << ","
         << monitor.h_clamping_energy << "," << monitor.h_terminal_energy << ","
         << monitor.worst_case_V_potential_ub << "," << monitor.terminal_energy_ub << ","
         << robot_potential_energy << ","
@@ -3461,8 +3496,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<std::string>("rviz_frame_id", "panda_link0");
     auto_declare<int>("rviz_marker_decimation", 10);
     auto_declare<double>("rviz_marker_lifetime_sec", 0.2);
-    auto_declare<double>("rviz_plane_size", 0.8);
-    auto_declare<double>("rviz_plane_thickness", 0.003);
     auto_declare<double>("rviz_normal_arrow_length", 0.20);
     auto_declare<double>("rviz_velocity_arrow_scale", 0.25);
     auto_declare<double>("rviz_arrow_shaft_diameter", 0.01);
@@ -3790,8 +3823,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     rviz_frame_id_ = get_node()->get_parameter("rviz_frame_id").as_string();
     rviz_marker_decimation_ = std::max(1, static_cast<int>(get_node()->get_parameter("rviz_marker_decimation").as_int()));
     rviz_marker_lifetime_sec_ = get_node()->get_parameter("rviz_marker_lifetime_sec").as_double();
-    rviz_plane_size_ = get_node()->get_parameter("rviz_plane_size").as_double();
-    rviz_plane_thickness_ = get_node()->get_parameter("rviz_plane_thickness").as_double();
     rviz_normal_arrow_length_ = get_node()->get_parameter("rviz_normal_arrow_length").as_double();
     rviz_velocity_arrow_scale_ = get_node()->get_parameter("rviz_velocity_arrow_scale").as_double();
     rviz_arrow_shaft_diameter_ = get_node()->get_parameter("rviz_arrow_shaft_diameter").as_double();
@@ -3994,6 +4025,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   prof_io_sum_ms_ = 0.0;
   prof_io_max_ms_ = 0.0;
   log_write_counter_ = 0;
+  command_recording_active_ = false;
   prediction_log_write_counter_ = 0;
   control_update_sequence_ = 0;
   prev_Tn_fs_ = 0.0; prev_Tn_fs_valid_ = false;
@@ -4084,6 +4116,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << static_cast<int>(enable_prediction_logging_) << "\n"
                     << "prediction_log_max_queue_size: "
                     << prediction_log_max_queue_size_ << "\n"
+                    << "recording_start: first_valid_via_points_command\n"
                     << "arm_id: " << arm_id_ << "\n"
                     << "cartesian_via_points_count: "
                     << cartesian_via_points_.size() << "\n"
@@ -4140,10 +4173,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << desired_position_.x() << ", "
                     << desired_position_.y() << ", "
                     << desired_position_.z() << "]\n"
-                    << "human_plane_normal: ["
-                    << human_workspace_.normal().x() << ", "
-                    << human_workspace_.normal().y() << ", "
-                    << human_workspace_.normal().z() << "]\n"
+                    << "human_workspace_direction: ["
+                    << human_workspace_.direction().x() << ", "
+                    << human_workspace_.direction().y() << ", "
+                    << human_workspace_.direction().z() << "]\n"
                     << "human_sphere_center: ["
                     << human_workspace_.center().x() << ", "
                     << human_workspace_.center().y() << ", "
@@ -4194,15 +4227,15 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "torque_rate_limit_delta_nm,torque_rate_max_excess_nm,"
         << "torque_rate_max_ratio,torque_rate_max_cmd_delta_nm,"
         << "Kx,Ky,Kz,Dx,Dy,Dz,"
-        << "plane_distance_now,plane_distance_min,"
+        << "workspace_distance_now,workspace_distance_min,"
         << "m_eff_n,v_n_now,Tn_now,v_safe,"
         << "nominal_contact_sample_found,nominal_contact_time,nominal_contact_distance,"
         << "v_n_contact_nominal,Tn_contact_nominal,"
-        << "worst_case_contact_time,worst_case_plane_distance_at_candidate,"
+        << "worst_case_contact_time,worst_case_workspace_distance_at_candidate,"
         << "worst_case_nominal_forward_progress,"
         << "worst_case_v_n_ub,worst_case_Tn_ub,"
         << "worst_case_a_pos,worst_case_a_brake,worst_case_a_net,"
-        << "h_geom,h_monitored_energy,h_clamping_energy,h_terminal_energy,"
+        << "workspace_distance_margin,h_monitored_energy,h_clamping_energy,h_terminal_energy,"
         << "worst_case_V_potential_ub,terminal_energy_ub,"
         << "robot_potential_energy,robot_potential_energy_pos,robot_potential_energy_rot,"
         << "v_n_now_tube,Tn_now_tube,Tn_dot_est,"
@@ -4244,7 +4277,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
           << "wall_time_sec,nominal_time_sec,source,"
           << "monitor_total_ms,planner_ms,plan_build_ms,monitor_eval_ms,"
           << "mode,candidate_verified,"
-          << "executing_failsafe,predicted_trigger,monitored_contact_possible,"
+          << "executing_last_verified_monitored,predicted_trigger,monitored_contact_possible,"
           << "plan_intended_steps,plan_failsafe_steps,"
           << "stage,index,is_failsafe_sample,sample_t,dt,"
           << "actual_tcp_px,actual_tcp_py,actual_tcp_pz,"
@@ -4265,7 +4298,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
           << "is_worst_T,is_worst_V,"
           << "Kx,Ky,Kz,Dx,Dy,Dz,"
           << "monitor_worst_case_Tn_ub,monitor_worst_case_V_potential_ub,"
-          << "monitor_terminal_energy_ub,monitor_h_geom,monitor_h_clamping_energy\n";
+          << "monitor_terminal_energy_ub,monitor_workspace_distance_margin,monitor_h_clamping_energy\n";
       RCLCPP_INFO(
           get_node()->get_logger(),
           "Shield prediction log enabled: %s",

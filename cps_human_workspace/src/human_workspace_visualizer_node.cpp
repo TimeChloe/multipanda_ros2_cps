@@ -9,7 +9,6 @@
 #include <Eigen/Dense>
 
 #include <geometry_msgs/msg/point.hpp>
-#include <geometry_msgs/msg/quaternion.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/color_rgba.hpp>
@@ -26,7 +25,6 @@ namespace {
 
 using cps_human_workspace::HumanWorkspace;
 using Vector3d = Eigen::Vector3d;
-using Matrix3d = Eigen::Matrix3d;
 using Quaterniond = Eigen::Quaterniond;
 using Marker = visualization_msgs::msg::Marker;
 using MarkerArray = visualization_msgs::msg::MarkerArray;
@@ -46,29 +44,6 @@ geometry_msgs::msg::Point toPoint(const Vector3d& p) {
   point.y = p.y();
   point.z = p.z();
   return point;
-}
-
-geometry_msgs::msg::Quaternion toQuatMsg(const Quaterniond& q) {
-  geometry_msgs::msg::Quaternion msg;
-  msg.x = q.x();
-  msg.y = q.y();
-  msg.z = q.z();
-  msg.w = q.w();
-  return msg;
-}
-
-Matrix3d makePlaneFrameFromNormal(const Vector3d& normal_in) {
-  const Vector3d normal = normal_in.normalized();
-  const Vector3d reference =
-      std::abs(normal.z()) < 0.9 ? Vector3d::UnitZ() : Vector3d::UnitX();
-  const Vector3d x_axis = reference.cross(normal).normalized();
-  const Vector3d y_axis = normal.cross(x_axis).normalized();
-
-  Matrix3d frame;
-  frame.col(0) = x_axis;
-  frame.col(1) = y_axis;
-  frame.col(2) = normal;
-  return frame;
 }
 
 class HumanWorkspaceVisualizer : public rclcpp::Node {
@@ -103,8 +78,6 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
         0.0,
         declare_parameter<double>("tracking_pos_error_bound", 0.005));
 
-    plane_size_ = declare_parameter<double>("plane_size", 0.8);
-    plane_thickness_ = declare_parameter<double>("plane_thickness", 0.003);
     normal_arrow_length_ = declare_parameter<double>("normal_arrow_length", 0.20);
     arrow_shaft_diameter_ = declare_parameter<double>("arrow_shaft_diameter", 0.01);
     arrow_head_diameter_ = declare_parameter<double>("arrow_head_diameter", 0.02);
@@ -156,26 +129,13 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     const double elapsed_time_sec =
         std::max(0.0, (now() - start_time_).seconds());
     const Vector3d center = workspace_.centerAtTime(elapsed_time_sec);
-    const Vector3d normal = workspace_.normal();
-    const Quaterniond plane_orientation(makePlaneFrameFromNormal(normal));
+    const Vector3d direction = workspace_.direction();
 
     {
       Marker marker;
-      setupMarker(marker, 0, "human_workspace_plane", Marker::CUBE);
-      marker.pose.position = toPoint(center);
-      marker.pose.orientation = toQuatMsg(plane_orientation);
-      marker.scale.x = plane_size_;
-      marker.scale.y = plane_size_;
-      marker.scale.z = plane_thickness_;
-      marker.color = makeColor(0.1f, 0.6f, 1.0f, 0.16f);
-      array.markers.push_back(marker);
-    }
-
-    {
-      Marker marker;
-      setupMarker(marker, 1, "human_workspace_normal", Marker::ARROW);
+      setupMarker(marker, 1, "human_workspace_direction", Marker::ARROW);
       marker.points.push_back(toPoint(center));
-      marker.points.push_back(toPoint(center + normal_arrow_length_ * normal));
+      marker.points.push_back(toPoint(center + normal_arrow_length_ * direction));
       marker.scale.x = arrow_shaft_diameter_;
       marker.scale.y = arrow_head_diameter_;
       marker.scale.z = arrow_head_length_;
@@ -307,8 +267,6 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
   double ee_collision_radius_{0.04};
   Vector3d ee_collision_center_offset_{Vector3d::Zero()};
   double tracking_pos_error_bound_{0.005};
-  double plane_size_{0.8};
-  double plane_thickness_{0.003};
   double normal_arrow_length_{0.20};
   double arrow_shaft_diameter_{0.01};
   double arrow_head_diameter_{0.02};

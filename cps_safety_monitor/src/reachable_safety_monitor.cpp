@@ -51,7 +51,7 @@ Vector3d fallbackDirection(const Vector3d& x_pred,
     return direction;
   }
 
-  return human_workspace.normal();
+  return human_workspace.direction();
 }
 
 Vector3d commandDirection(const ImpedanceSample& s,
@@ -155,29 +155,19 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
           config.ee_collision_radius,
           rho_p);
 
-  out.plane_distance_now =
+  out.workspace_distance_now =
       config.human_workspace.signedDistanceToInflatedSphere(
           current_position,
           inflated_contact_radius,
           config.wall_time_sec);
 
-  out.plane_distance_min = out.plane_distance_now;
+  out.workspace_distance_min = out.workspace_distance_now;
 
   Matrix6d K_exec = config.K_runtime;
   Matrix6d D_exec = config.D_runtime;
 
-  const Matrix3d Kp_now = K_exec.topLeftCorner<3, 3>();
-  const double k_n_now =
-      std::max((direction_now.transpose() * Kp_now * direction_now)(0, 0), 0.0);
-  const double e_n_now =
-      std::abs(direction_now.dot(current_position - plan.anchor.p)) + rho_p;
-  const double V_n_now_tube = 0.5 * k_n_now * e_n_now * e_n_now;
-
-  double T_n_max = out.Tn_now_tube;
-  double V_n_max = V_n_now_tube;
-  out.worst_case_v_n_ub = out.v_n_now_tube;
-  out.worst_case_Tn_ub = T_n_max;
-  out.worst_case_V_potential_ub = V_n_max;
+  double T_n_contact_max = 0.0;
+  double V_n_contact_max = 0.0;
 
   double terminal_T_ub = 0.0;
   double terminal_V_ub = 0.0;
@@ -218,23 +208,17 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
             inflated_contact_radius,
             segment_start_time_sec);
 
-    const double d_next =
-        config.human_workspace.signedDistanceToInflatedSphere(
-            x_next,
-            inflated_contact_radius,
-            segment_end_time_sec);
-
+    Vector3d closest_predicted_point = Vector3d::Zero();
     const double d_segment =
         config.human_workspace.signedDistanceSegmentToInflatedSphere(
             x_pred,
             x_next,
             inflated_contact_radius,
             segment_start_time_sec,
-            segment_end_time_sec);
+            segment_end_time_sec,
+            &closest_predicted_point);
 
-    out.plane_distance_min = std::min(out.plane_distance_min, d_segment);
-
-    const bool contact_possible_step = d_segment <= 0.0;
+    out.workspace_distance_min = std::min(out.workspace_distance_min, d_segment);
 
     const Vector3d direction =
         commandDirection(
@@ -254,11 +238,23 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     const double T_n_ub = 0.5 * m_eff * v_n * v_n;
     const double V_n_ub = 0.5 * k_n * e_n * e_n;
 
-    if (T_n_ub > T_n_max) {
-      T_n_max = T_n_ub;
+    const bool contact_possible_step = d_segment <= 0.0;
+    if (contact_possible_step && !out.nominal_contact_sample_found) {
+      const bool contact_at_segment_start = d_pred <= 0.0;
+      out.nominal_contact_sample_found = true;
+      out.nominal_contact_time = contact_at_segment_start ? t_prev : s.t;
+      out.nominal_contact_distance = d_segment;
+      out.v_n_contact_nominal = v_n;
+      out.Tn_contact_nominal = T_n_ub;
+      out.nominal_contact_point_world =
+          contact_at_segment_start ? x_pred : closest_predicted_point;
+    }
+
+    if (contact_possible_step && T_n_ub > T_n_contact_max) {
+      T_n_contact_max = T_n_ub;
 
       out.worst_case_contact_time = s.t;
-      out.worst_case_plane_distance_at_candidate = std::min(d_pred, d_next);
+      out.worst_case_workspace_distance_at_candidate = d_segment;
       out.worst_case_nominal_forward_progress = direction.dot(x_next - current_position);
       out.worst_case_v_n_ub = v_n;
       out.worst_case_Tn_ub = T_n_ub;
@@ -268,31 +264,9 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
       out.worst_case_a_net = 0.0;
     }
 
-    if (V_n_ub > V_n_max) {
-      V_n_max = V_n_ub;
+    if (contact_possible_step && V_n_ub > V_n_contact_max) {
+      V_n_contact_max = V_n_ub;
       out.worst_case_V_potential_ub = V_n_ub;
-    }
-
-    if (contact_possible_step) {
-      out.monitored_contact_possible = true;
-
-      if (!s.failsafe && !out.nominal_contact_sample_found) {
-        Vector3d x_contact = Vector3d::Zero();
-        config.human_workspace.signedDistanceSegmentToInflatedSphere(
-            x_pred,
-            x_next,
-            inflated_contact_radius,
-            segment_start_time_sec,
-            segment_end_time_sec,
-            &x_contact);
-
-        out.nominal_contact_sample_found = true;
-        out.nominal_contact_time = s.t;
-        out.nominal_contact_distance = d_segment;
-        out.v_n_contact_nominal = v_n;
-        out.Tn_contact_nominal = T_n_ub;
-        out.nominal_contact_point_world = x_contact;
-      }
     }
 
     if (s.failsafe) {
@@ -323,9 +297,10 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     terminal_V_ub = 0.0;
   }
 
-  out.h_geom = out.plane_distance_min;
-  out.worst_case_Tn_ub = T_n_max;
-  out.worst_case_V_potential_ub = V_n_max;
+  out.monitored_contact_possible = out.workspace_distance_min <= 0.0;
+  out.workspace_distance_margin = out.workspace_distance_min;
+  out.worst_case_Tn_ub = T_n_contact_max;
+  out.worst_case_V_potential_ub = V_n_contact_max;
   out.terminal_energy_ub = terminal_T_ub + terminal_V_ub;
 
   const double L_TF_eff =
@@ -338,12 +313,30 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
 
   const double L_F_eff = std::min(L_TF_eff, L_QS_eff);
 
-  out.contact_relevant_for_energy =
-      out.monitored_contact_possible ||
-      out.plane_distance_min <= std::max(0.0, config.contact_activation_margin);
+  // SARA/PFL-style split: future predicted interaction is verified on the
+  // monitored trajectory; actual current interaction is handled by the Cartesian
+  // energy budget instead of rejecting the trajectory here.
+  out.contact_relevant_for_energy = out.workspace_distance_now <= 0.0;
+  const bool predicted_contact_requires_verification =
+      out.monitored_contact_possible && !out.contact_relevant_for_energy;
 
   const bool current_collision_energy_unsafe =
       out.contact_relevant_for_energy && out.Tn_now_tube > L_TF_eff;
+  const bool predicted_collision_energy_unsafe =
+      predicted_contact_requires_verification &&
+      out.worst_case_Tn_ub > L_TF_eff;
+  const bool predicted_clamping_energy_unsafe =
+      predicted_contact_requires_verification &&
+      out.worst_case_V_potential_ub > L_QS_eff;
+  const bool predicted_terminal_energy_unsafe =
+      predicted_contact_requires_verification &&
+      out.terminal_energy_ub > L_F_eff;
+
+  out.predicted_trigger =
+      predicted_collision_energy_unsafe ||
+      predicted_clamping_energy_unsafe ||
+      predicted_terminal_energy_unsafe;
+
   const double monitored_collision_energy_ub =
       std::max(out.worst_case_Tn_ub,
                out.contact_relevant_for_energy ? out.Tn_now_tube : 0.0);
@@ -353,17 +346,13 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   out.h_terminal_energy = L_F_eff - out.terminal_energy_ub;
 
   out.collision_energy_unsafe =
-      out.worst_case_Tn_ub > L_TF_eff || current_collision_energy_unsafe;
-  out.clamping_energy_unsafe = out.worst_case_V_potential_ub > L_QS_eff;
-  out.terminal_energy_unsafe = out.terminal_energy_ub > L_F_eff;
+      current_collision_energy_unsafe || predicted_collision_energy_unsafe;
+  out.clamping_energy_unsafe = predicted_clamping_energy_unsafe;
+  out.terminal_energy_unsafe = predicted_terminal_energy_unsafe;
 
   out.monitored_unsafe =
-      out.contact_relevant_for_energy &&
-      (out.collision_energy_unsafe ||
-       out.clamping_energy_unsafe ||
-       out.terminal_energy_unsafe);
-
-  out.predicted_trigger = out.monitored_unsafe;
+      out.predicted_trigger ||
+      (out.contact_relevant_for_energy && current_collision_energy_unsafe);
 
   return out;
 }

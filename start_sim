@@ -3,3 +3,7 @@ ros2 launch franka_bringup franka_sim.launch.py
 ros2 control load_controller --set-state active reachable_cartesian_impedance_controller 
 
 ros2 launch franka_bringup franka_sim.launch.py hide_table:=true show_human_workspace:=false
+
+ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian_via_points \
+  panda_motion_generator_msgs/action/CartesianViaMotion \
+  "$(cat src/cps_trajectory_generators/config/examples/reachable_via_points_dynamic_human_crossing_action_goal.yaml)"

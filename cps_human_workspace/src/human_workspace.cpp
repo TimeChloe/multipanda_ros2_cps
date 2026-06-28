@@ -54,8 +54,23 @@ bool HumanWorkspace::configureFromConfigFile(
     };
 
     Parameters parameters;
-    if (!read_vector3(root, "plane_normal", &parameters.plane_normal) ||
-        !read_vector3(root, "sphere_center", &parameters.sphere_center)) {
+    if (root["workspace_direction"]) {
+      if (!read_vector3(root, "workspace_direction", &parameters.workspace_direction)) {
+        return false;
+      }
+    } else if (root["plane_normal"]) {
+      if (!read_vector3(root, "plane_normal", &parameters.workspace_direction)) {
+        return false;
+      }
+    } else {
+      RCLCPP_ERROR(
+          logger,
+          "workspace_direction must be a 3-element list in %s.",
+          config_path.c_str());
+      return false;
+    }
+
+    if (!read_vector3(root, "sphere_center", &parameters.sphere_center)) {
       return false;
     }
 
@@ -135,8 +150,8 @@ bool HumanWorkspace::configureFromConfigFile(
       return false;
     }
 
-    if (parameters.plane_normal.norm() < 1e-8) {
-      RCLCPP_ERROR(logger, "plane_normal norm too small.");
+    if (parameters.workspace_direction.norm() < 1e-8) {
+      RCLCPP_ERROR(logger, "workspace_direction norm too small.");
       return false;
     }
 
@@ -167,7 +182,7 @@ bool HumanWorkspace::configureFromParameters(
 
 void HumanWorkspace::setParameters(const Parameters& parameters) {
   parameters_ = parameters;
-  parameters_.plane_normal.normalize();
+  parameters_.workspace_direction.normalize();
 }
 
 Vector3d HumanWorkspace::centerAtTime(double time_sec) const {
@@ -261,12 +276,12 @@ double HumanWorkspace::signedDistanceSegmentToInflatedSphere(
 }
 
 double HumanWorkspace::normalStiffness(const Matrix6d& K) const {
-  const Vector3d& n = parameters_.plane_normal;
+  const Vector3d& n = parameters_.workspace_direction;
   return std::max((n.transpose() * K.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
 }
 
 double HumanWorkspace::normalDamping(const Matrix6d& D) const {
-  const Vector3d& n = parameters_.plane_normal;
+  const Vector3d& n = parameters_.workspace_direction;
   return std::max((n.transpose() * D.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
 }
 
