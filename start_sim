@@ -7,3 +7,22 @@ ros2 launch franka_bringup franka_sim.launch.py hide_table:=true show_human_work
 ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian_via_points \
   panda_motion_generator_msgs/action/CartesianViaMotion \
   "$(cat src/cps_trajectory_generators/config/examples/reachable_via_points_dynamic_human_crossing_action_goal.yaml)"
+  
+ros2 launch cps_human_workspace human_workspace.launch.py \
+  human_workspace_config_path:=/path/to/your_workspace.yaml
+  
+ 
+ 
+ 
+ 
+ 
+static:
+ros2 launch cps_human_workspace human_workspace_visualizer.launch.py \
+human_workspace_config:=human_workspace.yaml \
+use_sim_time:=true
+
+
+dynamical:
+ros2 launch cps_human_workspace human_workspace_visualizer.launch.py \
+human_workspace_config:=human_workspace_dynamic_crossing.yaml \
+use_sim_time:=true

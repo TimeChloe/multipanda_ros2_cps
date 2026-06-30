@@ -203,7 +203,12 @@ reachable_cartesian_impedance_controller:
     # Each state is a robot-base-frame pose [x, y, z, qx, qy, qz, qw].
     # Options: "yaml" starts from cartesian_via_points below; "action" waits
     # for a CartesianViaMotion action goal.
-    human_workspace_config_path: /home/developer/multipanda_ws/src/cps_human_workspace/config/human_workspace_dynamic_crossing.yaml
+    # Leave empty to use live human workspace states from human_workspace_topic.
+    # Set this before configuring/activating the controller only when using a
+    # static/dynamic YAML config as an initial workspace source.
+    human_workspace_config_path: ""
+    human_workspace_topic: "human_workspace/state"
+    human_workspace_timeout_sec: 0.5
     startup_via_points_source: "action"
     cartesian_via_points_action_name: "~/follow_cartesian_via_points"
     cartesian_via_points_action_feedback_period_sec: 0.1
@@ -234,6 +239,12 @@ reachable_cartesian_impedance_controller:
     cartesian_energy_lambda_update_period_sec: 0.004
     contact_activation_margin: 0.00
 
+    # Collision model for the safety monitor:
+    # center = metal ball center = panda_link8 + [0, 0, 0.03].
+    # tcp_offset keeps Cartesian control at the metal-ball TCP
+    # (panda_link8 + [0, 0, 0.06]); ee_collision_center_offset moves the
+    # safety collision model back to the metal-ball center.
+    # ee_collision_radius expands the monitored sphere around that center.
     ee_collision_radius: 0.03
     tcp_offset: [0.0, 0.0, 0.06]
     ee_collision_center_offset: [0.0, 0.0, -0.03]

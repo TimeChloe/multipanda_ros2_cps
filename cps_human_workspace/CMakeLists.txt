@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.8)
 project(cps_human_workspace)
+# rosidl_generate_interfaces creates targets under the package name, so the
+# C++ model library needs a private CMake target name. It still installs and
+# exports publicly as cps_human_workspace.
+set(HUMAN_WORKSPACE_MODEL_TARGET human_workspace_model)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -11,29 +15,41 @@ find_package(ament_index_cpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
-add_library(${PROJECT_NAME} SHARED
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/HumanWorkspace.msg"
+  DEPENDENCIES geometry_msgs std_msgs
+)
+
+add_library(${HUMAN_WORKSPACE_MODEL_TARGET} SHARED
   src/human_workspace.cpp
 )
 
-target_include_directories(${PROJECT_NAME}
+set_target_properties(${HUMAN_WORKSPACE_MODEL_TARGET}
+  PROPERTIES
+    OUTPUT_NAME ${PROJECT_NAME}
+    EXPORT_NAME ${PROJECT_NAME}
+)
+
+target_include_directories(${HUMAN_WORKSPACE_MODEL_TARGET}
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
 
-ament_target_dependencies(${PROJECT_NAME}
+ament_target_dependencies(${HUMAN_WORKSPACE_MODEL_TARGET}
   ament_index_cpp
   rclcpp
   rclcpp_lifecycle
 )
 
-target_link_libraries(${PROJECT_NAME}
+target_link_libraries(${HUMAN_WORKSPACE_MODEL_TARGET}
   Eigen3::Eigen
   yaml-cpp
 )
@@ -58,12 +74,20 @@ ament_target_dependencies(human_workspace_visualizer
 )
 
 target_link_libraries(human_workspace_visualizer
-  ${PROJECT_NAME}
+  ${HUMAN_WORKSPACE_MODEL_TARGET}
   Eigen3::Eigen
 )
 
+rosidl_get_typesupport_target(cpp_typesupport_target
+  ${PROJECT_NAME}
+  "rosidl_typesupport_cpp")
+
+target_link_libraries(human_workspace_visualizer
+  ${cpp_typesupport_target}
+)
+
 install(
-  TARGETS ${PROJECT_NAME}
+  TARGETS ${HUMAN_WORKSPACE_MODEL_TARGET}
   EXPORT export_${PROJECT_NAME}
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
@@ -85,8 +109,14 @@ install(
   DESTINATION share/${PROJECT_NAME}/config
 )
 
+install(
+  DIRECTORY launch/
+  DESTINATION share/${PROJECT_NAME}/launch
+  FILES_MATCHING PATTERN "*.launch.py"
+)
+
 ament_export_include_directories(include)
-ament_export_libraries(${PROJECT_NAME})
+ament_export_libraries(${HUMAN_WORKSPACE_MODEL_TARGET})
 ament_export_targets(export_${PROJECT_NAME})
 ament_export_dependencies(
   Eigen3
@@ -94,6 +124,7 @@ ament_export_dependencies(
   geometry_msgs
   rclcpp
   rclcpp_lifecycle
+  rosidl_default_runtime
   std_msgs
   tf2
   tf2_ros

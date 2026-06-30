@@ -364,9 +364,102 @@ Matrix6d ReachableCartesianImpedanceController::computeDampingFromStiffness(
   return D;
 }
 
-bool ReachableCartesianImpedanceController::shouldRejectCandidateWithMonitor(
-    const MonitorResult& monitor) const {
+void ReachableCartesianImpedanceController::handleHumanWorkspaceState(
+    const cps_human_workspace::msg::HumanWorkspace::SharedPtr msg) {
+  if (!msg) {
+    return;
+  }
+
+  cps_human_workspace::HumanWorkspace::Parameters parameters;
+  parameters.workspace_direction = Vector3d(
+      msg->workspace_direction.x,
+      msg->workspace_direction.y,
+      msg->workspace_direction.z);
+  parameters.sphere_center = Vector3d(
+      msg->sphere_center.x,
+      msg->sphere_center.y,
+      msg->sphere_center.z);
+  parameters.center_velocity = Vector3d(
+      msg->center_velocity.x,
+      msg->center_velocity.y,
+      msg->center_velocity.z);
+  parameters.center_sinusoid_amplitude.setZero();
+  parameters.center_sinusoid_frequency_hz = 0.0;
+  parameters.center_sinusoid_phase_rad = 0.0;
+  parameters.center_motion_time_offset_sec = 0.0;
+  parameters.motion_radius = msg->motion_radius;
+  parameters.hand_radius = msg->hand_radius;
+
+  if (parameters.workspace_direction.norm() < 1.0e-8 ||
+      parameters.motion_radius < 0.0 ||
+      parameters.hand_radius < 0.0 ||
+      !std::isfinite(parameters.motion_radius) ||
+      !std::isfinite(parameters.hand_radius)) {
+    RCLCPP_WARN_THROTTLE(
+        get_node()->get_logger(),
+        *get_node()->get_clock(),
+        1000,
+        "Ignoring invalid human workspace state on '%s'.",
+        human_workspace_topic_.c_str());
+    return;
+  }
+
+  human_workspace_param_buffer_.writeFromNonRT(parameters);
+  human_workspace_live_received_.store(true, std::memory_order_relaxed);
+  latest_human_workspace_msg_time_sec_.store(
+      get_node()->now().seconds(),
+      std::memory_order_relaxed);
+}
+
+bool ReachableCartesianImpedanceController::refreshHumanWorkspaceForMonitor(
+    double wall_time) {
   if (!enable_safety_monitor_) {
+    human_workspace_active_ = false;
+    return false;
+  }
+
+  if (human_workspace_live_received_.load(std::memory_order_relaxed)) {
+    const double latest_msg_time =
+        latest_human_workspace_msg_time_sec_.load(std::memory_order_relaxed);
+    const double age_sec = get_node()->now().seconds() - latest_msg_time;
+    human_workspace_active_ =
+        latest_msg_time >= 0.0 &&
+        age_sec <= std::max(0.0, human_workspace_timeout_sec_);
+    if (const auto* parameters = human_workspace_param_buffer_.readFromRT()) {
+      auto live_parameters = *parameters;
+      live_parameters.center_motion_time_offset_sec =
+          wall_time - std::max(0.0, age_sec);
+      human_workspace_.setParameters(live_parameters);
+    }
+    if (!human_workspace_active_) {
+      RCLCPP_WARN_THROTTLE(
+          get_node()->get_logger(),
+          *get_node()->get_clock(),
+          1000,
+          "Human workspace state on '%s' is stale or unavailable. "
+          "Safety monitor is waiting for fresh workspace data.",
+          human_workspace_topic_.c_str());
+    }
+    return human_workspace_active_;
+  }
+
+  human_workspace_active_ = human_workspace_configured_static_;
+  if (!human_workspace_active_) {
+    RCLCPP_WARN_THROTTLE(
+        get_node()->get_logger(),
+        *get_node()->get_clock(),
+        1000,
+        "No human workspace state received on '%s'. "
+        "Safety monitor is waiting for the human workspace provider.",
+        human_workspace_topic_.c_str());
+  }
+  return human_workspace_active_;
+}
+
+bool ReachableCartesianImpedanceController::shouldRejectCandidateWithMonitor(
+    const MonitorResult& monitor,
+    bool human_workspace_active) const {
+  if (!enable_safety_monitor_ || !human_workspace_active) {
     return false;
   }
 
@@ -375,12 +468,18 @@ bool ReachableCartesianImpedanceController::shouldRejectCandidateWithMonitor(
   return monitor.predicted_trigger;
 }
 
+bool ReachableCartesianImpedanceController::shouldRejectCandidateWithMonitor(
+    const MonitorResult& monitor) const {
+  return shouldRejectCandidateWithMonitor(monitor, human_workspace_active_);
+}
+
 bool ReachableCartesianImpedanceController::shouldApplyCartesianEnergyBudget(
     const MonitorResult& monitor,
     const ImpedanceSample& command,
     bool executing_last_verified_monitored) const {
   (void)command;
   return enable_safety_monitor_ &&
+         human_workspace_active_ &&
          monitor.contact_relevant_for_energy &&
          !executing_last_verified_monitored;
 }
@@ -504,6 +603,7 @@ void ReachableCartesianImpedanceController::publishRvizDiagnostics(
     const Vector3d& desired_position_cur, const Vector6d& ee_twist,
     const MonitorResult& monitor) {
   (void)ee_twist;
+  if (!enable_safety_monitor_ || !human_workspace_active_) return;
   if (!rviz_enable_markers_ || !rviz_marker_pub_) return;
   ++rviz_publish_counter_;
   if ((rviz_publish_counter_ % std::max(1, rviz_marker_decimation_)) != 0) return;
@@ -989,11 +1089,12 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
 }
 
 SafetyMonitorConfig ReachableCartesianImpedanceController::makeSafetyMonitorConfig(
+    const cps_human_workspace::HumanWorkspace& human_workspace,
     const Matrix6d& K_runtime,
     const Matrix6d& D_runtime,
     double wall_time) const {
   SafetyMonitorConfig config;
-  config.human_workspace = human_workspace_;
+  config.human_workspace = human_workspace;
   config.K_runtime = K_runtime;
   config.D_runtime = D_runtime;
   config.wall_time_sec = wall_time;
@@ -1149,7 +1250,13 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
     const Matrix7d& inertia,
     const Matrix37d& Jv,
     const Matrix6d& K_runtime,
-    const Matrix6d& D_runtime) const {
+    const Matrix6d& D_runtime,
+    const cps_human_workspace::HumanWorkspace& human_workspace,
+    bool human_workspace_active) const {
+  if (!enable_safety_monitor_ || !human_workspace_active) {
+    return MonitorResult{};
+  }
+
   const VerifiedPlan monitor_plan = makeSparsePlanForMonitor(plan);
   const VerifiedPlan collision_center_plan =
       makeCollisionCenterPlanForMonitor(monitor_plan);
@@ -1164,7 +1271,11 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
       collision_twist,
       inertia,
       Jv,
-      makeSafetyMonitorConfig(K_runtime, D_runtime, plan.generated_wall_time));
+      makeSafetyMonitorConfig(
+          human_workspace,
+          K_runtime,
+          D_runtime,
+          plan.generated_wall_time));
 }
 
 // ============================================================================
@@ -1191,7 +1302,16 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
 
   auto evaluate_plan = [&](const VerifiedPlan& plan) {
     return evaluateCandidatePlan(
-        plan, current_position, current_orientation, ee_twist, inertia, Jv, K_runtime_, D_runtime_);
+        plan,
+        current_position,
+        current_orientation,
+        ee_twist,
+        inertia,
+        Jv,
+        K_runtime_,
+        D_runtime_,
+        human_workspace_,
+        human_workspace_active_);
   };
 
   auto execute_last_verified_monitored = [&]() {
@@ -1505,13 +1625,18 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
         input.inertia,
         input.Jv,
         input.K_runtime,
-        input.D_runtime);
+        input.D_runtime,
+        input.human_workspace,
+        input.human_workspace_active);
     monitor_eval_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - eval_tic).count();
     dec.evaluated_plan = candidate_plan;
     dec.has_evaluated_plan = true;
 
-    dec.candidate_verified = !shouldRejectCandidateWithMonitor(dec.monitor);
+    dec.candidate_verified =
+        !shouldRejectCandidateWithMonitor(
+            dec.monitor,
+            input.human_workspace_active);
 
     if (!dec.candidate_verified) {
       return true;
@@ -2179,6 +2304,7 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
     const Matrix37d& Jv,
     const Matrix6d& K_runtime,
     const Matrix6d& D_runtime,
+    const cps_human_workspace::HumanWorkspace& human_workspace,
     const VerifiedPlan& evaluated_plan,
     const MonitorResult& monitor,
     bool candidate_verified,
@@ -2204,6 +2330,7 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
   record.Jv = Jv;
   record.K_runtime = K_runtime;
   record.D_runtime = D_runtime;
+  record.human_workspace = human_workspace;
   record.evaluated_plan = evaluated_plan;
   record.monitor = monitor;
   record.candidate_verified = candidate_verified;
@@ -2235,6 +2362,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     const Matrix37d& Jv,
     const Matrix6d& K_runtime,
     const Matrix6d& D_runtime,
+    const cps_human_workspace::HumanWorkspace& human_workspace,
     const VerifiedPlan& evaluated_plan,
     const MonitorResult& monitor,
     bool candidate_verified,
@@ -2292,7 +2420,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   const double rho_p = std::max(0.0, tracking_pos_error_bound_);
   const double rho_v = std::max(0.0, tracking_vel_error_bound_);
   const double inflated_contact_radius =
-      human_workspace_.inflatedCollisionRadius(ee_collision_radius_, rho_p);
+      human_workspace.inflatedCollisionRadius(ee_collision_radius_, rho_p);
 
   Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
   task_inertia_inv.diagonal().array() += kSmallPositive;
@@ -2345,16 +2473,16 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     row.x_next = x_next;
     row.v_next = v_next;
     row.a_pred = a_pred;
-    row.human_center_start = human_workspace_.centerAtTime(segment_start_time_sec);
-    row.human_center_end = human_workspace_.centerAtTime(segment_end_time_sec);
+    row.human_center_start = human_workspace.centerAtTime(segment_start_time_sec);
+    row.human_center_end = human_workspace.centerAtTime(segment_end_time_sec);
     row.d_pred =
-        human_workspace_.signedDistanceToInflatedSphere(
+        human_workspace.signedDistanceToInflatedSphere(
             x_pred, inflated_contact_radius, segment_start_time_sec);
     row.d_next =
-        human_workspace_.signedDistanceToInflatedSphere(
+        human_workspace.signedDistanceToInflatedSphere(
             x_next, inflated_contact_radius, segment_end_time_sec);
     row.d_segment =
-        human_workspace_.signedDistanceSegmentToInflatedSphere(
+        human_workspace.signedDistanceSegmentToInflatedSphere(
             x_pred,
             x_next,
             inflated_contact_radius,
@@ -2367,7 +2495,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
             previous_command_position,
             x_pred,
             v_pred,
-            human_workspace_,
+            human_workspace,
             segment_end_time_sec);
     const double denom =
         (monitor_direction.transpose() * task_inertia_inv * monitor_direction)(0, 0);
@@ -2419,11 +2547,11 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   }
 
   const double actual_collision_distance =
-      human_workspace_.signedDistanceToInflatedSphere(
+      human_workspace.signedDistanceToInflatedSphere(
           collision_center,
           inflated_contact_radius,
           wall_time);
-  const Vector3d actual_human_center = human_workspace_.centerAtTime(wall_time);
+  const Vector3d actual_human_center = human_workspace.centerAtTime(wall_time);
 
   prediction_log_file_ << std::fixed << std::setprecision(9);
   for (const auto& row : rows) {
@@ -2511,6 +2639,7 @@ void ReachableCartesianImpedanceController::predictionLoggerWorkerLoop() {
         record.Jv,
         record.K_runtime,
         record.D_runtime,
+        record.human_workspace,
         record.evaluated_plan,
         record.monitor,
         record.candidate_verified,
@@ -2725,6 +2854,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
   const double dt = std::max(period.seconds(), kMinDt);
   const double wall_time = (this->get_node()->now() - start_time_).seconds();
+  refreshHumanWorkspaceForMonitor(wall_time);
 
   const Eigen::Map<const Vector7d> q(franka_robot_model_->getRobotState()->q.data());
   const Eigen::Map<const Vector7d> dq(franka_robot_model_->getRobotState()->dq.data());
@@ -2786,6 +2916,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       async_input.Jv = Jv_collision;
       async_input.K_runtime = K_runtime_;
       async_input.D_runtime = D_runtime_;
+      async_input.human_workspace = human_workspace_;
+      async_input.human_workspace_active = human_workspace_active_;
       async_input.last_commanded_sample = last_commanded_sample_;
       async_input.last_commanded_sample_valid = last_commanded_sample_valid_;
       async_input.commanded_path_time = commanded_path_time_;
@@ -2817,6 +2949,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             async_output.input.Jv,
             async_output.input.K_runtime,
             async_output.input.D_runtime,
+            async_output.input.human_workspace,
             async_output.decision.evaluated_plan,
             async_output.decision.monitor,
             async_output.decision.candidate_verified,
@@ -2898,6 +3031,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
               Jv_collision,
               K_runtime_,
               D_runtime_,
+              human_workspace_,
               shield_dec.evaluated_plan,
               shield_dec.monitor,
               shield_dec.candidate_verified,
@@ -2950,6 +3084,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
               Jv_collision,
               K_runtime_,
               D_runtime_,
+              human_workspace_,
               shield_dec.evaluated_plan,
               shield_dec.monitor,
               shield_dec.candidate_verified,
@@ -3006,6 +3141,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             Jv_collision,
             K_runtime_,
             D_runtime_,
+            human_workspace_,
             shield_dec.evaluated_plan,
             shield_dec.monitor,
             shield_dec.candidate_verified,
@@ -3473,6 +3609,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("async_plan_max_age_sec", 0.05);
 
     cps_human_workspace::HumanWorkspace::declareParameters(get_node());
+    auto_declare<std::string>("human_workspace_topic", "human_workspace/state");
+    auto_declare<double>("human_workspace_timeout_sec", 0.5);
 
     auto_declare<double>("k_rate_limit", 5000.0);
     auto_declare<double>("d_rate_limit", 500.0);
@@ -3830,8 +3968,34 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     rviz_arrow_head_length_ = get_node()->get_parameter("rviz_arrow_head_length").as_double();
     rviz_ub_arrow_z_offset_ = get_node()->get_parameter("rviz_ub_arrow_z_offset").as_double();
 
-    if (!human_workspace_.configureFromParameters(get_node(), get_node()->get_logger())) {
-      return CallbackReturn::ERROR;
+    human_workspace_topic_ =
+        get_node()->get_parameter("human_workspace_topic").as_string();
+    human_workspace_timeout_sec_ = std::max(
+        0.0,
+        get_node()->get_parameter("human_workspace_timeout_sec").as_double());
+    human_workspace_active_ = false;
+    human_workspace_configured_static_ = false;
+    human_workspace_live_received_.store(false, std::memory_order_relaxed);
+    latest_human_workspace_msg_time_sec_.store(-1.0, std::memory_order_relaxed);
+
+    const std::string human_workspace_config_path =
+        get_node()->get_parameter("human_workspace_config_path").as_string();
+    if (enable_safety_monitor_) {
+      if (!human_workspace_config_path.empty()) {
+        if (!human_workspace_.configureFromConfigFile(
+                human_workspace_config_path,
+                get_node()->get_logger())) {
+          return CallbackReturn::ERROR;
+        }
+        human_workspace_configured_static_ = true;
+        human_workspace_active_ = true;
+      } else {
+        RCLCPP_WARN(
+            get_node()->get_logger(),
+            "enable_safety_monitor is true, but human_workspace_config_path is empty. "
+            "Waiting for live human workspace states on '%s'.",
+            human_workspace_topic_.c_str());
+      }
     }
 
     profiling_stats_print_period_ = std::max<int>(
@@ -3854,6 +4018,23 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
                   std::placeholders::_1));
     } else {
       mujoco_contact_sub_.reset();
+    }
+
+    if (enable_safety_monitor_ && !human_workspace_topic_.empty()) {
+      human_workspace_sub_ =
+          get_node()->create_subscription<cps_human_workspace::msg::HumanWorkspace>(
+              human_workspace_topic_,
+              rclcpp::QoS(1).transient_local(),
+              std::bind(
+                  &ReachableCartesianImpedanceController::handleHumanWorkspaceState,
+                  this,
+                  std::placeholders::_1));
+      RCLCPP_INFO(
+          get_node()->get_logger(),
+          "Listening for human workspace states on '%s'.",
+          human_workspace_topic_.c_str());
+    } else {
+      human_workspace_sub_.reset();
     }
 
     if (!cartesian_via_points_topic_.empty()) {
@@ -4106,8 +4287,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
       std::string human_workspace_config_path =
           get_node()->get_parameter("human_workspace_config_path").as_string();
       if (human_workspace_config_path.empty()) {
-        human_workspace_config_path =
-            cps_human_workspace::HumanWorkspace::defaultConfigPath();
+        human_workspace_config_path = "(none)";
       }
       run_info_file << "run_directory: " << error_log_run_dir_ << "\n"
                     << "csv_file: " << error_log_file_path_ << "\n"
@@ -4322,6 +4502,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_deactivate(
   cartesian_effective_time_frozen_ = false;
   cartesian_effective_time_freeze_start_wall_time_ = -1.0;
   cartesian_effective_time_hold_sample_valid_ = false;
+  human_workspace_active_ = false;
   J_geo_prev_.setZero();
   Jdot_dq_filtered_.setZero();
   J_geo_prev_valid_ = false;

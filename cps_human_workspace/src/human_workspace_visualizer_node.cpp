@@ -20,6 +20,7 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "cps_human_workspace/human_workspace.hpp"
+#include "cps_human_workspace/msg/human_workspace.hpp"
 
 namespace {
 
@@ -28,6 +29,7 @@ using Vector3d = Eigen::Vector3d;
 using Quaterniond = Eigen::Quaterniond;
 using Marker = visualization_msgs::msg::Marker;
 using MarkerArray = visualization_msgs::msg::MarkerArray;
+using HumanWorkspaceMsg = cps_human_workspace::msg::HumanWorkspace;
 
 std_msgs::msg::ColorRGBA makeColor(float r, float g, float b, float a) {
   std_msgs::msg::ColorRGBA color;
@@ -46,6 +48,14 @@ geometry_msgs::msg::Point toPoint(const Vector3d& p) {
   return point;
 }
 
+geometry_msgs::msg::Vector3 toVector3Msg(const Vector3d& v) {
+  geometry_msgs::msg::Vector3 msg;
+  msg.x = v.x();
+  msg.y = v.y();
+  msg.z = v.z();
+  return msg;
+}
+
 class HumanWorkspaceVisualizer : public rclcpp::Node {
  public:
   HumanWorkspaceVisualizer() : Node("human_workspace_visualizer") {
@@ -54,13 +64,18 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
         declare_parameter<std::string>("human_workspace_config_path", "");
     frame_id_ = declare_parameter<std::string>("frame_id", "panda_link0");
     topic_name_ = declare_parameter<std::string>("marker_topic", "human_workspace/markers");
+    state_topic_name_ =
+        declare_parameter<std::string>("state_topic", "human_workspace/state");
     publish_rate_hz_ = std::max(0.1, declare_parameter<double>("publish_rate", 10.0));
+    marker_lifetime_sec_ = std::max(
+        0.0,
+        declare_parameter<double>("marker_lifetime_sec", 0.1));
     visualize_ee_collision_area_ =
         declare_parameter<bool>("visualize_ee_collision_area", true);
-    ee_frame_id_ = declare_parameter<std::string>("ee_frame_id", "panda_link8");
+    ee_frame_id_ = declare_parameter<std::string>("ee_frame_id", "panda_metal_ball_link");
     ee_collision_radius_ = std::max(
         0.0,
-        declare_parameter<double>("ee_collision_radius", 0.04));
+        declare_parameter<double>("ee_collision_radius", 0.03));
     const auto ee_collision_center_offset =
         declare_parameter<std::vector<double>>(
             "ee_collision_center_offset", std::vector<double>{0.0, 0.0, 0.0});
@@ -78,10 +93,6 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
         0.0,
         declare_parameter<double>("tracking_pos_error_bound", 0.005));
 
-    normal_arrow_length_ = declare_parameter<double>("normal_arrow_length", 0.20);
-    arrow_shaft_diameter_ = declare_parameter<double>("arrow_shaft_diameter", 0.01);
-    arrow_head_diameter_ = declare_parameter<double>("arrow_head_diameter", 0.02);
-    arrow_head_length_ = declare_parameter<double>("arrow_head_length", 0.03);
     const bool configured =
         config_path.empty()
             ? workspace_.configureFromDefaultConfig(get_logger())
@@ -96,6 +107,9 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
 
     marker_pub_ = create_publisher<MarkerArray>(topic_name_, rclcpp::QoS(1).transient_local());
+    state_pub_ = create_publisher<HumanWorkspaceMsg>(
+        state_topic_name_,
+        rclcpp::QoS(1).transient_local());
 
     const auto period = std::chrono::duration<double>(1.0 / publish_rate_hz_);
     timer_ = create_wall_timer(
@@ -104,8 +118,9 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
 
     RCLCPP_INFO(
         get_logger(),
-        "Publishing human workspace markers on %s in frame %s.",
+        "Publishing human workspace markers on %s and state on %s in frame %s.",
         topic_name_.c_str(),
+        state_topic_name_.c_str(),
         frame_id_.c_str());
   }
 
@@ -117,7 +132,7 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     marker.id = id;
     marker.type = type;
     marker.action = Marker::ADD;
-    marker.lifetime = rclcpp::Duration::from_seconds(0.0);
+    marker.lifetime = rclcpp::Duration::from_seconds(marker_lifetime_sec_);
   }
 
   void publishMarkers() {
@@ -129,17 +144,11 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     const double elapsed_time_sec =
         std::max(0.0, (now() - start_time_).seconds());
     const Vector3d center = workspace_.centerAtTime(elapsed_time_sec);
-    const Vector3d direction = workspace_.direction();
 
     {
       Marker marker;
       setupMarker(marker, 1, "human_workspace_direction", Marker::ARROW);
-      marker.points.push_back(toPoint(center));
-      marker.points.push_back(toPoint(center + normal_arrow_length_ * direction));
-      marker.scale.x = arrow_shaft_diameter_;
-      marker.scale.y = arrow_head_diameter_;
-      marker.scale.z = arrow_head_length_;
-      marker.color = makeColor(0.1f, 0.6f, 1.0f, 0.9f);
+      marker.action = Marker::DELETE;
       array.markers.push_back(marker);
     }
 
@@ -177,6 +186,23 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     publishEndEffectorMarkers(array);
 
     marker_pub_->publish(array);
+    publishWorkspaceState(center, elapsed_time_sec);
+  }
+
+  void publishWorkspaceState(const Vector3d& center, double elapsed_time_sec) {
+    HumanWorkspaceMsg msg;
+    msg.header.stamp = now();
+    msg.header.frame_id = frame_id_;
+    msg.workspace_direction = toVector3Msg(workspace_.direction());
+    msg.sphere_center = toPoint(center);
+    msg.center_velocity = toVector3Msg(workspace_.centerVelocityAtTime(elapsed_time_sec));
+    msg.center_sinusoid_amplitude = toVector3Msg(Vector3d::Zero());
+    msg.center_sinusoid_frequency_hz = 0.0;
+    msg.center_sinusoid_phase_rad = 0.0;
+    msg.center_motion_time_offset_sec = elapsed_time_sec;
+    msg.motion_radius = workspace_.motionRadius();
+    msg.hand_radius = workspace_.handRadius();
+    state_pub_->publish(msg);
   }
 
   void publishEndEffectorMarkers(MarkerArray& array) {
@@ -262,17 +288,16 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
   std::string frame_id_;
   std::string ee_frame_id_;
   std::string topic_name_;
+  std::string state_topic_name_;
   bool visualize_ee_collision_area_{true};
   double publish_rate_hz_{10.0};
+  double marker_lifetime_sec_{0.1};
   double ee_collision_radius_{0.04};
   Vector3d ee_collision_center_offset_{Vector3d::Zero()};
   double tracking_pos_error_bound_{0.005};
-  double normal_arrow_length_{0.20};
-  double arrow_shaft_diameter_{0.01};
-  double arrow_head_diameter_{0.02};
-  double arrow_head_length_{0.03};
   rclcpp::Time start_time_;
   rclcpp::Publisher<MarkerArray>::SharedPtr marker_pub_;
+  rclcpp::Publisher<HumanWorkspaceMsg>::SharedPtr state_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;

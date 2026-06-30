@@ -42,6 +42,7 @@ class HumanWorkspace {
 
   void setParameters(const Parameters& parameters);
 
+  const Parameters& parameters() const { return parameters_; }
   const Vector3d& direction() const { return parameters_.workspace_direction; }
   const Vector3d& normal() const { return direction(); }
   const Vector3d& center() const { return parameters_.sphere_center; }

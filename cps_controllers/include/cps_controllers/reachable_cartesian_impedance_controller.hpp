@@ -21,9 +21,11 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp>
+#include <realtime_tools/realtime_buffer.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "cps_human_workspace/human_workspace.hpp"
+#include "cps_human_workspace/msg/human_workspace.hpp"
 #include "cps_safety_monitor/reachable_safety_monitor.hpp"
 #include "cps_trajectory_generators/reachable_cartesian_trajectory.hpp"
 #include "franka_semantic_components/franka_robot_model.hpp"
@@ -131,6 +133,11 @@ class ReachableCartesianImpedanceController
                               const Vector6d& ee_twist,
                               const MonitorResult& monitor);
 
+  void handleHumanWorkspaceState(
+      const cps_human_workspace::msg::HumanWorkspace::SharedPtr msg);
+
+  bool refreshHumanWorkspaceForMonitor(double wall_time);
+
   ImpedanceSample makeFrozenFailsafeSample(
       double nominal_time,
       const ImpedanceSample& freeze_sample,
@@ -166,7 +173,9 @@ class ReachableCartesianImpedanceController
                                       const Matrix7d& inertia,
                                       const Matrix37d& Jv,
                                       const Matrix6d& K_runtime,
-                                      const Matrix6d& D_runtime) const;
+                                      const Matrix6d& D_runtime,
+                                      const cps_human_workspace::HumanWorkspace& human_workspace,
+                                      bool human_workspace_active) const;
 
   Vector3d collisionCenterOffsetWorld(const Quaterniond& orientation) const;
 
@@ -188,9 +197,11 @@ class ReachableCartesianImpedanceController
                                        const Matrix7d& inertia,
                                        const Matrix37d& Jv);
 
-  SafetyMonitorConfig makeSafetyMonitorConfig(const Matrix6d& K_runtime,
-                                              const Matrix6d& D_runtime,
-                                              double wall_time) const;
+  SafetyMonitorConfig makeSafetyMonitorConfig(
+      const cps_human_workspace::HumanWorkspace& human_workspace,
+      const Matrix6d& K_runtime,
+      const Matrix6d& D_runtime,
+      double wall_time) const;
 
   struct AsyncMonitorInput {
     std::uint64_t sequence{0};
@@ -205,6 +216,8 @@ class ReachableCartesianImpedanceController
     Matrix37d Jv{Matrix37d::Zero()};
     Matrix6d K_runtime{Matrix6d::Zero()};
     Matrix6d D_runtime{Matrix6d::Zero()};
+    cps_human_workspace::HumanWorkspace human_workspace;
+    bool human_workspace_active{false};
 
     ImpedanceSample last_commanded_sample;
     bool last_commanded_sample_valid{false};
@@ -273,6 +286,7 @@ class ReachableCartesianImpedanceController
       const Matrix37d& Jv,
       const Matrix6d& K_runtime,
       const Matrix6d& D_runtime,
+      const cps_human_workspace::HumanWorkspace& human_workspace,
       const VerifiedPlan& evaluated_plan,
       const MonitorResult& monitor,
       bool candidate_verified,
@@ -293,6 +307,7 @@ class ReachableCartesianImpedanceController
     Matrix37d Jv{Matrix37d::Zero()};
     Matrix6d K_runtime{Matrix6d::Zero()};
     Matrix6d D_runtime{Matrix6d::Zero()};
+    cps_human_workspace::HumanWorkspace human_workspace;
     VerifiedPlan evaluated_plan{};
     MonitorResult monitor{};
     bool candidate_verified{false};
@@ -314,6 +329,7 @@ class ReachableCartesianImpedanceController
       const Matrix37d& Jv,
       const Matrix6d& K_runtime,
       const Matrix6d& D_runtime,
+      const cps_human_workspace::HumanWorkspace& human_workspace,
       const VerifiedPlan& evaluated_plan,
       const MonitorResult& monitor,
       bool candidate_verified,
@@ -361,6 +377,8 @@ class ReachableCartesianImpedanceController
   };
 
   bool shouldRejectCandidateWithMonitor(const MonitorResult& monitor) const;
+  bool shouldRejectCandidateWithMonitor(const MonitorResult& monitor,
+                                        bool human_workspace_active) const;
 
   bool shouldApplyCartesianEnergyBudget(
       const MonitorResult& monitor,
@@ -464,6 +482,16 @@ class ReachableCartesianImpedanceController
   double async_plan_max_age_sec_{0.05};
 
   cps_human_workspace::HumanWorkspace human_workspace_;
+  realtime_tools::RealtimeBuffer<cps_human_workspace::HumanWorkspace::Parameters>
+      human_workspace_param_buffer_;
+  rclcpp::Subscription<cps_human_workspace::msg::HumanWorkspace>::SharedPtr
+      human_workspace_sub_;
+  std::string human_workspace_topic_{"human_workspace/state"};
+  double human_workspace_timeout_sec_{0.5};
+  bool human_workspace_active_{false};
+  bool human_workspace_configured_static_{false};
+  std::atomic_bool human_workspace_live_received_{false};
+  std::atomic<double> latest_human_workspace_msg_time_sec_{-1.0};
 
   double k_rate_limit_{5000.0};
   double d_rate_limit_{500.0};

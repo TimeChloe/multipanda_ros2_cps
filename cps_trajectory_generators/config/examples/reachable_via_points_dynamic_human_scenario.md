@@ -15,17 +15,27 @@ so the matching approach is a time-indexed sphere center:
 - robot via-point topic payload:
   `cps_trajectory_generators/config/examples/reachable_via_points_dynamic_human_crossing.yaml`
 
-Run the controller with the dynamic workspace config before the controller is
-configured or activated, for example by setting the reachable controller
-parameter in the controller YAML or with a parameter override:
+Start the simulator separately:
 
 ```bash
-ros2 param set /reachable_cartesian_impedance_controller human_workspace_config_path \
-  "$(ros2 pkg prefix cps_human_workspace)/share/cps_human_workspace/config/human_workspace_dynamic_crossing.yaml"
+ros2 launch franka_bringup franka_sim.launch.py
 ```
 
-If the controller was already active, deactivate/configure/activate it again
-after changing this parameter. Then send the path:
+Start the dynamic human workspace visualization separately:
+
+```bash
+ros2 launch cps_human_workspace human_workspace_visualizer.launch.py \
+  human_workspace_config:=human_workspace_dynamic_crossing.yaml
+```
+
+Load the controller. It subscribes to `human_workspace/state`, so it can start
+before or after the workspace provider:
+
+```bash
+ros2 control load_controller --set-state active reachable_cartesian_impedance_controller
+```
+
+Then send the path:
 
 ```bash
 ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian_via_points \
@@ -33,11 +43,14 @@ ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian
   "$(cat cps_trajectory_generators/config/examples/reachable_via_points_dynamic_human_crossing_action_goal.yaml)"
 ```
 
-For RViz-only visualization of the moving human workspace:
+For a different workspace, create a config-only ROS package that installs its
+YAML files under `config/`, then pass `human_workspace_package` and
+`human_workspace_config` to the standalone human workspace launch:
 
 ```bash
-ros2 run cps_human_workspace human_workspace_visualizer --ros-args \
-  -p human_workspace_config_path:="$(ros2 pkg prefix cps_human_workspace)/share/cps_human_workspace/config/human_workspace_dynamic_crossing.yaml"
+ros2 launch cps_human_workspace human_workspace_visualizer.launch.py \
+  human_workspace_package:=my_lab_workspace \
+  human_workspace_config:=table_corner.yaml
 ```
 
 The validation CSV includes `human_center_px`, `human_center_py`, and
