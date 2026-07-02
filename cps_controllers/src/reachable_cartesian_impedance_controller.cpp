@@ -3255,7 +3255,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       use_cartesian_energy_budget,
       &candidate_energy_info);
 
-  const bool cartesian_budget_saturated =
+  // Lachner et al. Eq. (14)-(15): when the unscaled controlled
+  // energy exceeds the budget, scale the impedance and hold effective
+  // trajectory time until the energy is back inside the budget.
+  const bool cartesian_budget_limited =
       use_cartesian_energy_budget &&
       candidate_energy_info.scale < 1.0 - 1.0e-6;
 
@@ -3263,7 +3266,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   cartesian_energy_info = candidate_energy_info;
   shield_dec.command = candidate_scaled_command;
 
-  if (cartesian_budget_saturated) {
+  if (cartesian_budget_limited) {
     if (!cartesian_effective_time_frozen_) {
       cartesian_effective_time_freeze_start_wall_time_ = wall_time;
       commanded_path_rate_ = 0.0;
