@@ -232,10 +232,10 @@ reachable_cartesian_impedance_controller:
 
     enable_safety_monitor: true
 
-    safe_collision_energy_joule: 0.10
-    clamping_energy_budget_joule: 0.10
+    safe_collision_energy_joule: 0.05
+    clamping_energy_budget_joule: 0.05
     energy_budget_margin_joule: 0.000
-    cartesian_energy_budget_joule: 0.10
+    cartesian_energy_budget_joule: 0.05
     cartesian_energy_lambda_update_period_sec: 0.004
     contact_activation_margin: 0.00
 

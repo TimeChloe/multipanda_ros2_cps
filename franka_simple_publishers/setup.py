@@ -20,6 +20,10 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            (
+                'clear_mujoco_obstacles = '
+                'franka_simple_publishers.clear_mujoco_obstacles:main'
+            ),
         ],
     },
 )

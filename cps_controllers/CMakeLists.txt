@@ -23,6 +23,8 @@ find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(franka_msgs REQUIRED)
 find_package(mujoco_ros_msgs REQUIRED)
+# CMake 3.22's FindBoost does not map python310 to boost/python.hpp.
+set(_Boost_PYTHON310_HEADERS "boost/python.hpp")
 find_package(pinocchio REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(panda_motion_generator_msgs REQUIRED)

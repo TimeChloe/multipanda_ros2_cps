@@ -24,6 +24,8 @@ find_package(generate_parameter_library)
 find_package(franka_msgs REQUIRED)
 find_package(multi_mode_control_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
+# CMake 3.22's FindBoost does not map python310 to boost/python.hpp.
+set(_Boost_PYTHON310_HEADERS "boost/python.hpp")
 find_package(pinocchio REQUIRED)
 
 add_library(
