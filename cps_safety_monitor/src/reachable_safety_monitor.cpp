@@ -11,24 +11,6 @@ constexpr double kMinDt = 1.0e-6;
 constexpr double kLambdaReg = 1.0e-9;
 constexpr double kSmallPositive = 1.0e-9;
 
-Matrix6d applyMatrixRateLimit(const Matrix6d& current,
-                              const Matrix6d& target,
-                              double rate_limit,
-                              double dt) {
-  const double step = std::max(rate_limit, 0.0) * std::max(dt, kMinDt);
-  Matrix6d out = current;
-
-  for (int i = 0; i < out.rows(); ++i) {
-    for (int j = 0; j < out.cols(); ++j) {
-      const double delta =
-          std::clamp(target(i, j) - current(i, j), -step, step);
-      out(i, j) = current(i, j) + delta;
-    }
-  }
-
-  return out;
-}
-
 Vector3d normalizedOrZero(const Vector3d& v) {
   const double norm = v.norm();
   if (norm < 1.0e-9) {
@@ -146,7 +128,7 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
 
   out.v_safe = std::sqrt(
       std::max(
-          2.0 * config.safe_collision_energy_joule /
+          2.0 * config.energy_budget_joule /
               std::max(out.m_eff_n, kSmallPositive),
           0.0));
 
@@ -180,8 +162,8 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     const double segment_start_time_sec = config.wall_time_sec + t_prev;
     const double segment_end_time_sec = config.wall_time_sec + s.t;
 
-    K_exec = applyMatrixRateLimit(K_exec, s.K, config.k_rate_limit, dtp);
-    D_exec = applyMatrixRateLimit(D_exec, s.D, config.d_rate_limit, dtp);
+    K_exec = s.K;
+    D_exec = s.D;
 
     const Matrix3d Kp = K_exec.topLeftCorner<3, 3>();
     const Matrix3d Dp = D_exec.topLeftCorner<3, 3>();
@@ -303,15 +285,9 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   out.worst_case_V_potential_ub = V_n_contact_max;
   out.terminal_energy_ub = terminal_T_ub + terminal_V_ub;
 
-  const double L_TF_eff =
-      std::max(0.0, config.safe_collision_energy_joule -
+  const double energy_budget_eff =
+      std::max(0.0, config.energy_budget_joule -
                         config.energy_budget_margin_joule);
-
-  const double L_QS_eff =
-      std::max(0.0, config.clamping_energy_budget_joule -
-                        config.energy_budget_margin_joule);
-
-  const double L_F_eff = std::min(L_TF_eff, L_QS_eff);
 
   // SARA/PFL-style split: future predicted interaction is verified on the
   // monitored trajectory; actual current interaction is handled by the Cartesian
@@ -321,16 +297,16 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
       out.monitored_contact_possible && !out.contact_relevant_for_energy;
 
   const bool current_collision_energy_unsafe =
-      out.contact_relevant_for_energy && out.Tn_now_tube > L_TF_eff;
+      out.contact_relevant_for_energy && out.Tn_now_tube > energy_budget_eff;
   const bool predicted_collision_energy_unsafe =
       predicted_contact_requires_verification &&
-      out.worst_case_Tn_ub > L_TF_eff;
+      out.worst_case_Tn_ub > energy_budget_eff;
   const bool predicted_clamping_energy_unsafe =
       predicted_contact_requires_verification &&
-      out.worst_case_V_potential_ub > L_QS_eff;
+      out.worst_case_V_potential_ub > energy_budget_eff;
   const bool predicted_terminal_energy_unsafe =
       predicted_contact_requires_verification &&
-      out.terminal_energy_ub > L_F_eff;
+      out.terminal_energy_ub > energy_budget_eff;
 
   out.predicted_trigger =
       predicted_collision_energy_unsafe ||
@@ -341,9 +317,9 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
       std::max(out.worst_case_Tn_ub,
                out.contact_relevant_for_energy ? out.Tn_now_tube : 0.0);
 
-  out.h_monitored_energy = L_TF_eff - monitored_collision_energy_ub;
-  out.h_clamping_energy = L_QS_eff - out.worst_case_V_potential_ub;
-  out.h_terminal_energy = L_F_eff - out.terminal_energy_ub;
+  out.h_monitored_energy = energy_budget_eff - monitored_collision_energy_ub;
+  out.h_clamping_energy = energy_budget_eff - out.worst_case_V_potential_ub;
+  out.h_terminal_energy = energy_budget_eff - out.terminal_energy_ub;
 
   out.collision_energy_unsafe =
       current_collision_energy_unsafe || predicted_collision_energy_unsafe;

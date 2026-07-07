@@ -26,7 +26,6 @@ find_package(mujoco_ros_msgs REQUIRED)
 # CMake 3.22's FindBoost does not map python310 to boost/python.hpp.
 set(_Boost_PYTHON310_HEADERS "boost/python.hpp")
 find_package(pinocchio REQUIRED)
-find_package(visualization_msgs REQUIRED)
 find_package(panda_motion_generator_msgs REQUIRED)
 find_package(cps_human_workspace REQUIRED)
 find_package(cps_safety_monitor REQUIRED)
@@ -64,7 +63,6 @@ ament_target_dependencies(${PROJECT_NAME}
   geometry_msgs
   franka_msgs
   mujoco_ros_msgs
-  visualization_msgs
   panda_motion_generator_msgs
   cps_human_workspace
   cps_safety_monitor
@@ -109,7 +107,6 @@ ament_export_dependencies(
   geometry_msgs
   franka_msgs
   pinocchio
-  visualization_msgs
   panda_motion_generator_msgs
   cps_human_workspace
   cps_safety_monitor

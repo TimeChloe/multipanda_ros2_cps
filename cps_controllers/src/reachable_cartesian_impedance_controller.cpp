@@ -39,11 +39,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/state.hpp>
 
-#include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
-#include <std_msgs/msg/color_rgba.hpp>
-#include <visualization_msgs/msg/marker.hpp>
-#include <visualization_msgs/msg/marker_array.hpp>
 
 #include <cps_controllers/reachable_cartesian_impedance_controller.hpp>
 #include <cps_controllers/reachable_cartesian_math.hpp>
@@ -69,8 +65,6 @@ using Matrix3d = Eigen::Matrix3d;
 using Vector3d = Eigen::Vector3d;
 using Quaterniond = Eigen::Quaterniond;
 using SteadyClock = std::chrono::steady_clock;
-using Marker = visualization_msgs::msg::Marker;
-using MarkerArray = visualization_msgs::msg::MarkerArray;
 using CartesianViaMotionAction =
     panda_motion_generator_msgs::action::CartesianViaMotion;
 using SimpleActionResult = panda_motion_generator_msgs::msg::SimpleActionResult;
@@ -182,18 +176,6 @@ inline std::string sanitizedFileNameOrDefault(
   const std::filesystem::path path(file_name);
   const std::string sanitized = path.filename().string();
   return sanitized.empty() ? default_file_name : sanitized;
-}
-
-inline std_msgs::msg::ColorRGBA makeColor(float r, float g, float b, float a) {
-  std_msgs::msg::ColorRGBA c;
-  c.r = r; c.g = g; c.b = b; c.a = a;
-  return c;
-}
-
-inline geometry_msgs::msg::Point toPoint(const Vector3d& p) {
-  geometry_msgs::msg::Point msg;
-  msg.x = p.x(); msg.y = p.y(); msg.z = p.z();
-  return msg;
 }
 
 inline Vector3d normalizedOrZero(const Vector3d& v) {
@@ -323,26 +305,12 @@ ReachableCartesianImpedanceController::~ReachableCartesianImpedanceController() 
 }
 
 // ============================================================================
-// Helper: matrix rate limit & runtime gain update
+// Helper: runtime gain update
 // ============================================================================
-Matrix6d ReachableCartesianImpedanceController::applyMatrixRateLimit(
-    const Matrix6d& current, const Matrix6d& target,
-    double rate_limit, double dt) const {
-  const double step = std::max(rate_limit, 0.0) * std::max(dt, kMinDt);
-  Matrix6d out = current;
-  for (int i = 0; i < out.rows(); ++i)
-    for (int j = 0; j < out.cols(); ++j) {
-      const double delta = std::clamp(target(i, j) - current(i, j), -step, step);
-      out(i, j) = current(i, j) + delta;
-    }
-  return out;
-}
-
 void ReachableCartesianImpedanceController::updateRuntimeGains(const Matrix6d& K_target,
-                                                               const Matrix6d& D_target,
-                                                               double dt) {
-  K_runtime_ = applyMatrixRateLimit(K_runtime_, K_target, k_rate_limit_, dt);
-  D_runtime_ = applyMatrixRateLimit(D_runtime_, D_target, d_rate_limit_, dt);
+                                                               const Matrix6d& D_target) {
+  K_runtime_ = K_target;
+  D_runtime_ = D_target;
 }
 
 Matrix6d ReachableCartesianImpedanceController::computeDampingFromStiffness(
@@ -500,7 +468,7 @@ bool ReachableCartesianImpedanceController::computeTaskInertia(
   const Matrix7d M_inv = inertia_ldlt.solve(Matrix7d::Identity());
   Matrix6d lambda_inv = J_geo * M_inv * J_geo.transpose();
   lambda_inv = 0.5 * (lambda_inv + lambda_inv.transpose());
-  lambda_inv.diagonal().array() += dynamic_lambda_regularization_;
+  lambda_inv.diagonal().array() += kDynamicLambdaRegularization;
 
   const Eigen::LDLT<Matrix6d> lambda_ldlt(lambda_inv);
   if (lambda_ldlt.info() != Eigen::Success) {
@@ -588,7 +556,7 @@ ImpedanceSample ReachableCartesianImpedanceController::applyCartesianEnergyBudge
   local_info.total_energy =
       local_info.kinetic_energy + local_info.potential_energy;
 
-  const double budget = std::max(0.0, cartesian_energy_budget_joule_);
+  const double budget = std::max(0.0, energy_budget_joule_);
   if (local_info.kinetic_energy > budget) {
     local_info.scale = 0.0;
   } else if (local_info.total_energy <= budget) {
@@ -618,9 +586,7 @@ double ReachableCartesianImpedanceController::computeConservativeNormalAccelPosi
   const double m_safe = std::max(m_eff_n, kSmallPositive);
   const double k_n_up = human_workspace_.normalStiffness(K_used);
   const double a_from_stiffness = (k_n_up * e_n_abs) / m_safe;
-  const double a_from_tau_rate = torque_to_accel_gain_ * tau_rate_limit_ * kMinDt;
-  const double a_from_uncertainty = std::max(model_accel_uncertainty_, 0.0);
-  return std::max(0.0, a_from_stiffness + a_from_tau_rate + a_from_uncertainty);
+  return std::max(0.0, a_from_stiffness);
 }
 
 double ReachableCartesianImpedanceController::computeConservativeNormalBrakeAccelLowerBound(
@@ -628,95 +594,7 @@ double ReachableCartesianImpedanceController::computeConservativeNormalBrakeAcce
   const double m_safe = std::max(m_eff_n, kSmallPositive);
   const double d_n_low = human_workspace_.normalDamping(D_used);
   const double a_from_damping = (d_n_low * v_n_abs) / m_safe;
-  const double a_tau_loss = 0.5 * torque_to_accel_gain_ * tau_rate_limit_ * kMinDt;
-  return std::max(0.0, a_from_damping - a_tau_loss);
-}
-
-// ============================================================================
-// RViz diagnostics
-// ============================================================================
-void ReachableCartesianImpedanceController::publishRvizDiagnostics(
-    double wall_time, const Vector3d& current_position,
-    const Vector3d& desired_position_cur, const Vector6d& ee_twist,
-    const MonitorResult& monitor) {
-  (void)ee_twist;
-  if (!enable_safety_monitor_ || !human_workspace_active_) return;
-  if (!rviz_enable_markers_ || !rviz_marker_pub_) return;
-  ++rviz_publish_counter_;
-  if ((rviz_publish_counter_ % std::max(1, rviz_marker_decimation_)) != 0) return;
-
-  MarkerArray arr;
-  const auto stamp = get_node()->now();
-  const std::string& frame_id = rviz_frame_id_;
-  const Vector3d n = human_workspace_.direction();
-  const Vector3d human_center = human_workspace_.centerAtTime(wall_time);
-  auto setupMarker = [&](Marker& m, int id, const std::string& ns, int type) {
-    m.header.frame_id = frame_id; m.header.stamp = stamp;
-    m.ns = ns; m.id = id; m.type = type; m.action = Marker::ADD;
-    m.lifetime = rclcpp::Duration::from_seconds(rviz_marker_lifetime_sec_);
-  };
-
-  { Marker m; setupMarker(m, 1, "reachable_workspace_direction", Marker::ARROW);
-    m.scale.x = rviz_arrow_shaft_diameter_; m.scale.y = rviz_arrow_head_diameter_; m.scale.z = rviz_arrow_head_length_;
-    m.color = makeColor(0.1f, 0.6f, 1.0f, 0.9f);
-    const Vector3d p0 = human_center;
-    const Vector3d p1 = p0 + rviz_normal_arrow_length_ * n;
-    m.points.push_back(toPoint(p0)); m.points.push_back(toPoint(p1));
-    arr.markers.push_back(m); }
-  { Marker m; setupMarker(m, 2, "reachable_hand_motion_sphere", Marker::SPHERE);
-    m.pose.position = toPoint(human_center); m.pose.orientation.w = 1.0;
-    m.scale.x = m.scale.y = m.scale.z = 2.0 * human_workspace_.motionRadius();
-    m.color = makeColor(1.0f, 0.8f, 0.1f, 0.20f);
-    arr.markers.push_back(m); }
-  { Marker m; setupMarker(m, 3, "reachable_hand_inflated_sphere", Marker::SPHERE);
-    m.pose.position = toPoint(human_center); m.pose.orientation.w = 1.0;
-    const double inflated_radius = human_workspace_.inflatedHandRadius();
-    m.scale.x = m.scale.y = m.scale.z = 2.0 * inflated_radius;
-    m.color = makeColor(1.0f, 0.3f, 0.2f, 0.10f);
-    arr.markers.push_back(m); }
-  { Marker m; setupMarker(m, 4, "reachable_ee_center", Marker::SPHERE);
-    m.pose.position = toPoint(current_position); m.pose.orientation.w = 1.0;
-    m.scale.x = m.scale.y = m.scale.z = 0.03;
-    m.color = makeColor(0.0f, 1.0f, 0.2f, 0.9f);
-    arr.markers.push_back(m); }
-  { Marker m; setupMarker(m, 5, "reachable_ee_radius", Marker::SPHERE);
-    m.pose.position = toPoint(current_position); m.pose.orientation.w = 1.0;
-    const double inflated_r = ee_collision_radius_ + monitor.current_pos_error_radius;
-    m.scale.x = m.scale.y = m.scale.z = 2.0 * inflated_r;
-    m.color = makeColor(0.0f, 1.0f, 0.2f, 0.15f);
-    arr.markers.push_back(m); }
-  { Marker m; setupMarker(m, 6, "reachable_desired", Marker::SPHERE);
-    m.pose.position = toPoint(desired_position_cur); m.pose.orientation.w = 1.0;
-    m.scale.x = m.scale.y = m.scale.z = 0.025;
-    m.color = makeColor(1.0f, 1.0f, 0.0f, 0.85f);
-    arr.markers.push_back(m); }
-  { Marker m; setupMarker(m, 7, "reachable_vn_now", Marker::ARROW);
-    m.scale.x = rviz_arrow_shaft_diameter_; m.scale.y = rviz_arrow_head_diameter_; m.scale.z = rviz_arrow_head_length_;
-    const double vn = monitor.v_n_now;
-    const Vector3d p0 = current_position;
-    const Vector3d p1 = p0 + rviz_velocity_arrow_scale_ * vn * n;
-    m.points.push_back(toPoint(p0)); m.points.push_back(toPoint(p1));
-    m.color = (vn >= 0.0) ? makeColor(1.0f, 0.5f, 0.0f, 0.95f) : makeColor(0.8f, 0.2f, 1.0f, 0.95f);
-    arr.markers.push_back(m); }
-  { Marker m; setupMarker(m, 8, "reachable_vn_ub", Marker::ARROW);
-    m.scale.x = rviz_arrow_shaft_diameter_; m.scale.y = rviz_arrow_head_diameter_; m.scale.z = rviz_arrow_head_length_;
-    m.color = makeColor(1.0f, 0.0f, 0.0f, 0.95f);
-    const Vector3d p0 = current_position + Vector3d(0.0, 0.0, rviz_ub_arrow_z_offset_);
-    const Vector3d p1 = p0 + rviz_velocity_arrow_scale_ * monitor.worst_case_v_n_ub * n;
-    m.points.push_back(toPoint(p0)); m.points.push_back(toPoint(p1));
-    arr.markers.push_back(m); }
-  { Marker m; setupMarker(m, 9, "reachable_nominal_contact", Marker::SPHERE);
-    if (monitor.nominal_contact_sample_found) {
-      m.pose.position = toPoint(monitor.nominal_contact_point_world); m.pose.orientation.w = 1.0;
-      m.scale.x = m.scale.y = m.scale.z = 0.035;
-      m.color = makeColor(1.0f, 0.0f, 1.0f, 0.95f);
-      arr.markers.push_back(m);
-    } else { m.action = Marker::DELETE; arr.markers.push_back(m); } }
-  { Marker m; setupMarker(m, 10, "reachable_status_text", Marker::TEXT_VIEW_FACING);
-    m.action = Marker::DELETE;
-    arr.markers.push_back(m); }
-
-  rviz_marker_pub_->publish(arr);
+  return std::max(0.0, a_from_damping);
 }
 
 // ============================================================================
@@ -1135,10 +1013,7 @@ SafetyMonitorConfig ReachableCartesianImpedanceController::makeSafetyMonitorConf
   config.K_runtime = K_runtime;
   config.D_runtime = D_runtime;
   config.wall_time_sec = wall_time;
-  config.k_rate_limit = k_rate_limit_;
-  config.d_rate_limit = d_rate_limit_;
-  config.safe_collision_energy_joule = safe_collision_energy_joule_;
-  config.clamping_energy_budget_joule = clamping_energy_budget_joule_;
+  config.energy_budget_joule = energy_budget_joule_;
   config.energy_budget_margin_joule = energy_budget_margin_joule_;
   config.ee_collision_radius = ee_collision_radius_;
   config.contact_activation_margin = contact_activation_margin_;
@@ -2237,12 +2112,14 @@ void ReachableCartesianImpedanceController::handleCartesianViaPoints(
   }
 
   const std::string& frame_id = msg->header.frame_id;
-  if (!frame_id.empty() && frame_id != rviz_frame_id_) {
+  const std::string robot_base_frame_id =
+      arm_id_.empty() ? "panda_link0" : arm_id_ + "_link0";
+  if (!frame_id.empty() && frame_id != robot_base_frame_id) {
     RCLCPP_WARN(
         get_node()->get_logger(),
         "Received cartesian_via_points in frame '%s'. Interpreting poses as robot base frame '%s'.",
         frame_id.c_str(),
-        rviz_frame_id_.c_str());
+        robot_base_frame_id.c_str());
   }
 
   std::vector<Vector3d> points;
@@ -2478,8 +2355,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
                         double dtp) {
     const double segment_start_time_sec = wall_time + t_prev;
     const double segment_end_time_sec = wall_time + collision_sample.t;
-    K_exec = applyMatrixRateLimit(K_exec, collision_sample.K, k_rate_limit_, dtp);
-    D_exec = applyMatrixRateLimit(D_exec, collision_sample.D, d_rate_limit_, dtp);
+    K_exec = collision_sample.K;
+    D_exec = collision_sample.D;
 
     const Matrix3d Kp = K_exec.topLeftCorner<3, 3>();
     const Matrix3d Dp = D_exec.topLeftCorner<3, 3>();
@@ -2729,7 +2606,7 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
     const Quaterniond& current_orientation,
     const ImpedanceSample& cmd,
     double dt) {
-  updateRuntimeGains(cmd.K, cmd.D, dt);
+  updateRuntimeGains(cmd.K, cmd.D);
 
   const Vector6d xdot = J_geo * dq;
 
@@ -2756,13 +2633,13 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
     Vector6d Jdot_dq_raw = Jdot * dq;
 
     const double raw_norm = Jdot_dq_raw.norm();
-    if (jdot_dq_max_norm_ > 0.0 && raw_norm > jdot_dq_max_norm_) {
-      Jdot_dq_raw *= jdot_dq_max_norm_ / std::max(raw_norm, kSmallPositive);
+    if (kJdotDqMaxNorm > 0.0 && raw_norm > kJdotDqMaxNorm) {
+      Jdot_dq_raw *= kJdotDqMaxNorm / std::max(raw_norm, kSmallPositive);
     }
 
     Jdot_dq_filtered_ =
-        jdot_dq_filter_alpha_ * Jdot_dq_raw +
-        (1.0 - jdot_dq_filter_alpha_) * Jdot_dq_filtered_;
+        kJdotDqFilterAlpha * Jdot_dq_raw +
+        (1.0 - kJdotDqFilterAlpha) * Jdot_dq_filtered_;
 
     Jdot_dq = Jdot_dq_filtered_;
   }
@@ -2784,7 +2661,7 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
 
       Matrix6d lambda_inv = J_geo * M_inv * J_geo.transpose();
       lambda_inv = 0.5 * (lambda_inv + lambda_inv.transpose());
-      lambda_inv.diagonal().array() += dynamic_lambda_regularization_;
+      lambda_inv.diagonal().array() += kDynamicLambdaRegularization;
 
       const Eigen::LDLT<Matrix6d> lambda_ldlt(lambda_inv);
 
@@ -2844,7 +2721,7 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
 
   const Vector7d tau_des = tau_task + coriolis + tau_nullspace_eff;
 
-  const double max_delta = torque_rate_limit_ * std::max(dt, kMinDt);
+  const double max_delta = panda_limits::kTorqueRateLimit * std::max(dt, kMinDt);
   torque_rate_limited_last_ = false;
   torque_rate_max_desired_delta_nm_last_ = 0.0;
   torque_rate_limit_delta_nm_last_ = max_delta;
@@ -3421,7 +3298,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
   for (int i = 0; i < kNumJoints; ++i) command_interfaces_[i].set_value(tau_cmd(i));
 
-  publishRvizDiagnostics(wall_time, collision_center, desired_position_cur, ee_collision_twist, monitor);
   updateCartesianViaPointsActionStatus(
       current_position,
       current_orientation,
@@ -3513,7 +3389,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << last_cartesian_kinetic_energy_ << ","
         << last_cartesian_potential_energy_ << ","
         << last_cartesian_control_energy_ << ","
-        << cartesian_energy_budget_joule_ << ","
+        << energy_budget_joule_ << ","
         << latest_mujoco_contact_value_.load(std::memory_order_relaxed) << ","
         << static_cast<int>(latest_mujoco_contact_active_.load(std::memory_order_relaxed)) << ","
         << mujoco_contact_msg_time << ","
@@ -3634,10 +3510,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<bool>("disable_nullspace_in_failsafe", true);
     auto_declare<bool>("enable_safety_monitor", true);
 
-    auto_declare<double>("safe_collision_energy_joule", 0.05);
-    auto_declare<double>("clamping_energy_budget_joule", 0.05);
+    auto_declare<double>("energy_budget_joule", 0.05);
     auto_declare<double>("energy_budget_margin_joule", 0.005);
-    auto_declare<double>("cartesian_energy_budget_joule", 0.05);
     auto_declare<double>("cartesian_energy_min_pos_stiffness", 0.0);
     auto_declare<double>("cartesian_energy_lambda_update_period_sec", 0.004);
     auto_declare<double>("contact_activation_margin", 0.0);
@@ -3653,34 +3527,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<std::string>("human_workspace_topic", "human_workspace/state");
     auto_declare<double>("human_workspace_timeout_sec", 0.5);
 
-    auto_declare<double>("k_rate_limit", 5000.0);
-    auto_declare<double>("d_rate_limit", 500.0);
-    auto_declare<double>("tau_rate_limit", 1000.0);
-    auto_declare<double>("torque_to_accel_gain", 8.0);
-    auto_declare<double>("model_accel_uncertainty", 0.05);
-    auto_declare<double>("stiffness_error_bound_m", 0.01);
-
     auto_declare<double>("tracking_pos_error_bound", 0.005);
     auto_declare<double>("tracking_vel_error_bound", 0.05);
 
     auto_declare<bool>("use_dynamic_consistent_impedance", true);
-    auto_declare<double>("torque_rate_limit", 1000.0);
-
-    // Added for corrected dynamic-consistent branch.
-    auto_declare<double>("dynamic_lambda_regularization", 1.0e-6);
-    auto_declare<double>("jdot_dq_filter_alpha", 0.15);
-    auto_declare<double>("jdot_dq_max_norm", 5.0);
-
-    auto_declare<bool>("rviz_enable_markers", true);
-    auto_declare<std::string>("rviz_frame_id", "panda_link0");
-    auto_declare<int>("rviz_marker_decimation", 10);
-    auto_declare<double>("rviz_marker_lifetime_sec", 0.2);
-    auto_declare<double>("rviz_normal_arrow_length", 0.20);
-    auto_declare<double>("rviz_velocity_arrow_scale", 0.25);
-    auto_declare<double>("rviz_arrow_shaft_diameter", 0.01);
-    auto_declare<double>("rviz_arrow_head_diameter", 0.02);
-    auto_declare<double>("rviz_arrow_head_length", 0.03);
-    auto_declare<double>("rviz_ub_arrow_z_offset", 0.05);
 
     auto_declare<int>("profiling_stats_print_period", 1000);
     auto_declare<bool>("enable_mujoco_contact_logging", true);
@@ -3878,14 +3728,11 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     disable_nullspace_in_failsafe_ = get_node()->get_parameter("disable_nullspace_in_failsafe").as_bool();
     enable_safety_monitor_ = get_node()->get_parameter("enable_safety_monitor").as_bool();
 
-    safe_collision_energy_joule_ = get_node()->get_parameter("safe_collision_energy_joule").as_double();
-    clamping_energy_budget_joule_ =
-        std::max(0.0, get_node()->get_parameter("clamping_energy_budget_joule").as_double());
+    energy_budget_joule_ =
+        std::max(0.0, get_node()->get_parameter("energy_budget_joule").as_double());
 
     energy_budget_margin_joule_ =
         std::max(0.0, get_node()->get_parameter("energy_budget_margin_joule").as_double());
-    cartesian_energy_budget_joule_ =
-        std::max(0.0, get_node()->get_parameter("cartesian_energy_budget_joule").as_double());
     cartesian_energy_min_pos_stiffness_ =
         std::max(0.0, get_node()->get_parameter("cartesian_energy_min_pos_stiffness").as_double());
     cartesian_energy_lambda_update_period_sec_ =
@@ -3920,13 +3767,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     async_safety_monitor_ = get_node()->get_parameter("async_safety_monitor").as_bool();
     async_plan_max_age_sec_ =
         std::max(0.0, get_node()->get_parameter("async_plan_max_age_sec").as_double());
-
-    k_rate_limit_ = std::max(0.0, get_node()->get_parameter("k_rate_limit").as_double());
-    d_rate_limit_ = std::max(0.0, get_node()->get_parameter("d_rate_limit").as_double());
-    tau_rate_limit_ = get_node()->get_parameter("tau_rate_limit").as_double();
-    torque_to_accel_gain_ = get_node()->get_parameter("torque_to_accel_gain").as_double();
-    model_accel_uncertainty_ = get_node()->get_parameter("model_accel_uncertainty").as_double();
-    stiffness_error_bound_m_ = get_node()->get_parameter("stiffness_error_bound_m").as_double();
 
     tracking_pos_error_bound_ = std::max(0.0, get_node()->get_parameter("tracking_pos_error_bound").as_double());
     tracking_vel_error_bound_ = std::max(0.0, get_node()->get_parameter("tracking_vel_error_bound").as_double());
@@ -3987,29 +3827,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         std::max(1e-4, trajectory_settings.failsafe_brake_max_angular_jerk);
 
     use_dynamic_consistent_impedance_ = get_node()->get_parameter("use_dynamic_consistent_impedance").as_bool();
-    torque_rate_limit_ = get_node()->get_parameter("torque_rate_limit").as_double();
-
-    dynamic_lambda_regularization_ = std::max(
-        1.0e-10,
-        get_node()->get_parameter("dynamic_lambda_regularization").as_double());
-    jdot_dq_filter_alpha_ = std::clamp(
-        get_node()->get_parameter("jdot_dq_filter_alpha").as_double(),
-        0.0,
-        1.0);
-    jdot_dq_max_norm_ = std::max(
-        0.0,
-        get_node()->get_parameter("jdot_dq_max_norm").as_double());
-
-    rviz_enable_markers_ = get_node()->get_parameter("rviz_enable_markers").as_bool();
-    rviz_frame_id_ = get_node()->get_parameter("rviz_frame_id").as_string();
-    rviz_marker_decimation_ = std::max(1, static_cast<int>(get_node()->get_parameter("rviz_marker_decimation").as_int()));
-    rviz_marker_lifetime_sec_ = get_node()->get_parameter("rviz_marker_lifetime_sec").as_double();
-    rviz_normal_arrow_length_ = get_node()->get_parameter("rviz_normal_arrow_length").as_double();
-    rviz_velocity_arrow_scale_ = get_node()->get_parameter("rviz_velocity_arrow_scale").as_double();
-    rviz_arrow_shaft_diameter_ = get_node()->get_parameter("rviz_arrow_shaft_diameter").as_double();
-    rviz_arrow_head_diameter_ = get_node()->get_parameter("rviz_arrow_head_diameter").as_double();
-    rviz_arrow_head_length_ = get_node()->get_parameter("rviz_arrow_head_length").as_double();
-    rviz_ub_arrow_z_offset_ = get_node()->get_parameter("rviz_ub_arrow_z_offset").as_double();
 
     human_workspace_topic_ =
         get_node()->get_parameter("human_workspace_topic").as_string();
@@ -4148,9 +3965,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     franka_robot_model_ = std::make_unique<franka_semantic_components::FrankaRobotModel>(
         franka_semantic_components::FrankaRobotModel(arm_id_ + "/robot_model", arm_id_));
 
-    if (rviz_enable_markers_)
-      rviz_marker_pub_ = get_node()->create_publisher<MarkerArray>("reachable_impedance/markers", 10);
-
   } catch (const std::exception& e) {
     RCLCPP_ERROR(get_node()->get_logger(), "Exception in on_configure: %s", e.what());
     return CallbackReturn::ERROR;
@@ -4277,8 +4091,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   cartesian_effective_time_hold_sample_ = ImpedanceSample{};
   cartesian_effective_time_hold_sample_valid_ = false;
 
-  rviz_publish_counter_ = 0;
-
   last_verified_plan_ = VerifiedPlan{};
   last_verified_command_stage_ = 0;
   last_verified_command_index_ = 0;
@@ -4369,8 +4181,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "failsafe_plan_dt: "
                     << std::max(shield_plan_dt_, local_replan_dt_) << "\n"
                     << "failsafe_command_dt: " << local_replan_dt_ << "\n"
-                    << "cartesian_energy_budget_joule: "
-                    << cartesian_energy_budget_joule_ << "\n"
+                    << "energy_budget_joule: "
+                    << energy_budget_joule_ << "\n"
                     << "cartesian_energy_min_pos_stiffness: "
                     << cartesian_energy_min_pos_stiffness_ << "\n"
                     << "cartesian_energy_lambda_update_period_sec: "
@@ -4477,7 +4289,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "cartesian_energy_lambda_valid,"
         << "cartesian_energy_scale,cartesian_kinetic_energy,"
         << "cartesian_potential_energy,cartesian_control_energy,"
-        << "cartesian_energy_budget_joule,"
+        << "energy_budget_joule,"
         << "mujoco_contact_value,mujoco_contact_active,mujoco_contact_msg_time_sec,"
         << "mujoco_contact_sample_seq,mujoco_contact_new_sample,"
         << "mujoco_contact_samples_since_last_log,mujoco_contact_sample_age_sec,"

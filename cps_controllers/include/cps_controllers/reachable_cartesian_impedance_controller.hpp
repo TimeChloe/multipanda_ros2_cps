@@ -22,12 +22,12 @@
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp>
 #include <realtime_tools/realtime_buffer.hpp>
-#include <visualization_msgs/msg/marker_array.hpp>
 
 #include "cps_human_workspace/human_workspace.hpp"
 #include "cps_human_workspace/msg/human_workspace.hpp"
 #include "cps_safety_monitor/reachable_safety_monitor.hpp"
 #include "cps_trajectory_generators/reachable_cartesian_trajectory.hpp"
+#include "cps_controllers/panda_control_limits.hpp"
 #include "franka_semantic_components/franka_robot_model.hpp"
 
 using CallbackReturn =
@@ -106,15 +106,12 @@ class ReachableCartesianImpedanceController
 
  private:
   static constexpr int kNumJoints = 7;
-
-  Matrix6d applyMatrixRateLimit(const Matrix6d& current,
-                                const Matrix6d& target,
-                                double rate_limit,
-                                double dt) const;
+  static constexpr double kDynamicLambdaRegularization = 1.0e-6;
+  static constexpr double kJdotDqFilterAlpha = 0.15;
+  static constexpr double kJdotDqMaxNorm = 5.0;
 
   void updateRuntimeGains(const Matrix6d& K_target,
-                          const Matrix6d& D_target,
-                          double dt);
+                          const Matrix6d& D_target);
 
   double computeConservativeNormalAccelPositiveBound(
       double m_eff_n,
@@ -126,12 +123,6 @@ class ReachableCartesianImpedanceController
       double m_eff_n,
       double v_n_abs,
       const Matrix6d& D_used) const;
-
-  void publishRvizDiagnostics(double wall_time,
-                              const Vector3d& current_position,
-                              const Vector3d& desired_position_cur,
-                              const Vector6d& ee_twist,
-                              const MonitorResult& monitor);
 
   void handleHumanWorkspaceState(
       const cps_human_workspace::msg::HumanWorkspace::SharedPtr msg);
@@ -474,7 +465,7 @@ class ReachableCartesianImpedanceController
 
   bool enable_safety_monitor_{true};
 
-  double safe_collision_energy_joule_{0.05};
+  double energy_budget_joule_{0.05};
   double ee_collision_radius_{0.04};
   Vector3d tcp_offset_{Vector3d::Zero()};
   Vector3d ee_collision_center_offset_{Vector3d::Zero()};
@@ -493,13 +484,6 @@ class ReachableCartesianImpedanceController
   bool human_workspace_configured_static_{false};
   std::atomic_bool human_workspace_live_received_{false};
   std::atomic<double> latest_human_workspace_msg_time_sec_{-1.0};
-
-  double k_rate_limit_{5000.0};
-  double d_rate_limit_{500.0};
-  double tau_rate_limit_{1000.0};
-  double torque_to_accel_gain_{8.0};
-  double model_accel_uncertainty_{0.05};
-  double stiffness_error_bound_m_{0.00};
 
   // 替换了旧的 error_pos_gain_alpha_ 等常数，改用固定的误差管道边界
   double tracking_pos_error_bound_{0.000};
@@ -533,16 +517,12 @@ class ReachableCartesianImpedanceController
   std::string trajectory_generator_config_path_;
 
   bool use_dynamic_consistent_impedance_{true};
-  double torque_rate_limit_{1000.0};
   bool torque_rate_limited_last_{false};
   double torque_rate_max_desired_delta_nm_last_{0.0};
   double torque_rate_limit_delta_nm_last_{0.0};
   double torque_rate_max_excess_nm_last_{0.0};
   double torque_rate_max_ratio_last_{0.0};
   double torque_rate_max_cmd_delta_nm_last_{0.0};
-  double dynamic_lambda_regularization_{1.0e-6};
-  double jdot_dq_filter_alpha_{0.15};
-  double jdot_dq_max_norm_{5.0};
   Matrix67d J_geo_prev_{Matrix67d::Zero()};
   Vector6d Jdot_dq_filtered_{Vector6d::Zero()};
   bool J_geo_prev_valid_{false};
@@ -586,24 +566,6 @@ class ReachableCartesianImpedanceController
 
   Vector7d tau_cmd_prev_{Vector7d::Zero()};
 
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr rviz_marker_pub_;
-
-  bool rviz_enable_markers_{true};
-  std::string rviz_frame_id_{"panda_link0"};
-  int rviz_marker_decimation_{10};
-  std::size_t rviz_publish_counter_{0};
-
-  double rviz_marker_lifetime_sec_{0.2};
-
-  double rviz_normal_arrow_length_{0.20};
-  double rviz_velocity_arrow_scale_{0.25};
-
-  double rviz_arrow_shaft_diameter_{0.01};
-  double rviz_arrow_head_diameter_{0.02};
-  double rviz_arrow_head_length_{0.03};
-
-  double rviz_ub_arrow_z_offset_{0.05};
-
   int profiling_stats_print_period_{1000};
 
   bool enable_mujoco_contact_logging_{true};
@@ -635,9 +597,7 @@ class ReachableCartesianImpedanceController
   double prof_io_sum_ms_{0.0};
   double prof_io_max_ms_{0.0};
 
-  double clamping_energy_budget_joule_{0.05};
   double energy_budget_margin_joule_{0.005};
-  double cartesian_energy_budget_joule_{0.05};
   double cartesian_energy_min_pos_stiffness_{0.0};
   double cartesian_energy_lambda_update_period_sec_{0.004};
   Matrix6d cartesian_energy_lambda_cache_{};

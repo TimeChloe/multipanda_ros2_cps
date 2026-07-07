@@ -22,7 +22,6 @@
   <depend>franka_msgs</depend>
   <depend>mujoco_ros_msgs</depend>
   <depend>pinocchio</depend>
-  <depend>visualization_msgs</depend>
   <depend>panda_motion_generator_msgs</depend>
   <depend>cps_human_workspace</depend>
   <depend>cps_safety_monitor</depend>

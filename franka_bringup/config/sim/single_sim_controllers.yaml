@@ -92,8 +92,7 @@ cartesian_impedance_example_controller:
     friction_viscous: [0.04, 0.04, 0.03, 0.02, 0.02, 0.01, 0.01]
     friction_velocity_scale: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
     friction_offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    profiling_stats_print_period: 1000
-  
+
 multi_mode_controller:
   ros__parameters:
     arm_count: 1
@@ -134,8 +133,6 @@ nonlinear_impedance_controller:
     friction_viscous: [0.04, 0.04, 0.03, 0.02, 0.02, 0.01, 0.01]
     friction_velocity_scale: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
     friction_offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    profiling_stats_print_period: 1000
-
 
 free_motion_external_wrench_controller:
   ros__parameters:
@@ -232,10 +229,8 @@ reachable_cartesian_impedance_controller:
 
     enable_safety_monitor: true
 
-    safe_collision_energy_joule: 0.12
-    clamping_energy_budget_joule: 0.12
+    energy_budget_joule: 0.12
     energy_budget_margin_joule: 0.000
-    cartesian_energy_budget_joule: 0.12
     cartesian_energy_min_pos_stiffness: 200.0
     cartesian_energy_lambda_update_period_sec: 0.004
     contact_activation_margin: 0.00
@@ -255,35 +250,8 @@ reachable_cartesian_impedance_controller:
     mujoco_contact_sensor_topic: /panda_metal_ball_touch
     mujoco_contact_threshold: 1.0e-6
 
-    k_rate_limit: 1000000.0
-    d_rate_limit: 100000.0
-
-    # torque-rate / conservative monitor fallback terms
-    tau_rate_limit: 1000.0
-    torque_to_accel_gain: 8.0
-    model_accel_uncertainty: 0.00
-    stiffness_error_bound_m: 0.00
-
     # 误差管道 tracking error tube 边界
     tracking_pos_error_bound: 0.000
     tracking_vel_error_bound: 0.0
 
     use_dynamic_consistent_impedance: true
-    torque_rate_limit: 1000.0
-
-    dynamic_lambda_regularization: 1.0e-6
-    jdot_dq_filter_alpha: 0.15
-    jdot_dq_max_norm: 5.0
-
-    rviz_enable_markers: false
-    rviz_frame_id: panda_link0
-    rviz_marker_decimation: 10
-    rviz_marker_lifetime_sec: 0.2
-    rviz_normal_arrow_length: 0.20
-    rviz_velocity_arrow_scale: 0.25
-    rviz_arrow_shaft_diameter: 0.01
-    rviz_arrow_head_diameter: 0.02
-    rviz_arrow_head_length: 0.03
-    rviz_ub_arrow_z_offset: 0.05
-
-    profiling_stats_print_period: 1000

@@ -113,10 +113,7 @@ struct SafetyMonitorConfig {
   Matrix6d D_runtime{Matrix6d::Zero()};
 
   double wall_time_sec{0.0};
-  double k_rate_limit{5000.0};
-  double d_rate_limit{500.0};
-  double safe_collision_energy_joule{0.05};
-  double clamping_energy_budget_joule{0.05};
+  double energy_budget_joule{0.05};
   double energy_budget_margin_joule{0.005};
   double ee_collision_radius{0.04};
   double contact_activation_margin{0.0};
