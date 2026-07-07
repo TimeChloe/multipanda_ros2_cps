@@ -391,6 +391,7 @@ class ReachableCartesianImpedanceController
 
   ImpedanceSample makeEffectiveTimeHoldSample(
       const ImpedanceSample& command) const;
+  double cartesianEnergyScaleFloor(const Matrix6d& K_reference) const;
 
   ImpedanceSample applyCartesianEnergyBudget(
       const ImpedanceSample& command,
@@ -637,6 +638,7 @@ class ReachableCartesianImpedanceController
   double clamping_energy_budget_joule_{0.05};
   double energy_budget_margin_joule_{0.005};
   double cartesian_energy_budget_joule_{0.05};
+  double cartesian_energy_min_pos_stiffness_{0.0};
   double cartesian_energy_lambda_update_period_sec_{0.004};
   Matrix6d cartesian_energy_lambda_cache_{};
   bool cartesian_energy_lambda_cache_valid_{false};

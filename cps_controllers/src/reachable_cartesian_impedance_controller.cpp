@@ -515,12 +515,47 @@ bool ReachableCartesianImpedanceController::computeTaskInertia(
 ImpedanceSample ReachableCartesianImpedanceController::makeEffectiveTimeHoldSample(
     const ImpedanceSample& command) const {
   ImpedanceSample hold = command;
+  const double min_pos_stiffness =
+      std::max(0.0, cartesian_energy_min_pos_stiffness_);
+  if (min_pos_stiffness > kSmallPositive) {
+    bool below_floor = false;
+    for (int i = 0; i < 3; ++i) {
+      const double nominal_floor =
+          K_nominal_(i, i) > kSmallPositive
+              ? std::min(min_pos_stiffness, K_nominal_(i, i))
+              : min_pos_stiffness;
+      below_floor = below_floor || hold.K(i, i) < nominal_floor;
+    }
+    if (below_floor) {
+      hold.K = K_nominal_;
+      hold.D = D_nominal_;
+    }
+  }
   hold.dp.setZero();
   hold.ddp.setZero();
   hold.w.setZero();
   hold.dw.setZero();
   hold.failsafe = false;
   return hold;
+}
+
+double ReachableCartesianImpedanceController::cartesianEnergyScaleFloor(
+    const Matrix6d& K_reference) const {
+  const double min_pos_stiffness =
+      std::max(0.0, cartesian_energy_min_pos_stiffness_);
+  if (min_pos_stiffness <= kSmallPositive) {
+    return 0.0;
+  }
+
+  double scale_floor = 0.0;
+  for (int i = 0; i < 3; ++i) {
+    const double k_ref = K_reference(i, i);
+    if (k_ref > kSmallPositive) {
+      const double bounded_floor = std::min(min_pos_stiffness, k_ref);
+      scale_floor = std::max(scale_floor, bounded_floor / k_ref);
+    }
+  }
+  return clamp01(scale_floor);
 }
 
 ImpedanceSample ReachableCartesianImpedanceController::applyCartesianEnergyBudget(
@@ -565,6 +600,8 @@ ImpedanceSample ReachableCartesianImpedanceController::applyCartesianEnergyBudge
   } else {
     local_info.scale = 0.0;
   }
+  local_info.scale =
+      std::max(local_info.scale, cartesianEnergyScaleFloor(command.K));
 
   scaled_command.K = local_info.scale * command.K;
   scaled_command.D = std::sqrt(local_info.scale) * command.D;
@@ -3601,6 +3638,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("clamping_energy_budget_joule", 0.05);
     auto_declare<double>("energy_budget_margin_joule", 0.005);
     auto_declare<double>("cartesian_energy_budget_joule", 0.05);
+    auto_declare<double>("cartesian_energy_min_pos_stiffness", 0.0);
     auto_declare<double>("cartesian_energy_lambda_update_period_sec", 0.004);
     auto_declare<double>("contact_activation_margin", 0.0);
     auto_declare<double>("ee_collision_radius", 0.04);
@@ -3848,6 +3886,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         std::max(0.0, get_node()->get_parameter("energy_budget_margin_joule").as_double());
     cartesian_energy_budget_joule_ =
         std::max(0.0, get_node()->get_parameter("cartesian_energy_budget_joule").as_double());
+    cartesian_energy_min_pos_stiffness_ =
+        std::max(0.0, get_node()->get_parameter("cartesian_energy_min_pos_stiffness").as_double());
     cartesian_energy_lambda_update_period_sec_ =
         std::max(0.0, get_node()->get_parameter("cartesian_energy_lambda_update_period_sec").as_double());
     contact_activation_margin_ =
@@ -4331,6 +4371,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "failsafe_command_dt: " << local_replan_dt_ << "\n"
                     << "cartesian_energy_budget_joule: "
                     << cartesian_energy_budget_joule_ << "\n"
+                    << "cartesian_energy_min_pos_stiffness: "
+                    << cartesian_energy_min_pos_stiffness_ << "\n"
                     << "cartesian_energy_lambda_update_period_sec: "
                     << cartesian_energy_lambda_update_period_sec_ << "\n"
                     << "cartesian_effective_time_freeze_enabled: 1\n"

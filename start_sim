@@ -12,7 +12,10 @@ ros2 launch cps_human_workspace human_workspace.launch.py \
   human_workspace_config_path:=/path/to/your_workspace.yaml
   
  
- 
+ ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian_via_points \
+  panda_motion_generator_msgs/action/CartesianViaMotion \
+  "$(cat src/cps_trajectory_generators/config/examples/reachable_via_points_static_down_collision_action_goal)"
+
  
  
  
