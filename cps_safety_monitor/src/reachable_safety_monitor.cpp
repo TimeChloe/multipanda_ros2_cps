@@ -19,16 +19,17 @@ Vector3d normalizedOrZero(const Vector3d& v) {
   return v / norm;
 }
 
-Vector3d fallbackDirection(const Vector3d& x_pred,
-                           const Vector3d& v_pred,
+Vector3d fallbackDirection(const Vector3d& point,
+                           const Vector3d& velocity,
                            const cps_human_workspace::HumanWorkspace& human_workspace,
                            double time_sec) {
-  Vector3d direction = normalizedOrZero(v_pred);
+  Vector3d direction =
+      normalizedOrZero(point - human_workspace.centerAtTime(time_sec));
   if (direction.squaredNorm() > 0.0) {
     return direction;
   }
 
-  direction = normalizedOrZero(human_workspace.centerAtTime(time_sec) - x_pred);
+  direction = normalizedOrZero(velocity);
   if (direction.squaredNorm() > 0.0) {
     return direction;
   }
@@ -36,54 +37,19 @@ Vector3d fallbackDirection(const Vector3d& x_pred,
   return human_workspace.direction();
 }
 
-Vector3d commandDirection(const ImpedanceSample& s,
-                          const Vector3d& previous_command_position,
-                          const Vector3d& x_pred,
-                          const Vector3d& v_pred,
-                          const cps_human_workspace::HumanWorkspace& human_workspace,
-                          double time_sec) {
-  Vector3d direction = normalizedOrZero(s.dp);
+Vector3d contactNormalDirection(
+    const Vector3d& robot_point,
+    const Vector3d& human_center,
+    const Vector3d& fallback_point,
+    const Vector3d& fallback_velocity,
+    const cps_human_workspace::HumanWorkspace& human_workspace,
+    double time_sec) {
+  Vector3d direction = normalizedOrZero(robot_point - human_center);
   if (direction.squaredNorm() > 0.0) {
     return direction;
   }
-
-  direction = normalizedOrZero(s.p - previous_command_position);
-  if (direction.squaredNorm() > 0.0) {
-    return direction;
-  }
-
-  direction = normalizedOrZero(s.p - x_pred);
-  if (direction.squaredNorm() > 0.0) {
-    return direction;
-  }
-
-  return fallbackDirection(x_pred, v_pred, human_workspace, time_sec);
-}
-
-Vector3d initialCommandDirection(const VerifiedPlan& plan,
-                                 const Vector3d& current_position,
-                                 const Vector3d& current_velocity,
-                                 const cps_human_workspace::HumanWorkspace& human_workspace,
-                                 double time_sec) {
-  if (!plan.intended.empty()) {
-    const double sample_time_sec = time_sec + plan.intended.front().t;
-    return commandDirection(plan.intended.front(),
-                            plan.anchor.p,
-                            current_position,
-                            current_velocity,
-                            human_workspace,
-                            sample_time_sec);
-  }
-  if (!plan.failsafe.empty()) {
-    const double sample_time_sec = time_sec + plan.failsafe.front().t;
-    return commandDirection(plan.failsafe.front(),
-                            plan.anchor.p,
-                            current_position,
-                            current_velocity,
-                            human_workspace,
-                            sample_time_sec);
-  }
-  return fallbackDirection(current_position, current_velocity, human_workspace, time_sec);
+  return fallbackDirection(
+      fallback_point, fallback_velocity, human_workspace, time_sec);
 }
 
 }  // namespace
@@ -103,8 +69,9 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   task_inertia_inv.diagonal().array() += kLambdaReg;
 
   const Vector3d direction_now =
-      initialCommandDirection(
-          plan,
+      contactNormalDirection(
+          current_position,
+          config.human_workspace.centerAtTime(config.wall_time_sec),
           current_position,
           v_pred,
           config.human_workspace,
@@ -154,8 +121,6 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   double terminal_T_ub = 0.0;
   double terminal_V_ub = 0.0;
   bool terminal_sample_found = false;
-  Vector3d previous_command_position = plan.anchor.p;
-
   double t_prev = plan.anchor.t;
 
   auto eval_sample = [&](const ImpedanceSample& s, double dtp) {
@@ -191,6 +156,7 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
             segment_start_time_sec);
 
     Vector3d closest_predicted_point = Vector3d::Zero();
+    Vector3d closest_human_center = Vector3d::Zero();
     const double d_segment =
         config.human_workspace.signedDistanceSegmentToInflatedSphere(
             x_pred,
@@ -198,16 +164,17 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
             inflated_contact_radius,
             segment_start_time_sec,
             segment_end_time_sec,
-            &closest_predicted_point);
+            &closest_predicted_point,
+            &closest_human_center);
 
     out.workspace_distance_min = std::min(out.workspace_distance_min, d_segment);
 
     const Vector3d direction =
-        commandDirection(
-            s,
-            previous_command_position,
-            x_pred,
-            v_pred,
+        contactNormalDirection(
+            closest_predicted_point,
+            closest_human_center,
+            x_next,
+            v_next,
             config.human_workspace,
             segment_end_time_sec);
     const double denom = (direction.transpose() * task_inertia_inv * direction)(0, 0);
@@ -259,7 +226,6 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
 
     x_pred = x_next;
     v_pred = v_next;
-    previous_command_position = s.p;
   };
 
   for (const auto& s : plan.intended) {

@@ -254,16 +254,17 @@ inline cps_safety_monitor::ImpedanceSample interpolateImpedanceSample(
 }
 
 inline Vector3d fallbackMonitorDirection(
-    const Vector3d& x_pred,
-    const Vector3d& v_pred,
+    const Vector3d& point,
+    const Vector3d& velocity,
     const cps_human_workspace::HumanWorkspace& human_workspace,
     double time_sec) {
-  Vector3d direction = normalizedOrZero(v_pred);
+  Vector3d direction =
+      normalizedOrZero(point - human_workspace.centerAtTime(time_sec));
   if (direction.squaredNorm() > 0.0) {
     return direction;
   }
 
-  direction = normalizedOrZero(human_workspace.centerAtTime(time_sec) - x_pred);
+  direction = normalizedOrZero(velocity);
   if (direction.squaredNorm() > 0.0) {
     return direction;
   }
@@ -271,29 +272,20 @@ inline Vector3d fallbackMonitorDirection(
   return human_workspace.direction();
 }
 
-inline Vector3d commandMonitorDirection(
-    const cps_safety_monitor::ImpedanceSample& sample,
-    const Vector3d& previous_command_position,
-    const Vector3d& x_pred,
-    const Vector3d& v_pred,
+inline Vector3d contactNormalMonitorDirection(
+    const Vector3d& robot_point,
+    const Vector3d& human_center,
+    const Vector3d& fallback_point,
+    const Vector3d& fallback_velocity,
     const cps_human_workspace::HumanWorkspace& human_workspace,
     double time_sec) {
-  Vector3d direction = normalizedOrZero(sample.dp);
+  Vector3d direction = normalizedOrZero(robot_point - human_center);
   if (direction.squaredNorm() > 0.0) {
     return direction;
   }
 
-  direction = normalizedOrZero(sample.p - previous_command_position);
-  if (direction.squaredNorm() > 0.0) {
-    return direction;
-  }
-
-  direction = normalizedOrZero(sample.p - x_pred);
-  if (direction.squaredNorm() > 0.0) {
-    return direction;
-  }
-
-  return fallbackMonitorDirection(x_pred, v_pred, human_workspace, time_sec);
+  return fallbackMonitorDirection(
+      fallback_point, fallback_velocity, human_workspace, time_sec);
 }
 
 }  // namespace
@@ -2304,6 +2296,9 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     Vector3d x_next{Vector3d::Zero()};
     Vector3d v_next{Vector3d::Zero()};
     Vector3d a_pred{Vector3d::Zero()};
+    Vector3d closest_robot_point{Vector3d::Zero()};
+    Vector3d closest_human_center{Vector3d::Zero()};
+    Vector3d contact_normal{Vector3d::Zero()};
     double d_pred{0.0};
     double d_next{0.0};
     double d_segment{0.0};
@@ -2344,7 +2339,6 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   Vector3d x_pred = collision_center;
   Vector3d v_pred = collision_twist.head<3>();
   double t_prev = collision_plan.anchor.t;
-  Vector3d previous_command_position = collision_plan.anchor.p;
   std::vector<PredictionRow> rows;
   rows.reserve(1 + collision_plan.intended.size() + collision_plan.failsafe.size());
 
@@ -2401,23 +2395,25 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
             x_next,
             inflated_contact_radius,
             segment_start_time_sec,
-            segment_end_time_sec);
+            segment_end_time_sec,
+            &row.closest_robot_point,
+            &row.closest_human_center);
     row.contact_possible = row.d_segment <= 0.0;
-    const Vector3d monitor_direction =
-        commandMonitorDirection(
-            collision_sample,
-            previous_command_position,
-            x_pred,
-            v_pred,
+    row.contact_normal =
+        contactNormalMonitorDirection(
+            row.closest_robot_point,
+            row.closest_human_center,
+            x_next,
+            v_next,
             human_workspace,
             segment_end_time_sec);
     const double denom =
-        (monitor_direction.transpose() * task_inertia_inv * monitor_direction)(0, 0);
+        (row.contact_normal.transpose() * task_inertia_inv * row.contact_normal)(0, 0);
     const double m_eff_dir = 1.0 / std::max(denom, kSmallPositive);
     row.k_n =
-        std::max((monitor_direction.transpose() * Kp * monitor_direction)(0, 0), 0.0);
-    row.e_n = std::abs(monitor_direction.dot(x_next - collision_sample.p)) + rho_p;
-    row.v_n = std::abs(monitor_direction.dot(v_next)) + rho_v;
+        std::max((row.contact_normal.transpose() * Kp * row.contact_normal)(0, 0), 0.0);
+    row.e_n = std::abs(row.contact_normal.dot(x_next - collision_sample.p)) + rho_p;
+    row.v_n = std::abs(row.contact_normal.dot(v_next)) + rho_v;
     row.T_n_ub = 0.5 * m_eff_dir * row.v_n * row.v_n;
     row.V_n_ub = 0.5 * row.k_n * row.e_n * row.e_n;
     row.Kx = K_exec(0, 0);
@@ -2430,7 +2426,6 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
 
     x_pred = x_next;
     v_pred = v_next;
-    previous_command_position = collision_sample.p;
   };
 
   auto append_samples = [&](const char* stage,
@@ -2504,6 +2499,9 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         << row.a_pred(0) << "," << row.a_pred(1) << "," << row.a_pred(2) << ","
         << row.human_center_start(0) << "," << row.human_center_start(1) << "," << row.human_center_start(2) << ","
         << row.human_center_end(0) << "," << row.human_center_end(1) << "," << row.human_center_end(2) << ","
+        << row.closest_robot_point(0) << "," << row.closest_robot_point(1) << "," << row.closest_robot_point(2) << ","
+        << row.closest_human_center(0) << "," << row.closest_human_center(1) << "," << row.closest_human_center(2) << ","
+        << row.contact_normal(0) << "," << row.contact_normal(1) << "," << row.contact_normal(2) << ","
         << row.d_pred << "," << row.d_next << "," << row.d_segment << ","
         << static_cast<int>(row.contact_possible) << ","
         << row.k_n << "," << row.e_n << "," << row.v_n << ","
@@ -3231,7 +3229,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   last_cartesian_control_energy_ = cartesian_energy_info.total_energy;
 
   const Vector3d desired_position_cur = shield_dec.command.p;
-  const Quaterniond desired_orientation_cur = shield_dec.command.q;
   const Vector3d desired_linear_velocity_cur = shield_dec.command.dp;
 
   const double robot_potential_energy_pos =
@@ -3248,13 +3245,12 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       robot_potential_energy_pos + robot_potential_energy_rot;
 
   {
-    ImpedanceSample current_command = shield_dec.command;
-    current_command.p =
-        desired_position_cur + collisionCenterOffsetWorld(desired_orientation_cur);
+    const Vector3d current_human_center =
+        human_workspace_.centerAtTime(wall_time);
     const Vector3d monitor_direction =
-        commandMonitorDirection(
-            current_command,
-            current_command.p,
+        contactNormalMonitorDirection(
+            collision_center,
+            current_human_center,
             collision_center,
             ee_collision_twist.head<3>(),
             human_workspace_,
@@ -3270,6 +3266,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     const double Tn_now_tube =
         0.5 * std::max(m_eff_dir, 0.0) * v_n_now_tube * v_n_now_tube;
     monitor.m_eff_n = m_eff_dir;
+    monitor.v_safe = std::sqrt(
+        std::max(2.0 * energy_budget_joule_ /
+                     std::max(m_eff_dir, kSmallPositive),
+                 0.0));
     monitor.v_n_now = monitor_direction.dot(ee_collision_twist.head<3>());
     monitor.Tn_now = 0.5 * std::max(m_eff_dir, 0.0) *
                      monitor.v_n_now * monitor.v_n_now;
@@ -4330,6 +4330,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
           << "pred_ax,pred_ay,pred_az,"
           << "human_center_start_px,human_center_start_py,human_center_start_pz,"
           << "human_center_end_px,human_center_end_py,human_center_end_pz,"
+          << "closest_robot_px,closest_robot_py,closest_robot_pz,"
+          << "closest_human_center_px,closest_human_center_py,closest_human_center_pz,"
+          << "contact_normal_x,contact_normal_y,contact_normal_z,"
           << "distance_start,distance_next,distance_segment,"
           << "contact_possible,k_n,e_n,v_n,T_n_ub,V_potential_ub,"
           << "is_worst_T,is_worst_V,"

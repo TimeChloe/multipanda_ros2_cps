@@ -208,7 +208,6 @@ reachable_cartesian_impedance_controller:
     human_workspace_timeout_sec: 0.5
     startup_via_points_source: "action"
     cartesian_via_points_action_name: "~/follow_cartesian_via_points"
-    cartesian_via_points_action_feedback_period_sec: 0.1
     # cartesian_via_points: [0.306957, 0.000000, 0.099912, 0.923956, -0.382499, 0.000000, 0.000000]
     # Leave cartesian_via_points unset in action mode. ROS2 cannot infer the
     # type of an empty YAML sequence here.
@@ -231,7 +230,7 @@ reachable_cartesian_impedance_controller:
 
     energy_budget_joule: 0.12
     energy_budget_margin_joule: 0.000
-    cartesian_energy_min_pos_stiffness: 200.0
+    cartesian_energy_min_pos_stiffness: 400.0
     cartesian_energy_lambda_update_period_sec: 0.004
     contact_activation_margin: 0.00
 
