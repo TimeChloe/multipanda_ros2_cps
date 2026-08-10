@@ -76,7 +76,19 @@ using cps_trajectory_generators::loadTrajectoryGeneratorSettings;
 using cps_trajectory_generators::makeLocalCartesianReplanFromTimedPath;
 using cps_trajectory_generators::makePathConsistentTimedPathBrake;
 using cps_trajectory_generators::makePathConsistentTimedPathIntendedPrefix;
+using cps_trajectory_generators::makeRetimedPathState;
 using cps_trajectory_generators::makeSmoothViaPointCartesianTrajectory;
+
+std::vector<double> defaultNullspaceHomePoseParameter() {
+  return {
+      0.0,
+      -0.7853981633974483,
+      0.0,
+      -2.356194490192345,
+      0.0,
+      1.5707963267948966,
+      0.7853981633974483};
+}
 
 cps_controllers::SafetyMode nominalSafetyModeForMonitor(
     const cps_safety_monitor::MonitorResult& monitor) {
@@ -238,6 +250,12 @@ inline cps_safety_monitor::ImpedanceSample interpolateImpedanceSample(
 
   cps_safety_monitor::ImpedanceSample out;
   out.t = t;
+  out.nominal_path_time_valid =
+      a.nominal_path_time_valid && b.nominal_path_time_valid;
+  if (out.nominal_path_time_valid) {
+    out.nominal_path_time =
+        (1.0 - u) * a.nominal_path_time + u * b.nominal_path_time;
+  }
   out.p = h00 * a.p + h10 * span * a.dp +
           h01 * b.p + h11 * span * b.dp;
   out.dp = dh00 * a.p + dh10 * a.dp +
@@ -286,6 +304,81 @@ inline Vector3d contactNormalMonitorDirection(
 
   return fallbackMonitorDirection(
       fallback_point, fallback_velocity, human_workspace, time_sec);
+}
+
+Matrix3d positiveSemidefinitePart(const Matrix3d& matrix) {
+  const Matrix3d symmetric = 0.5 * (matrix + matrix.transpose());
+  const Eigen::SelfAdjointEigenSolver<Matrix3d> eig(symmetric);
+  if (eig.info() != Eigen::Success) {
+    return symmetric;
+  }
+  Matrix3d psd =
+      eig.eigenvectors() *
+      eig.eigenvalues().cwiseMax(0.0).asDiagonal() *
+      eig.eigenvectors().transpose();
+  return 0.5 * (psd + psd.transpose());
+}
+
+double maxTrackingBlockRadius(const Matrix6d& tube, int block_start) {
+  const Matrix3d block =
+      0.5 * (tube.block<3, 3>(block_start, block_start) +
+             tube.block<3, 3>(block_start, block_start).transpose());
+  const Eigen::SelfAdjointEigenSolver<Matrix3d> eig(block);
+  if (eig.info() != Eigen::Success) {
+    return std::sqrt(std::max(0.0, block.norm()));
+  }
+  return std::sqrt(std::max(0.0, eig.eigenvalues().maxCoeff()));
+}
+
+double directionalTrackingBlockRadius(
+    const Matrix6d& tube,
+    int block_start,
+    const Vector3d& direction) {
+  const Vector3d unit_direction = normalizedOrZero(direction);
+  if (unit_direction.squaredNorm() <= 0.0) {
+    return maxTrackingBlockRadius(tube, block_start);
+  }
+  const Matrix3d block =
+      0.5 * (tube.block<3, 3>(block_start, block_start) +
+             tube.block<3, 3>(block_start, block_start).transpose());
+  const double radius_squared =
+      (unit_direction.transpose() * block * unit_direction)(0, 0);
+  return std::sqrt(std::max(0.0, radius_squared));
+}
+
+Matrix6d propagateTrackingTube(
+    const Matrix6d& tube,
+    const Matrix3d& task_inertia_inv,
+    const Matrix3d& Kp,
+    const Matrix3d& Dp,
+    double dt,
+    double acc_error_bound) {
+  const double h = std::max(dt, kMinDt);
+  Matrix6d A = Matrix6d::Identity();
+  A.topRightCorner<3, 3>() = h * Matrix3d::Identity();
+  A.bottomLeftCorner<3, 3>() = -h * task_inertia_inv * Kp;
+  A.bottomRightCorner<3, 3>() =
+      Matrix3d::Identity() - h * task_inertia_inv * Dp;
+
+  Eigen::Matrix<double, 6, 3> B = Eigen::Matrix<double, 6, 3>::Zero();
+  B.topRows<3>() = 0.5 * h * h * Matrix3d::Identity();
+  B.bottomRows<3>() = h * Matrix3d::Identity();
+
+  const double acc_bound = std::max(0.0, acc_error_bound);
+  const Matrix6d propagated =
+      A * tube * A.transpose() + acc_bound * acc_bound * B * B.transpose();
+  return 0.5 * (propagated + propagated.transpose());
+}
+
+Matrix6d scaleTranslationalCoordinates(
+    const Matrix6d& matrix,
+    double coordinate_scale) {
+  Matrix6d transform = Matrix6d::Identity();
+  transform.topLeftCorner<3, 3>() =
+      std::clamp(coordinate_scale, 0.0, 1.0) * Matrix3d::Identity();
+
+  Matrix6d scaled = transform.transpose() * matrix * transform;
+  return 0.5 * (scaled + scaled.transpose());
 }
 
 }  // namespace
@@ -440,7 +533,8 @@ bool ReachableCartesianImpedanceController::shouldApplyCartesianEnergyBudget(
   (void)command;
   return enable_safety_monitor_ &&
          human_workspace_active_ &&
-         monitor.contact_relevant_for_energy &&
+         monitor.workspace_distance_now <=
+             std::max(0.0, contact_activation_margin_) &&
          !executing_last_verified_monitored;
 }
 
@@ -470,6 +564,52 @@ bool ReachableCartesianImpedanceController::computeTaskInertia(
   *lambda = lambda_ldlt.solve(Matrix6d::Identity());
   *lambda = 0.5 * (*lambda + lambda->transpose());
   return lambda->array().isFinite().all();
+}
+
+bool ReachableCartesianImpedanceController::computeTranslationalTaskInertia(
+    const Matrix7d& inertia,
+    const Matrix37d& Jv,
+    Matrix3d* lambda_trans,
+    Matrix3d* task_inertia_inv) const {
+  if (lambda_trans == nullptr || task_inertia_inv == nullptr) {
+    return false;
+  }
+
+  const Eigen::LDLT<Matrix7d> inertia_ldlt(inertia);
+  if (inertia_ldlt.info() != Eigen::Success) {
+    return false;
+  }
+
+  const Matrix7d M_inv = inertia_ldlt.solve(Matrix7d::Identity());
+  Matrix3d task_inertia_inv_raw = Jv * M_inv * Jv.transpose();
+  task_inertia_inv_raw =
+      0.5 * (task_inertia_inv_raw + task_inertia_inv_raw.transpose());
+
+  *task_inertia_inv = task_inertia_inv_raw;
+  task_inertia_inv->diagonal().array() += kSmallPositive;
+
+  Matrix3d lambda_inv = task_inertia_inv_raw;
+  lambda_inv.diagonal().array() += kDynamicLambdaRegularization;
+  const Eigen::LDLT<Matrix3d> lambda_ldlt(lambda_inv);
+  if (lambda_ldlt.info() != Eigen::Success) {
+    return false;
+  }
+
+  *lambda_trans = lambda_ldlt.solve(Matrix3d::Identity());
+  *lambda_trans = 0.5 * (*lambda_trans + lambda_trans->transpose());
+  const Eigen::SelfAdjointEigenSolver<Matrix3d> lambda_eig(*lambda_trans);
+  if (lambda_eig.info() != Eigen::Success) {
+    return false;
+  }
+
+  *lambda_trans =
+      lambda_eig.eigenvectors() *
+      lambda_eig.eigenvalues().cwiseMax(0.0).asDiagonal() *
+      lambda_eig.eigenvectors().transpose();
+  *lambda_trans = 0.5 * (*lambda_trans + lambda_trans->transpose());
+
+  return lambda_trans->array().isFinite().all() &&
+         task_inertia_inv->array().isFinite().all();
 }
 
 ImpedanceSample ReachableCartesianImpedanceController::makeEffectiveTimeHoldSample(
@@ -520,33 +660,26 @@ double ReachableCartesianImpedanceController::cartesianEnergyScaleFloor(
 
 ImpedanceSample ReachableCartesianImpedanceController::applyCartesianEnergyBudget(
     const ImpedanceSample& command,
-    const Vector6d& error,
-    const Vector6d& xdot,
-    const Matrix6d& lambda,
-    bool lambda_valid,
+    double kinetic_energy,
+    double potential_energy,
+    bool energy_valid,
     bool active,
     CartesianEnergyBudgetInfo* info) const {
   CartesianEnergyBudgetInfo local_info;
   local_info.active = active;
+  local_info.lambda_valid = energy_valid;
+  local_info.kinetic_energy = std::max(0.0, kinetic_energy);
+  local_info.potential_energy = std::max(0.0, potential_energy);
+  local_info.total_energy =
+      local_info.kinetic_energy + local_info.potential_energy;
 
   ImpedanceSample scaled_command = command;
-  if (!active) {
+  if (!active || !energy_valid) {
     if (info != nullptr) {
       *info = local_info;
     }
     return scaled_command;
   }
-
-  local_info.lambda_valid = lambda_valid;
-  if (local_info.lambda_valid) {
-    local_info.kinetic_energy =
-        std::max(0.0, 0.5 * (xdot.transpose() * lambda * xdot)(0, 0));
-  }
-
-  local_info.potential_energy =
-      std::max(0.0, 0.5 * (error.transpose() * command.K * error)(0, 0));
-  local_info.total_energy =
-      local_info.kinetic_energy + local_info.potential_energy;
 
   const double budget = std::max(0.0, energy_budget_joule_);
   if (local_info.kinetic_energy > budget) {
@@ -563,8 +696,11 @@ ImpedanceSample ReachableCartesianImpedanceController::applyCartesianEnergyBudge
   local_info.scale =
       std::max(local_info.scale, cartesianEnergyScaleFloor(command.K));
 
-  scaled_command.K = local_info.scale * command.K;
-  scaled_command.D = std::sqrt(local_info.scale) * command.D;
+  const double stiffness_coordinate_scale = std::sqrt(local_info.scale);
+  scaled_command.K = scaleTranslationalCoordinates(
+      command.K,
+      stiffness_coordinate_scale);
+  scaled_command.D = command.D;
 
   if (info != nullptr) {
     *info = local_info;
@@ -615,6 +751,8 @@ ImpedanceSample ReachableCartesianImpedanceController::makeFrozenFailsafeSample(
     const Matrix6d& K_target, const Matrix6d& D_target) const {
   ImpedanceSample s;
   s.t = nominal_time;
+  s.nominal_path_time = freeze_sample.nominal_path_time;
+  s.nominal_path_time_valid = freeze_sample.nominal_path_time_valid;
   s.p = freeze_sample.p;
   s.dp.setZero(); s.ddp.setZero();
   s.q = freeze_sample.q; s.q.normalize();
@@ -709,6 +847,57 @@ ImpedanceSample ReachableCartesianImpedanceController::getNextVerifiedTrajectory
   return ImpedanceSample{};
 }
 
+bool ReachableCartesianImpedanceController::getVerifiedTrajectoryCommandAtOffset(
+    const VerifiedPlan& plan,
+    std::size_t offset,
+    ImpedanceSample* command) const {
+  if (command == nullptr || !plan.valid) {
+    return false;
+  }
+
+  const std::size_t intended_remaining =
+      plan.intended_exec_index < plan.intended.size()
+          ? plan.intended.size() - plan.intended_exec_index
+          : 0;
+  if (offset < intended_remaining) {
+    *command = plan.intended[plan.intended_exec_index + offset];
+    return true;
+  }
+
+  if (plan.failsafe.empty()) {
+    return false;
+  }
+
+  const std::size_t failsafe_offset = offset - intended_remaining;
+  const std::size_t failsafe_index =
+      plan.failsafe_exec_index + failsafe_offset;
+  const ImpedanceSample& failsafe_start =
+      plan.intended.empty() ? plan.anchor : plan.intended.back();
+  const double command_dt = std::max(local_replan_dt_, kMinDt);
+  const double command_time =
+      failsafe_start.t +
+      static_cast<double>(failsafe_index + 1) * command_dt;
+
+  if (command_time <= plan.failsafe.front().t) {
+    *command = interpolateImpedanceSample(
+        failsafe_start, plan.failsafe.front(), command_time);
+  } else if (command_time >= plan.failsafe.back().t) {
+    *command = plan.failsafe.back();
+    command->t = command_time;
+  } else {
+    const auto upper = std::lower_bound(
+        plan.failsafe.begin(),
+        plan.failsafe.end(),
+        command_time,
+        [](const ImpedanceSample& sample, double value) {
+          return sample.t < value;
+        });
+    *command = interpolateImpedanceSample(*(upper - 1), *upper, command_time);
+  }
+  command->failsafe = true;
+  return true;
+}
+
 void ReachableCartesianImpedanceController::alignVerifiedPlanExecutionIndex(
     VerifiedPlan* plan,
     std::size_t elapsed_control_steps) const {
@@ -732,7 +921,10 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     double nominal_guess_time,
     const ImpedanceSample& planning_start_command,
     double initial_path_rate,
-    double commanded_path_time) const {
+    double target_path_rate,
+    double commanded_path_time,
+    bool reanchor_path_kinematics,
+    double reanchor_path_rate) const {
   CartesianTrajectorySample planning_start;
   planning_start.t = planning_start_command.t;
   planning_start.p = planning_start_command.p;
@@ -761,64 +953,142 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
   }
 
   std::vector<CartesianTrajectorySample> planned_samples;
+  bool planned_samples_are_path_consistent = false;
+  auto has_continuous_seam =
+      [&](const std::vector<CartesianTrajectorySample>& samples) {
+    if (samples.empty()) {
+      return false;
+    }
+    const auto& first = samples.front();
+    const double dt = std::max(local_replan_dt_, kMinDt);
+    const double vector_axis_factor = std::sqrt(3.0);
+    const double linear_accel_step =
+        vector_axis_factor * local_replan_max_acceleration_ * dt;
+    const double linear_jerk_step =
+        vector_axis_factor * local_replan_max_jerk_ * dt;
+    const double angular_accel_step =
+        vector_axis_factor * local_replan_max_angular_acceleration_ * dt;
+    const double angular_jerk_step =
+        vector_axis_factor * local_replan_max_angular_jerk_ * dt;
+    constexpr double kSeamTolerance = 1.0e-6;
+
+    const double max_linear_speed =
+        std::max(planning_start.dp.norm(), first.dp.norm());
+    const double max_angular_speed =
+        std::max(planning_start.w.norm(), first.w.norm());
+    return
+        (first.p - planning_start.p).norm() <=
+            max_linear_speed * dt +
+                0.5 * vector_axis_factor *
+                    local_replan_max_acceleration_ * dt * dt +
+                kSeamTolerance &&
+        (first.dp - planning_start.dp).norm() <=
+            linear_accel_step + kSeamTolerance &&
+        (first.ddp - planning_start.ddp).norm() <=
+            linear_jerk_step + kSeamTolerance &&
+        computeOrientationError(planning_start.q, first.q).norm() <=
+            max_angular_speed * dt +
+                0.5 * vector_axis_factor *
+                    local_replan_max_angular_acceleration_ * dt * dt +
+                kSeamTolerance &&
+        (first.w - planning_start.w).norm() <=
+            angular_accel_step + kSeamTolerance &&
+        (first.dw - planning_start.dw).norm() <=
+            angular_jerk_step + kSeamTolerance;
+  };
+
   if (!active_path.empty()) {
+    const double path_start_time =
+        planning_start_command.nominal_path_time_valid
+            ? planning_start_command.nominal_path_time
+            : std::max(nominal_guess_time, commanded_path_time);
+
+    // During a Lachner hold, the frozen command has zero desired derivatives
+    // even though the physical robot can still be moving. Reconstruct the
+    // planning state at the same scalar path position, but use the measured
+    // along-path rate. This changes neither the Cartesian route nor its
+    // frozen progress; it only makes the new command state agree with the
+    // robot state from which execution will resume.
+    if (reanchor_path_kinematics &&
+        planning_start_command.nominal_path_time_valid) {
+      planning_start = makeRetimedPathState(
+          active_path,
+          path_start_time,
+          std::clamp(reanchor_path_rate,
+                     path_time_rate_min_,
+                     path_time_rate_max_),
+          0.0);
+      planning_start.t = planning_start_command.t;
+    }
+
+    // SaRA path-consistent mode advances a scalar progress state on the
+    // long-term trajectory.  Prefer that construction so every intended
+    // command stays on the requested via-point route.
     PathConsistentTimedPathConfig path_config;
-    path_config.intended_steps = std::max(1, shield_intended_steps_);
+    path_config.intended_steps = std::max(1, local_replan_horizon_steps_);
     path_config.dt = local_replan_dt_;
     path_config.path_lookahead_sec = local_path_lookahead_sec_;
+    path_config.project_start_to_nearest_path_state =
+        !planning_start_command.nominal_path_time_valid;
     path_config.max_path_rate = std::max(path_time_rate_max_, 1e-4);
     path_config.max_path_acceleration =
         std::max(path_time_acc_limit_, 1e-4);
     path_config.max_path_jerk = std::max(local_replan_max_jerk_, 1e-4);
     path_config.target_path_rate =
-        std::clamp(path_time_rate_target_, path_time_rate_min_,
+        std::clamp(target_path_rate, path_time_rate_min_,
                    path_time_rate_max_);
     path_config.initial_path_rate =
-        std::clamp(initial_path_rate, path_time_rate_min_, path_time_rate_max_);
-
-    const double path_start_time =
-        std::max(nominal_guess_time, commanded_path_time);
+        reanchor_path_kinematics
+            ? std::clamp(reanchor_path_rate,
+                         path_time_rate_min_,
+                         path_time_rate_max_)
+            : planning_start_command.nominal_path_time_valid
+            ? -1.0
+            : std::clamp(initial_path_rate,
+                         path_time_rate_min_,
+                         path_time_rate_max_);
 
     planned_samples = makePathConsistentTimedPathIntendedPrefix(
         path_start_time,
         planning_start,
         active_path,
         path_config);
+    if (!has_continuous_seam(planned_samples)) {
+      planned_samples.clear();
+    } else {
+      planned_samples_are_path_consistent = true;
+    }
 
-    if (planned_samples.empty()) {
+    // Only an explicitly off-path state may use the Cartesian reconnect.  If
+    // an exact verified scalar path state fails the seam check, rejecting this
+    // candidate preserves the old verified path/failsafe.  Silently replacing
+    // it with a Cartesian shortcut can skip a nearby or crossing route branch.
+    if (planned_samples.empty() &&
+        !planning_start_command.nominal_path_time_valid) {
       planned_samples = makeLocalCartesianReplanFromTimedPath(
           path_start_time,
           planning_start,
           active_path,
           config);
-    }
-  }
-
-  if (!planned_samples.empty()) {
-    Vector3d previous_position = planning_start.p;
-    Vector3d previous_velocity = planning_start.dp;
-    for (auto& sample : planned_samples) {
-      const double dt = std::max(local_replan_dt_, kMinDt);
-      const Vector3d raw_velocity =
-          (sample.p - previous_position) / dt;
-      const Vector3d velocity =
-          clampVectorNorm(raw_velocity, local_replan_max_velocity_);
-      const Vector3d raw_acceleration =
-          (velocity - previous_velocity) / dt;
-      sample.dp = velocity;
-      sample.ddp =
-          clampVectorNorm(raw_acceleration, local_replan_max_acceleration_);
-      previous_position = sample.p;
-      previous_velocity = sample.dp;
+      if (!has_continuous_seam(planned_samples)) {
+        planned_samples.clear();
+      }
     }
   }
 
   std::vector<ImpedanceSample> intended_buffer;
   intended_buffer.reserve(planned_samples.size());
 
-  for (const auto& planned_sample : planned_samples) {
+  const std::size_t gain_blend_steps = std::max<std::size_t>(
+      1, static_cast<std::size_t>(local_replan_horizon_steps_));
+  for (std::size_t i = 0; i < planned_samples.size(); ++i) {
+    const auto& planned_sample = planned_samples[i];
     ImpedanceSample s;
     s.t = planned_sample.t;
+    if (planned_samples_are_path_consistent) {
+      s.nominal_path_time = planned_sample.t;
+      s.nominal_path_time_valid = true;
+    }
     s.p = planned_sample.p;
     s.dp = planned_sample.dp;
     s.ddp = planned_sample.ddp;
@@ -826,8 +1096,15 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     s.q.normalize();
     s.w = planned_sample.w;
     s.dw = planned_sample.dw;
-    s.K = K_nominal_;
-    s.D = D_nominal_;
+    const double gain_blend = std::clamp(
+        static_cast<double>(i + 1) /
+            static_cast<double>(gain_blend_steps),
+        0.0,
+        1.0);
+    s.K = (1.0 - gain_blend) * planning_start_command.K +
+          gain_blend * K_nominal_;
+    s.D = (1.0 - gain_blend) * planning_start_command.D +
+          gain_blend * D_nominal_;
     s.failsafe = false;
 
     intended_buffer.push_back(s);
@@ -849,7 +1126,8 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     const Matrix37d& Jv,
     const Matrix6d& K_runtime,
     const Matrix6d& D_runtime,
-    const std::vector<ImpedanceSample>& intended_samples) const {
+    const std::vector<ImpedanceSample>& intended_samples,
+    std::size_t derivative_reanchor_index) const {
   (void)inertia;
   (void)Jv;
 
@@ -865,7 +1143,7 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
   plan.anchor.ddp.setZero();
   plan.anchor.q = current_orientation;
   plan.anchor.q.normalize();
-  plan.anchor.w.setZero();
+  plan.anchor.w = ee_twist.tail<3>();
   plan.anchor.dw.setZero();
   plan.anchor.K = K_runtime;
   plan.anchor.D = D_runtime;
@@ -877,9 +1155,6 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     ImpedanceSample step = intended_samples[i];
     step.t = plan.anchor.t + static_cast<double>(i + 1) *
                             std::max(local_replan_dt_, kMinDt);
-    step.K = K_nominal_;
-    step.D = D_nominal_;
-    step.failsafe = false;
     plan.intended.push_back(step);
   }
 
@@ -887,7 +1162,10 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     return plan;
   }
 
-  plan.nominal_time_anchor = intended_samples.back().t;
+  plan.nominal_time_anchor =
+      intended_samples.back().nominal_path_time_valid
+          ? intended_samples.back().nominal_path_time
+          : intended_samples.back().t;
   const ImpedanceSample freeze_anchor = plan.intended.back();
   const double failsafe_plan_dt = std::max(shield_plan_dt_, local_replan_dt_);
 
@@ -904,31 +1182,6 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     brake_start.w = freeze_anchor.w;
     brake_start.dw = freeze_anchor.dw;
 
-    std::vector<CartesianTrajectorySample> active_path;
-    {
-      std::lock_guard<std::mutex> lock(cartesian_via_point_path_mutex_);
-      active_path = cartesian_via_point_path_;
-    }
-
-    std::vector<CartesianTrajectorySample> brake_samples;
-    if (!active_path.empty()) {
-      PathConsistentTimedPathConfig path_brake_config;
-      path_brake_config.dt = failsafe_plan_dt;
-      path_brake_config.path_lookahead_sec = local_path_lookahead_sec_;
-      path_brake_config.max_path_rate = std::max(path_time_rate_max_, 1e-4);
-      path_brake_config.max_path_acceleration =
-          std::max(failsafe_brake_max_acceleration_, 1e-4);
-      path_brake_config.max_path_jerk =
-          std::max(failsafe_brake_max_jerk_, 1e-4);
-      path_brake_config.target_path_rate = 0.0;
-
-      brake_samples = makePathConsistentTimedPathBrake(
-          plan.nominal_time_anchor,
-          brake_start,
-          active_path,
-          path_brake_config);
-    }
-
     LocalCartesianReplanConfig brake_config;
     brake_config.dt = failsafe_plan_dt;
     brake_config.max_velocity = failsafe_brake_max_velocity_;
@@ -939,8 +1192,82 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
         failsafe_brake_max_angular_acceleration_;
     brake_config.max_angular_jerk = failsafe_brake_max_angular_jerk_;
 
+    std::vector<CartesianTrajectorySample> brake_samples;
+    bool path_consistent_brake = false;
+    if (freeze_anchor.nominal_path_time_valid) {
+      std::vector<CartesianTrajectorySample> active_path;
+      {
+        std::lock_guard<std::mutex> lock(cartesian_via_point_path_mutex_);
+        active_path = cartesian_via_point_path_;
+      }
+      PathConsistentTimedPathConfig path_brake_config;
+      path_brake_config.dt = failsafe_plan_dt;
+      path_brake_config.path_lookahead_sec = local_path_lookahead_sec_;
+      path_brake_config.max_path_rate = std::max(path_time_rate_max_, 1e-4);
+      path_brake_config.max_path_acceleration =
+          std::max(failsafe_brake_max_acceleration_, 1e-4);
+      path_brake_config.max_path_jerk =
+          std::max(failsafe_brake_max_jerk_, 1e-4);
+      path_brake_config.target_path_rate = 0.0;
+
+      if (!active_path.empty()) {
+        brake_samples = makePathConsistentTimedPathBrake(
+            freeze_anchor.nominal_path_time,
+            brake_start,
+            active_path,
+            path_brake_config);
+      }
+
+      // A path-consistent stop is admissible only if the intended endpoint is
+      // actually on that path state.  This rejects the former hybrid jump
+      // from a Cartesian OTG endpoint to an unrelated timed-path sample.
+      if (!brake_samples.empty()) {
+        const auto& first = brake_samples.front();
+        const double dt = failsafe_plan_dt;
+        const double axis_factor = std::sqrt(3.0);
+        constexpr double kBrakeSeamTolerance = 1.0e-6;
+        const bool position_continuous =
+            (first.p - freeze_anchor.p).norm() <=
+            std::max(freeze_anchor.dp.norm(), first.dp.norm()) * dt +
+                0.5 * axis_factor * failsafe_brake_max_acceleration_ *
+                    dt * dt +
+                kBrakeSeamTolerance;
+        const bool velocity_continuous =
+            (first.dp - freeze_anchor.dp).norm() <=
+            axis_factor * failsafe_brake_max_acceleration_ * dt +
+                kBrakeSeamTolerance;
+        const bool acceleration_continuous =
+            (first.ddp - freeze_anchor.ddp).norm() <=
+            axis_factor * failsafe_brake_max_jerk_ * dt +
+                kBrakeSeamTolerance;
+        const bool orientation_continuous =
+            computeOrientationError(freeze_anchor.q, first.q).norm() <=
+            std::max(freeze_anchor.w.norm(), first.w.norm()) * dt +
+                0.5 * axis_factor *
+                    failsafe_brake_max_angular_acceleration_ * dt * dt +
+                kBrakeSeamTolerance;
+        const bool angular_velocity_continuous =
+            (first.w - freeze_anchor.w).norm() <=
+            axis_factor * failsafe_brake_max_angular_acceleration_ * dt +
+                kBrakeSeamTolerance;
+        const bool angular_acceleration_continuous =
+            (first.dw - freeze_anchor.dw).norm() <=
+            axis_factor * failsafe_brake_max_angular_jerk_ * dt +
+                kBrakeSeamTolerance;
+        path_consistent_brake =
+            position_continuous && velocity_continuous &&
+            acceleration_continuous && orientation_continuous &&
+            angular_velocity_continuous &&
+            angular_acceleration_continuous;
+        if (!path_consistent_brake) {
+          brake_samples.clear();
+        }
+      }
+    }
+
     if (brake_samples.empty()) {
       brake_samples = makeCartesianBrakeTrajectory(brake_start, brake_config);
+      path_consistent_brake = false;
     }
 
     if (brake_samples.empty()) {
@@ -952,6 +1279,10 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
 
     const int N_fs = static_cast<int>(brake_samples.size());
     plan.failsafe.reserve(static_cast<std::size_t>(N_fs));
+    const Matrix6d D_terminal = computeDampingFromStiffness(
+        K_terminal,
+        failsafe_pos_damping_scale_,
+        failsafe_rot_damping_scale_);
 
     for (int i = 0; i < N_fs; ++i) {
       const double tk =
@@ -961,17 +1292,19 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
           static_cast<double>(i + 1) / static_cast<double>(N_fs);
 
       const Matrix6d K_sched =
-          (1.0 - s_blend) * K_nominal_ + s_blend * K_terminal;
+          (1.0 - s_blend) * freeze_anchor.K + s_blend * K_terminal;
 
       const Matrix6d D_sched =
-          computeDampingFromStiffness(
-              K_sched,
-              failsafe_pos_damping_scale_,
-              failsafe_rot_damping_scale_);
+          (1.0 - s_blend) * freeze_anchor.D +
+          s_blend * D_terminal;
 
       ImpedanceSample s;
       const auto& brake = brake_samples[static_cast<std::size_t>(i)];
       s.t = tk;
+      if (path_consistent_brake) {
+        s.nominal_path_time = brake.t;
+        s.nominal_path_time_valid = true;
+      }
       s.p = brake.p;
       s.dp = brake.dp;
       s.ddp = brake.ddp;
@@ -991,7 +1324,114 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
   // No online k_budget / k_selected update is performed here.
   fill_failsafe_prefix(K_f_target_);
 
-  plan.valid = !plan.intended.empty() && !plan.failsafe.empty();
+  const double axis_factor = std::sqrt(3.0);
+  auto sample_within_limits = [&](const ImpedanceSample& sample) {
+    const bool failsafe_limits = sample.failsafe;
+    const double max_velocity =
+        failsafe_limits ? failsafe_brake_max_velocity_
+                        : local_replan_max_velocity_;
+    const double max_acceleration =
+        failsafe_limits ? failsafe_brake_max_acceleration_
+                        : local_replan_max_acceleration_;
+    const double max_angular_velocity =
+        failsafe_limits ? failsafe_brake_max_angular_velocity_
+                        : local_replan_max_angular_velocity_;
+    const double max_angular_acceleration =
+        failsafe_limits ? failsafe_brake_max_angular_acceleration_
+                        : local_replan_max_angular_acceleration_;
+    return std::isfinite(sample.t) && sample.p.allFinite() &&
+           sample.dp.allFinite() && sample.ddp.allFinite() &&
+           sample.q.coeffs().allFinite() && sample.w.allFinite() &&
+           sample.dw.allFinite() && sample.K.allFinite() &&
+           sample.D.allFinite() &&
+           sample.dp.norm() <= axis_factor * max_velocity + 1.0e-6 &&
+           sample.ddp.norm() <= axis_factor * max_acceleration + 1.0e-6 &&
+           sample.w.norm() <= axis_factor * max_angular_velocity + 1.0e-6 &&
+           sample.dw.norm() <=
+               axis_factor * max_angular_acceleration + 1.0e-6;
+  };
+
+  auto transition_within_limits =
+      [&](const ImpedanceSample& previous,
+          const ImpedanceSample& current,
+          bool allow_measured_derivative_reanchor) {
+    const bool failsafe_limits = previous.failsafe || current.failsafe;
+    const double dt = std::max(current.t - previous.t, kMinDt);
+    const double max_acceleration = axis_factor *
+        (failsafe_limits ? failsafe_brake_max_acceleration_
+                         : local_replan_max_acceleration_);
+    const double max_jerk = axis_factor *
+        (failsafe_limits ? failsafe_brake_max_jerk_
+                         : local_replan_max_jerk_);
+    const double max_angular_acceleration = axis_factor *
+        (failsafe_limits ? failsafe_brake_max_angular_acceleration_
+                         : local_replan_max_angular_acceleration_);
+    const double max_angular_jerk = axis_factor *
+        (failsafe_limits ? failsafe_brake_max_angular_jerk_
+                         : local_replan_max_angular_jerk_);
+    constexpr double kPositionTolerance = 1.0e-5;
+    constexpr double kVelocityTolerance = 1.0e-5;
+    constexpr double kAccelerationTolerance = 1.0e-4;
+    constexpr double kPathTimeTolerance = 1.0e-6;
+    const bool path_state_continuous =
+        !previous.nominal_path_time_valid ||
+        !current.nominal_path_time_valid ||
+        (current.nominal_path_time >=
+             previous.nominal_path_time - kPathTimeTolerance &&
+         current.nominal_path_time - previous.nominal_path_time <=
+             path_time_rate_max_ * dt + kPathTimeTolerance);
+    const bool pose_and_path_continuous =
+        path_state_continuous &&
+        (current.p - previous.p).norm() <=
+            std::max(previous.dp.norm(), current.dp.norm()) * dt +
+                0.5 * max_acceleration * dt * dt +
+                kPositionTolerance &&
+        computeOrientationError(previous.q, current.q).norm() <=
+            std::max(previous.w.norm(), current.w.norm()) * dt +
+                0.5 * max_angular_acceleration * dt * dt +
+                kPositionTolerance;
+    const bool derivatives_continuous =
+        (current.dp - previous.dp).norm() <=
+            max_acceleration * dt + kVelocityTolerance &&
+        (current.ddp - previous.ddp).norm() <=
+            max_jerk * dt + kAccelerationTolerance &&
+        (current.w - previous.w).norm() <=
+            max_angular_acceleration * dt + kVelocityTolerance &&
+        (current.dw - previous.dw).norm() <=
+            max_angular_jerk * dt + kAccelerationTolerance;
+    // The sole exception is the hold-to-resume seam: the hold command's
+    // desired derivatives are zero by definition, while the robot's measured
+    // derivatives are not. Pose and scalar path progress must remain
+    // continuous, and the complete candidate is still rolled out from the
+    // measured state by the safety monitor before it can be executed.
+    return pose_and_path_continuous &&
+           (allow_measured_derivative_reanchor || derivatives_continuous);
+  };
+
+  bool executable = !plan.intended.empty() && !plan.failsafe.empty();
+  const ImpedanceSample* previous = nullptr;
+  for (std::size_t i = 0; i < plan.intended.size(); ++i) {
+    const auto& sample = plan.intended[i];
+    executable = executable && sample_within_limits(sample);
+    if (previous != nullptr) {
+      executable = executable &&
+                   transition_within_limits(
+                       *previous,
+                       sample,
+                       i == derivative_reanchor_index);
+    }
+    previous = &sample;
+  }
+  for (const auto& sample : plan.failsafe) {
+    executable = executable && sample_within_limits(sample);
+    if (previous != nullptr) {
+      executable = executable &&
+                   transition_within_limits(*previous, sample, false);
+    }
+    previous = &sample;
+  }
+
+  plan.valid = executable;
   return plan;
 }
 
@@ -1009,8 +1449,7 @@ SafetyMonitorConfig ReachableCartesianImpedanceController::makeSafetyMonitorConf
   config.energy_budget_margin_joule = energy_budget_margin_joule_;
   config.ee_collision_radius = ee_collision_radius_;
   config.contact_activation_margin = contact_activation_margin_;
-  config.tracking_pos_error_bound = tracking_pos_error_bound_;
-  config.tracking_vel_error_bound = tracking_vel_error_bound_;
+  config.tracking_acc_error_bound = tracking_acc_error_bound_;
   config.use_dynamic_consistent_impedance = use_dynamic_consistent_impedance_;
   return config;
 }
@@ -1241,6 +1680,12 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
       planning_start_command.w = last_commanded_sample_.w;
       planning_start_command.ddp = last_commanded_sample_.ddp;
       planning_start_command.dw = last_commanded_sample_.dw;
+      planning_start_command.K = last_commanded_sample_.K;
+      planning_start_command.D = last_commanded_sample_.D;
+      planning_start_command.nominal_path_time =
+          last_commanded_sample_.nominal_path_time;
+      planning_start_command.nominal_path_time_valid =
+          last_commanded_sample_.nominal_path_time_valid;
     } else {
       planning_start_command.p = current_position;
       planning_start_command.q = current_orientation;
@@ -1248,11 +1693,11 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
       planning_start_command.w = ee_twist.tail<3>();
       planning_start_command.ddp.setZero();
       planning_start_command.dw.setZero();
+      planning_start_command.K = K_runtime_;
+      planning_start_command.D = D_runtime_;
     }
     planning_start_command.q.normalize();
 
-    planning_start_command.K = K_nominal_;
-    planning_start_command.D = D_nominal_;
     planning_start_command.failsafe = false;
 
     const auto planner_tic = SteadyClock::now();
@@ -1261,7 +1706,12 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
             nominal_guess_time,
             planning_start_command,
             commanded_path_rate_,
-            commanded_path_time_);
+            mode_ == SafetyMode::kNominalContactPossible
+                ? mode2_energy_path_rate_target_
+                : path_time_rate_target_,
+            commanded_path_time_,
+            false,
+            0.0);
     planner_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - planner_tic).count();
 
@@ -1284,7 +1734,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
         Jv,
         K_runtime_,
         D_runtime_,
-        intended_segment);
+        intended_segment,
+        std::numeric_limits<std::size_t>::max());
     plan_build_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - build_tic).count();
     if (!candidate_plan.valid) return false;
@@ -1302,13 +1753,11 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
   const bool first_attempt = try_one_monitor_pass();
 
   if (!first_attempt) {
-    mode_ = SafetyMode::kNominal;
-    dec.executing_last_verified_monitored = false;
-    dec.candidate_verified = false;
-    dec.command = makeEmergencyStopCommand(
-        current_position,
-        current_orientation,
-        wall_time);
+    // A planner/build failure is not proof that a contact state has ended.
+    // Stay on the last verified monitored trajectory instead of allowing an
+    // unverified default MonitorResult to select nominal mode.
+    mode_ = SafetyMode::kLastVerifiedMonitored;
+    execute_last_verified_monitored();
     stamp_timing();
     return dec;
   }
@@ -1318,38 +1767,7 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     last_verified_plan_.valid = true;
     last_verified_plan_.intended_exec_index = 0;
     last_verified_plan_.failsafe_exec_index = 0;
-
-    if (!cartesian_effective_time_frozen_) {
-      const double previous_path_time = commanded_path_time_;
-      if (last_verified_plan_.nominal_time_anchor > 0.0) {
-        commanded_path_time_ =
-            std::max(commanded_path_time_, last_verified_plan_.nominal_time_anchor);
-      }
-      if (!last_verified_plan_.intended.empty()) {
-        const double plan_duration =
-            std::max(local_replan_dt_,
-                     static_cast<double>(last_verified_plan_.intended.size()) *
-                         local_replan_dt_);
-        if (last_verified_plan_.nominal_time_anchor > previous_path_time + kMinDt) {
-          commanded_path_rate_ = std::clamp(
-              (last_verified_plan_.nominal_time_anchor - previous_path_time) /
-                  plan_duration,
-              path_time_rate_min_,
-              path_time_rate_max_);
-        } else {
-          bool active_path_finished = false;
-          {
-            std::lock_guard<std::mutex> lock(cartesian_via_point_path_mutex_);
-            active_path_finished =
-                !cartesian_via_point_path_.empty() &&
-                commanded_path_time_ >= cartesian_via_point_path_.back().t - kMinDt;
-          }
-          if (active_path_finished) {
-            commanded_path_rate_ = 0.0;
-          }
-        }
-      }
-    }
+    ++last_verified_plan_generation_;
 
     mode_ = nominalSafetyModeForMonitor(dec.monitor);
 
@@ -1460,15 +1878,21 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
 
   auto try_one_monitor_pass = [&]() -> bool {
     ImpedanceSample planning_start_command;
-    planning_start_command.t = input.wall_time;
-
-    if (input.last_commanded_sample_valid) {
+    if (!input.committed_prefix.empty()) {
+      planning_start_command = input.committed_prefix.back();
+    } else if (input.last_commanded_sample_valid) {
       planning_start_command.p = input.last_commanded_sample.p;
       planning_start_command.q = input.last_commanded_sample.q;
       planning_start_command.dp = input.last_commanded_sample.dp;
       planning_start_command.w = input.last_commanded_sample.w;
       planning_start_command.ddp = input.last_commanded_sample.ddp;
       planning_start_command.dw = input.last_commanded_sample.dw;
+      planning_start_command.K = input.last_commanded_sample.K;
+      planning_start_command.D = input.last_commanded_sample.D;
+      planning_start_command.nominal_path_time =
+          input.last_commanded_sample.nominal_path_time;
+      planning_start_command.nominal_path_time_valid =
+          input.last_commanded_sample.nominal_path_time_valid;
     } else {
       planning_start_command.p = input.current_position;
       planning_start_command.q = input.current_orientation;
@@ -1476,31 +1900,62 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
       planning_start_command.w = input.ee_twist.tail<3>();
       planning_start_command.ddp.setZero();
       planning_start_command.dw.setZero();
+      planning_start_command.K = input.K_runtime;
+      planning_start_command.D = input.D_runtime;
     }
+    planning_start_command.t =
+        input.wall_time +
+        static_cast<double>(input.committed_prefix.size()) *
+            std::max(local_replan_dt_, kMinDt);
     planning_start_command.q.normalize();
 
-    planning_start_command.K = K_nominal_;
-    planning_start_command.D = D_nominal_;
     planning_start_command.failsafe = false;
+
+    const double nominal_advance_duration =
+        static_cast<double>(input.nominal_advance_steps) *
+        std::max(local_replan_dt_, kMinDt);
+    const double activation_nominal_guess_time =
+        input.nominal_guess_time + nominal_advance_duration;
+    const double activation_commanded_path_time =
+        planning_start_command.nominal_path_time_valid
+            ? planning_start_command.nominal_path_time
+            : input.commanded_path_time +
+                  std::max(0.0, input.commanded_path_rate) *
+                      nominal_advance_duration;
 
     const auto planner_tic = SteadyClock::now();
     const std::vector<ImpedanceSample> intended_buffer =
         makeIntendedBufferFromReplanner(
-            input.nominal_guess_time,
+            activation_nominal_guess_time,
             planning_start_command,
             input.commanded_path_rate,
-            input.commanded_path_time);
+            input.target_path_rate,
+            activation_commanded_path_time,
+            input.reanchor_path_kinematics,
+            input.reanchor_path_rate);
     planner_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - planner_tic).count();
 
     if (intended_buffer.empty()) return false;
 
     const std::size_t segment_count = std::min<std::size_t>(
-        static_cast<std::size_t>(std::max(1, shield_intended_steps_)),
+        std::max<std::size_t>(
+            static_cast<std::size_t>(std::max(1, shield_intended_steps_)),
+            async_verified_horizon_steps_),
         intended_buffer.size());
-    std::vector<ImpedanceSample> intended_segment(
+    std::vector<ImpedanceSample> replanned_segment(
         intended_buffer.begin(),
         intended_buffer.begin() + static_cast<std::ptrdiff_t>(segment_count));
+    std::vector<ImpedanceSample> intended_segment;
+    intended_segment.reserve(input.committed_prefix.size() + segment_count);
+    intended_segment.insert(
+        intended_segment.end(),
+        input.committed_prefix.begin(),
+        input.committed_prefix.end());
+    intended_segment.insert(
+        intended_segment.end(),
+        replanned_segment.begin(),
+        replanned_segment.end());
 
     const auto build_tic = SteadyClock::now();
     VerifiedPlan candidate_plan = buildCandidatePlan(
@@ -1512,7 +1967,10 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
         input.Jv,
         input.K_runtime,
         input.D_runtime,
-        intended_segment);
+        intended_segment,
+        input.reanchor_path_kinematics
+            ? input.committed_prefix.size()
+            : std::numeric_limits<std::size_t>::max());
     plan_build_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - build_tic).count();
 
@@ -1560,12 +2018,10 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
   const bool first_attempt = try_one_monitor_pass();
 
   if (!first_attempt) {
-    dec.executing_last_verified_monitored = false;
-    dec.candidate_verified = false;
-    dec.command = makeEmergencyStopCommand(
-        input.current_position,
-        input.current_orientation,
-        input.wall_time);
+    // Failure to create/evaluate a candidate cannot authorize leaving mode 2.
+    // Report execution of the last verified monitored plan so the real-time
+    // side remains conservative until a new candidate is actually verified.
+    execute_last_verified_monitored();
     stamp_timing();
     return dec;
   }
@@ -1786,9 +2242,11 @@ void ReachableCartesianImpedanceController::resetViaPointExecutionState(
   failsafe_enter_wall_time_sec_ = -1.0;
   commanded_path_time_ = 0.0;
   commanded_path_rate_ = 0.0;
+  mode2_energy_path_rate_target_ = path_time_rate_target_;
   mode_ = SafetyMode::kNominal;
 
   last_verified_plan_ = VerifiedPlan{};
+  ++last_verified_plan_generation_;
   last_verified_command_stage_ = 0;
   last_verified_command_index_ = 0;
   last_shield_decision_valid_ = false;
@@ -1798,6 +2256,12 @@ void ReachableCartesianImpedanceController::resetViaPointExecutionState(
   cartesian_effective_time_frozen_ = false;
   cartesian_effective_time_freeze_start_wall_time_ = -1.0;
   cartesian_effective_time_hold_sample_valid_ = false;
+  cartesian_energy_hold_dp_ds_.setZero();
+  cartesian_energy_hold_w_ds_.setZero();
+  cartesian_energy_hold_tangent_valid_ = false;
+  cartesian_energy_resume_path_rate_ = 0.0;
+  cartesian_energy_resume_path_rate_valid_ = false;
+  cartesian_effective_time_hold_monitor_ = MonitorResult{};
 
   {
     std::lock_guard<std::mutex> input_lock(async_input_mutex_);
@@ -2310,6 +2774,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     double v_n{0.0};
     double T_n_ub{0.0};
     double V_n_ub{0.0};
+    double E_contact_ub{0.0};
     double Kx{0.0};
     double Ky{0.0};
     double Kz{0.0};
@@ -2326,10 +2791,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   const Vector6d collision_twist =
       twistAtCollisionCenter(current_orientation, ee_twist);
 
-  const double rho_p = std::max(0.0, tracking_pos_error_bound_);
-  const double rho_v = std::max(0.0, tracking_vel_error_bound_);
-  const double inflated_contact_radius =
-      human_workspace.inflatedCollisionRadius(ee_collision_radius_, rho_p);
+  const double acc_error_bound =
+      std::max(0.0, tracking_acc_error_bound_);
 
   Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
   task_inertia_inv.diagonal().array() += kSmallPositive;
@@ -2338,6 +2801,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
 
   Vector3d x_pred = collision_center;
   Vector3d v_pred = collision_twist.head<3>();
+  Matrix6d tracking_tube = Matrix6d::Zero();
   double t_prev = collision_plan.anchor.t;
   std::vector<PredictionRow> rows;
   rows.reserve(1 + collision_plan.intended.size() + collision_plan.failsafe.size());
@@ -2352,11 +2816,13 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     K_exec = collision_sample.K;
     D_exec = collision_sample.D;
 
-    const Matrix3d Kp = K_exec.topLeftCorner<3, 3>();
-    const Matrix3d Dp = D_exec.topLeftCorner<3, 3>();
+    const Matrix3d Kp_raw = K_exec.topLeftCorner<3, 3>();
+    const Matrix3d Dp_raw = D_exec.topLeftCorner<3, 3>();
+    const Matrix3d Kp = positiveSemidefinitePart(Kp_raw);
+    const Matrix3d Dp = positiveSemidefinitePart(Dp_raw);
     const Vector3d force_pred =
-        Kp * (collision_sample.p - x_pred) -
-        Dp * (v_pred - collision_sample.dp);
+        Kp_raw * (collision_sample.p - x_pred) -
+        Dp_raw * (v_pred - collision_sample.dp);
     Vector3d a_pred = Vector3d::Zero();
     if (use_dynamic_consistent_impedance_) {
       a_pred = collision_sample.ddp + task_inertia_inv * force_pred;
@@ -2367,6 +2833,22 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     const Vector3d x_next =
         x_pred + v_pred * dtp + 0.5 * a_pred * dtp * dtp;
     const Vector3d v_next = v_pred + a_pred * dtp;
+
+    const Matrix6d tracking_tube_next =
+        propagateTrackingTube(
+            tracking_tube,
+            task_inertia_inv,
+            Kp,
+            Dp,
+            dtp,
+            acc_error_bound);
+    const double rho_p_segment =
+        std::max(maxTrackingBlockRadius(tracking_tube, 0),
+                 maxTrackingBlockRadius(tracking_tube_next, 0));
+    const double inflated_contact_radius_segment =
+        human_workspace.inflatedCollisionRadius(
+            ee_collision_radius_,
+            rho_p_segment);
 
     PredictionRow row;
     row.stage = stage;
@@ -2385,15 +2867,15 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     row.human_center_end = human_workspace.centerAtTime(segment_end_time_sec);
     row.d_pred =
         human_workspace.signedDistanceToInflatedSphere(
-            x_pred, inflated_contact_radius, segment_start_time_sec);
+            x_pred, inflated_contact_radius_segment, segment_start_time_sec);
     row.d_next =
         human_workspace.signedDistanceToInflatedSphere(
-            x_next, inflated_contact_radius, segment_end_time_sec);
+            x_next, inflated_contact_radius_segment, segment_end_time_sec);
     row.d_segment =
         human_workspace.signedDistanceSegmentToInflatedSphere(
             x_pred,
             x_next,
-            inflated_contact_radius,
+            inflated_contact_radius_segment,
             segment_start_time_sec,
             segment_end_time_sec,
             &row.closest_robot_point,
@@ -2412,10 +2894,15 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     const double m_eff_dir = 1.0 / std::max(denom, kSmallPositive);
     row.k_n =
         std::max((row.contact_normal.transpose() * Kp * row.contact_normal)(0, 0), 0.0);
-    row.e_n = std::abs(row.contact_normal.dot(x_next - collision_sample.p)) + rho_p;
-    row.v_n = std::abs(row.contact_normal.dot(v_next)) + rho_v;
+    row.e_n =
+        std::abs(row.contact_normal.dot(x_next - collision_sample.p)) +
+        directionalTrackingBlockRadius(tracking_tube_next, 0, row.contact_normal);
+    row.v_n =
+        std::abs(row.contact_normal.dot(v_next)) +
+        directionalTrackingBlockRadius(tracking_tube_next, 3, row.contact_normal);
     row.T_n_ub = 0.5 * m_eff_dir * row.v_n * row.v_n;
     row.V_n_ub = 0.5 * row.k_n * row.e_n * row.e_n;
+    row.E_contact_ub = row.T_n_ub + row.V_n_ub;
     row.Kx = K_exec(0, 0);
     row.Ky = K_exec(1, 1);
     row.Kz = K_exec(2, 2);
@@ -2426,6 +2913,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
 
     x_pred = x_next;
     v_pred = v_next;
+    tracking_tube = tracking_tube_next;
   };
 
   auto append_samples = [&](const char* stage,
@@ -2448,17 +2936,21 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
 
   double max_T = 0.0;
   double max_V = 0.0;
+  double max_E = 0.0;
   for (const auto& row : rows) {
     if (row.contact_possible) {
       max_T = std::max(max_T, row.T_n_ub);
       max_V = std::max(max_V, row.V_n_ub);
+      max_E = std::max(max_E, row.E_contact_ub);
     }
   }
 
   const double actual_collision_distance =
       human_workspace.signedDistanceToInflatedSphere(
           collision_center,
-          inflated_contact_radius,
+          human_workspace.inflatedCollisionRadius(
+              ee_collision_radius_,
+              0.0),
           wall_time);
   const Vector3d actual_human_center = human_workspace.centerAtTime(wall_time);
 
@@ -2468,6 +2960,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         row.contact_possible && std::abs(row.T_n_ub - max_T) <= 1.0e-9;
     const bool is_worst_V =
         row.contact_possible && std::abs(row.V_n_ub - max_V) <= 1.0e-9;
+    const bool is_worst_E =
+        row.contact_possible && std::abs(row.E_contact_ub - max_E) <= 1.0e-9;
 
     prediction_log_file_
         << wall_time << "," << nominal_guess_time << ","
@@ -2505,12 +2999,14 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         << row.d_pred << "," << row.d_next << "," << row.d_segment << ","
         << static_cast<int>(row.contact_possible) << ","
         << row.k_n << "," << row.e_n << "," << row.v_n << ","
-        << row.T_n_ub << "," << row.V_n_ub << ","
+        << row.T_n_ub << "," << row.V_n_ub << "," << row.E_contact_ub << ","
         << static_cast<int>(is_worst_T) << "," << static_cast<int>(is_worst_V) << ","
+        << static_cast<int>(is_worst_E) << ","
         << row.Kx << "," << row.Ky << "," << row.Kz << ","
         << row.Dx << "," << row.Dy << "," << row.Dz << ","
         << monitor.worst_case_Tn_ub << ","
         << monitor.worst_case_V_potential_ub << ","
+        << monitor.worst_case_contact_energy_ub << ","
         << monitor.terminal_energy_ub << ","
         << monitor.workspace_distance_margin << ","
         << monitor.h_clamping_energy << "\n";
@@ -2794,6 +3290,40 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       twistAtCollisionCenter(current_orientation, ee_twist);
   const Matrix37d Jv_collision =
       Jv - skewSymmetric(collisionCenterOffsetWorld(current_orientation)) * Jw;
+  const double current_workspace_distance_now =
+      human_workspace_active_
+          ? human_workspace_.signedDistanceToInflatedSphere(
+                collision_center,
+                human_workspace_.inflatedCollisionRadius(
+                    ee_collision_radius_, 0.0),
+                wall_time)
+          : std::numeric_limits<double>::infinity();
+  const bool current_contact_relevant_for_energy =
+      enable_safety_monitor_ && human_workspace_active_ &&
+      current_workspace_distance_now <= 0.0;
+
+  // Estimate the scalar rate of the motion that is still physically present
+  // during an energy hold. The tangent was captured from the last command on
+  // the original path before its desired derivatives were zeroed.
+  if (cartesian_effective_time_frozen_ &&
+      cartesian_energy_hold_tangent_valid_) {
+    const double tangent_norm_sq =
+        cartesian_energy_hold_dp_ds_.squaredNorm() +
+        cartesian_energy_hold_w_ds_.squaredNorm();
+    if (tangent_norm_sq > kSmallPositive) {
+      const double measured_path_rate =
+          (ee_twist.head<3>().dot(cartesian_energy_hold_dp_ds_) +
+           ee_twist.tail<3>().dot(cartesian_energy_hold_w_ds_)) /
+          tangent_norm_sq;
+      if (std::isfinite(measured_path_rate)) {
+        cartesian_energy_resume_path_rate_ = std::clamp(
+            measured_path_rate,
+            path_time_rate_min_,
+            path_time_rate_max_);
+        cartesian_energy_resume_path_rate_valid_ = true;
+      }
+    }
+  }
   const auto toc_model = SteadyClock::now();
 
   acceptPendingCartesianViaPoints(current_position, current_orientation, wall_time);
@@ -2819,6 +3349,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       AsyncMonitorInput async_input;
       async_input.sequence = async_input_sequence_.fetch_add(1) + 1;
       async_input.control_loop_sequence = control_loop_sequence;
+      async_input.source_plan_generation = last_verified_plan_generation_;
       async_input.wall_time = wall_time;
       async_input.nominal_guess_time = nominal_guess_time;
       async_input.current_position = current_position;
@@ -2834,6 +3365,76 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       async_input.last_commanded_sample_valid = last_commanded_sample_valid_;
       async_input.commanded_path_time = commanded_path_time_;
       async_input.commanded_path_rate = commanded_path_rate_;
+      async_input.target_path_rate =
+          mode_ == SafetyMode::kNominalContactPossible
+              ? mode2_energy_path_rate_target_
+              : path_time_rate_target_;
+      async_input.reanchor_path_kinematics =
+          cartesian_effective_time_frozen_ &&
+          cartesian_energy_resume_path_rate_valid_ &&
+          cartesian_effective_time_hold_sample_valid_ &&
+          cartesian_effective_time_hold_sample_.nominal_path_time_valid;
+      async_input.reanchor_path_rate =
+          async_input.reanchor_path_kinematics
+              ? cartesian_energy_resume_path_rate_
+              : 0.0;
+      async_input.committed_prefix.reserve(async_planning_lead_steps_);
+      // While nominal commands remain, do not extend a candidate's committed
+      // prefix into the fail-safe merely to reach the configured lead length.
+      // The worker result already carries an activation deadline equal to the
+      // actual prefix length.  A shorter intended-only prefix therefore means
+      // "finish verification before this intended tail is consumed".  Mixing
+      // the high-deceleration fail-safe tail with a new nominal replan made the
+      // C2 seam invalid and forced the robot to brake all the way to rest
+      // before a candidate could be accepted.
+      const bool commit_only_remaining_intended =
+          isNominalSafetyMode(mode_) && last_verified_plan_.valid &&
+          last_verified_plan_.intended_exec_index <
+              last_verified_plan_.intended.size();
+      for (std::size_t offset = 0;
+           offset < async_planning_lead_steps_;
+           ++offset) {
+        ImpedanceSample committed_command;
+        bool command_available = false;
+        if (cartesian_effective_time_frozen_ && last_commanded_sample_valid_) {
+          committed_command = last_commanded_sample_;
+          command_available = true;
+        } else if (commit_only_remaining_intended) {
+          const std::size_t intended_index =
+              last_verified_plan_.intended_exec_index + offset;
+          if (intended_index >= last_verified_plan_.intended.size()) {
+            break;
+          }
+          committed_command = last_verified_plan_.intended[intended_index];
+          command_available = true;
+        } else {
+          command_available = getVerifiedTrajectoryCommandAtOffset(
+              last_verified_plan_, offset, &committed_command);
+        }
+        if (!command_available && last_commanded_sample_valid_) {
+          committed_command = last_commanded_sample_;
+          committed_command.dp.setZero();
+          committed_command.ddp.setZero();
+          committed_command.w.setZero();
+          committed_command.dw.setZero();
+          committed_command.failsafe = true;
+          command_available = true;
+        }
+        if (!command_available) {
+          break;
+        }
+        async_input.committed_prefix.push_back(committed_command);
+      }
+      if (isNominalSafetyMode(mode_) &&
+          !cartesian_effective_time_frozen_) {
+        async_input.nominal_advance_steps =
+            static_cast<std::size_t>(std::count_if(
+                async_input.committed_prefix.begin(),
+                async_input.committed_prefix.end(),
+                [](const ImpedanceSample& command) {
+                  return !command.failsafe;
+                }));
+      }
       publishAsyncMonitorInput(async_input);
       last_async_input_publish_wall_time_ = wall_time;
     }
@@ -2846,10 +3447,16 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                     control_loop_sequence -
                     async_output.input.control_loop_sequence)
               : 0;
-      last_shield_decision_ = async_output.decision;
-      last_shield_decision_valid_ = true;
-      last_async_output_wall_time_ = async_output.input_wall_time;
-      last_async_output_valid_ = true;
+      const bool async_output_matches_source_plan =
+          async_output.input.source_plan_generation ==
+          last_verified_plan_generation_;
+      const bool async_output_before_activation =
+          !async_output.input.committed_prefix.empty() &&
+          async_plan_elapsed_steps <=
+              async_output.input.committed_prefix.size();
+      const bool async_output_usable =
+          async_output_matches_source_plan &&
+          async_output_before_activation;
       if (async_output.decision.has_evaluated_plan) {
         logShieldPredictionTrajectory(
             async_output.input.wall_time,
@@ -2872,43 +3479,19 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             async_output.decision.monitor_eval_ms,
             "async");
       }
-      if (async_output.decision.candidate_verified &&
-          async_output.decision.evaluated_plan.valid) {
-        last_verified_plan_ = async_output.decision.evaluated_plan;
-        last_verified_plan_.valid = true;
-        alignVerifiedPlanExecutionIndex(
-            &last_verified_plan_,
-            async_plan_elapsed_steps);
-        if (!cartesian_effective_time_frozen_) {
-          const double previous_path_time = commanded_path_time_;
-          if (last_verified_plan_.nominal_time_anchor > 0.0) {
-            commanded_path_time_ =
-                std::max(commanded_path_time_, last_verified_plan_.nominal_time_anchor);
-          }
-          if (!last_verified_plan_.intended.empty()) {
-            const double plan_duration =
-                std::max(local_replan_dt_,
-                         static_cast<double>(last_verified_plan_.intended.size()) *
-                             local_replan_dt_);
-            if (last_verified_plan_.nominal_time_anchor > previous_path_time + kMinDt) {
-              commanded_path_rate_ = std::clamp(
-                  (last_verified_plan_.nominal_time_anchor - previous_path_time) /
-                      plan_duration,
-                  path_time_rate_min_,
-                  path_time_rate_max_);
-            } else {
-              bool active_path_finished = false;
-              {
-                std::lock_guard<std::mutex> lock(cartesian_via_point_path_mutex_);
-                active_path_finished =
-                    !cartesian_via_point_path_.empty() &&
-                    commanded_path_time_ >= cartesian_via_point_path_.back().t - kMinDt;
-              }
-              if (active_path_finished) {
-                commanded_path_rate_ = 0.0;
-              }
-            }
-          }
+      if (async_output_usable) {
+        last_shield_decision_ = async_output.decision;
+        last_shield_decision_valid_ = true;
+        last_async_output_wall_time_ = async_output.input_wall_time;
+        last_async_output_valid_ = true;
+        if (async_output.decision.candidate_verified &&
+            async_output.decision.evaluated_plan.valid) {
+          last_verified_plan_ = async_output.decision.evaluated_plan;
+          last_verified_plan_.valid = true;
+          alignVerifiedPlanExecutionIndex(
+              &last_verified_plan_,
+              async_plan_elapsed_steps);
+          ++last_verified_plan_generation_;
         }
       }
     }
@@ -2921,41 +3504,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
     if (output_is_fresh) {
       shield_dec = last_shield_decision_;
-      const bool async_releases_failsafe =
-          mode_ == SafetyMode::kLastVerifiedMonitored &&
-          !shield_dec.executing_last_verified_monitored &&
-          !shouldRejectCandidateWithMonitor(shield_dec.monitor);
-
-      if (async_releases_failsafe) {
-        shield_dec = computeShieldDecision(wall_time, nominal_guess_time,
-                                           current_position, current_orientation,
-                                           ee_twist, inertia, Jv_collision);
-        last_shield_decision_ = shield_dec;
-        last_shield_decision_valid_ = true;
-        if (shield_dec.has_evaluated_plan) {
-          logShieldPredictionTrajectory(
-              wall_time,
-              nominal_guess_time,
-              current_position,
-              current_orientation,
-              ee_twist,
-              inertia,
-              Jv_collision,
-              K_runtime_,
-              D_runtime_,
-              human_workspace_,
-              shield_dec.evaluated_plan,
-              shield_dec.monitor,
-              shield_dec.candidate_verified,
-              shield_dec.executing_last_verified_monitored,
-              shield_dec.monitor_total_ms,
-              shield_dec.planner_ms,
-              shield_dec.plan_build_ms,
-              shield_dec.monitor_eval_ms,
-              "async_failsafe_release_sync");
-        }
-      } else if (shield_dec.executing_last_verified_monitored ||
-                 shouldRejectCandidateWithMonitor(shield_dec.monitor)) {
+      if (shield_dec.executing_last_verified_monitored ||
+          shouldRejectCandidateWithMonitor(shield_dec.monitor)) {
         shield_dec.executing_last_verified_monitored = true;
         if (last_verified_plan_.valid &&
             (!last_verified_plan_.intended.empty() ||
@@ -2970,6 +3520,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         if (last_verified_plan_.valid && !last_verified_plan_.intended.empty()) {
           shield_dec.command =
               getNextVerifiedTrajectoryCommandFromCache(!cartesian_effective_time_frozen_);
+          shield_dec.executing_last_verified_monitored =
+              shield_dec.command.failsafe;
         } else {
           shield_dec.command =
               makeEmergencyStopCommand(current_position, current_orientation, wall_time);
@@ -2980,32 +3532,35 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           !last_verified_plan_.valid || last_verified_plan_.intended.empty();
 
       if (need_sync_bootstrap) {
-        shield_dec = computeShieldDecision(wall_time, nominal_guess_time,
-                                           current_position, current_orientation,
-                                           ee_twist, inertia, Jv_collision);
-        last_shield_decision_ = shield_dec;
-        last_shield_decision_valid_ = true;
-        if (shield_dec.has_evaluated_plan) {
-          logShieldPredictionTrajectory(
-              wall_time,
-              nominal_guess_time,
-              current_position,
-              current_orientation,
-              ee_twist,
-              inertia,
-              Jv_collision,
-              K_runtime_,
-              D_runtime_,
-              human_workspace_,
-              shield_dec.evaluated_plan,
-              shield_dec.monitor,
-              shield_dec.candidate_verified,
-              shield_dec.executing_last_verified_monitored,
-              shield_dec.monitor_total_ms,
-              shield_dec.planner_ms,
-              shield_dec.plan_build_ms,
-              shield_dec.monitor_eval_ms,
-              "async_bootstrap_sync");
+        if (cartesian_effective_time_frozen_ &&
+            cartesian_effective_time_hold_sample_valid_) {
+          // This is a Lachner energy hold, not a failed safety verification.
+          // Keep mode 2 and execute the same hold command that is submitted in
+          // every async committed prefix while the worker verifies the resume
+          // trajectory.
+          shield_dec.monitor = cartesian_effective_time_hold_monitor_;
+          shield_dec.candidate_verified = false;
+          shield_dec.executing_last_verified_monitored = false;
+          shield_dec.command = cartesian_effective_time_hold_sample_;
+          shield_dec.command.t = wall_time;
+        } else {
+          // The planner/monitor is intentionally never run in the 1 kHz update
+          // during asynchronous operation. Until the first verified result is
+          // available, execute the exact hold command included in the submitted
+          // committed prefix.
+          shield_dec.executing_last_verified_monitored = true;
+          if (last_commanded_sample_valid_) {
+            shield_dec.command = last_commanded_sample_;
+            shield_dec.command.t = wall_time;
+            shield_dec.command.dp.setZero();
+            shield_dec.command.ddp.setZero();
+            shield_dec.command.w.setZero();
+            shield_dec.command.dw.setZero();
+            shield_dec.command.failsafe = true;
+          } else {
+            shield_dec.command = makeEmergencyStopCommand(
+                current_position, current_orientation, wall_time);
+          }
         }
       } else {
         shield_dec = last_shield_decision_;
@@ -3025,6 +3580,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           shield_dec.executing_last_verified_monitored = false;
           shield_dec.command =
               getNextVerifiedTrajectoryCommandFromCache(!cartesian_effective_time_frozen_);
+          shield_dec.executing_last_verified_monitored =
+              shield_dec.command.failsafe;
         }
         last_shield_decision_.command = shield_dec.command;
         last_shield_decision_.executing_last_verified_monitored =
@@ -3089,6 +3646,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   }
   const auto toc_shield = SteadyClock::now();
 
+  MonitorResult monitor = shield_dec.monitor;
+
   if (shield_dec.executing_last_verified_monitored) {
     if (failsafe_enter_wall_time_sec_ < 0.0) {
       failsafe_enter_wall_time_sec_ = wall_time;
@@ -3100,7 +3659,19 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       paused_nominal_time_sec_ += std::max(0.0, wall_time - failsafe_enter_wall_time_sec_);
       failsafe_enter_wall_time_sec_ = -1.0;
     }
-    mode_ = nominalSafetyModeForMonitor(shield_dec.monitor);
+    if (current_contact_relevant_for_energy) {
+      // Enter mode 2 immediately from the current measured state so the
+      // Lachner budget is active without waiting for the async worker.
+      mode_ = SafetyMode::kNominalContactPossible;
+    } else if (shield_dec.candidate_verified) {
+      // Leaving mode 2 is accepted only together with the freshly verified
+      // candidate whose input state also confirmed that contact had ended.
+      mode_ = nominalSafetyModeForMonitor(shield_dec.monitor);
+    } else if (cartesian_effective_time_frozen_) {
+      // A runtime energy hold is still mode 2. Continue applying the Lachner
+      // budget and wait for a verified resume/exit trajectory.
+      mode_ = SafetyMode::kNominalContactPossible;
+    }
   }
 
   const std::size_t monitored_intended_steps =
@@ -3113,7 +3684,11 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           : 0;
   const std::size_t monitored_steps =
       monitored_intended_steps + monitored_failsafe_steps;
-  MonitorResult monitor = shield_dec.monitor;
+  // Runtime energy accounting uses the current 1 kHz measured state. Keep the
+  // future-trajectory fields from the verified monitor result, but replace its
+  // instantaneous workspace classification with the current measurement.
+  monitor.workspace_distance_now = current_workspace_distance_now;
+  monitor.contact_relevant_for_energy = current_contact_relevant_for_energy;
 
   CartesianEnergyBudgetInfo cartesian_energy_info;
   const bool use_cartesian_energy_budget =
@@ -3121,27 +3696,59 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           monitor,
           shield_dec.command,
           shield_dec.executing_last_verified_monitored);
-  Matrix6d cartesian_lambda = Matrix6d::Zero();
-  bool cartesian_lambda_valid = false;
-  if (use_cartesian_energy_budget) {
-    const bool refresh_lambda =
+  const bool track_cartesian_energy_budget =
+      enable_safety_monitor_ &&
+      human_workspace_active_ &&
+      !shield_dec.executing_last_verified_monitored;
+
+  struct ContactEnergyTerms {
+    bool valid{false};
+    double kinetic_energy{0.0};
+    double potential_energy{0.0};
+  };
+
+  Matrix3d budget_lambda_trans = Matrix3d::Zero();
+  Matrix3d budget_task_inertia_inv = Matrix3d::Zero();
+  bool budget_task_inertia_valid = false;
+  const bool maintain_cartesian_energy_cache =
+      enable_safety_monitor_ && human_workspace_active_;
+  if (maintain_cartesian_energy_cache) {
+    const double cache_period =
+        std::max(0.0, cartesian_energy_lambda_update_period_sec_);
+    const bool refresh_every_update =
+        cache_period <= std::max(dt, kMinDt) + kMinDt;
+    const bool cache_due =
         !cartesian_energy_lambda_cache_valid_ ||
-        cartesian_energy_lambda_update_period_sec_ <= kMinDt ||
-        wall_time - cartesian_energy_lambda_cache_wall_time_ >=
-            cartesian_energy_lambda_update_period_sec_;
-    if (refresh_lambda) {
-      Matrix6d refreshed_lambda = Matrix6d::Zero();
-      if (computeTaskInertia(inertia, J_geo, &refreshed_lambda)) {
-        cartesian_energy_lambda_cache_ = refreshed_lambda;
+        cartesian_energy_lambda_cache_wall_time_ < 0.0 ||
+        wall_time < cartesian_energy_lambda_cache_wall_time_ ||
+        refresh_every_update ||
+        (wall_time - cartesian_energy_lambda_cache_wall_time_) >= cache_period;
+
+    if (cache_due) {
+      Matrix3d lambda_trans = Matrix3d::Zero();
+      Matrix3d task_inertia_inv = Matrix3d::Zero();
+      if (computeTranslationalTaskInertia(
+              inertia, Jv_collision, &lambda_trans, &task_inertia_inv)) {
+        cartesian_energy_lambda_trans_cache_ = lambda_trans;
+        cartesian_energy_task_inertia_inv_cache_ = task_inertia_inv;
         cartesian_energy_lambda_cache_valid_ = true;
         cartesian_energy_lambda_cache_wall_time_ = wall_time;
+      } else {
+        cartesian_energy_lambda_trans_cache_.setZero();
+        cartesian_energy_task_inertia_inv_cache_.setZero();
+        cartesian_energy_lambda_cache_valid_ = false;
+        cartesian_energy_lambda_cache_wall_time_ = -1.0;
       }
     }
+
     if (cartesian_energy_lambda_cache_valid_) {
-      cartesian_lambda = cartesian_energy_lambda_cache_;
-      cartesian_lambda_valid = true;
+      budget_lambda_trans = cartesian_energy_lambda_trans_cache_;
+      budget_task_inertia_inv = cartesian_energy_task_inertia_inv_cache_;
+      budget_task_inertia_valid = true;
     }
   } else {
+    cartesian_energy_lambda_trans_cache_.setZero();
+    cartesian_energy_task_inertia_inv_cache_.setZero();
     cartesian_energy_lambda_cache_valid_ = false;
     cartesian_energy_lambda_cache_wall_time_ = -1.0;
   }
@@ -3154,16 +3761,140 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     return command_error;
   };
 
+  auto compute_contact_energy_terms = [&](const ImpedanceSample& command) {
+    ContactEnergyTerms terms;
+    if (!track_cartesian_energy_budget ||
+        !budget_task_inertia_valid) {
+      return terms;
+    }
+
+    terms.valid = true;
+
+    // Runtime passivity storage uses the measured current state. The tracking
+    // error tube is reserved for predictive rollout, not for the instantaneous
+    // stored-energy calculation.
+    const Vector3d v_collision = ee_collision_twist.head<3>();
+    const double kinetic_energy =
+        0.5 * (v_collision.transpose() *
+               budget_lambda_trans *
+               v_collision)(0, 0);
+    terms.kinetic_energy =
+        std::max(0.0, kinetic_energy);
+
+    const Quaterniond command_orientation =
+        normalizedQuaternionOrIdentity(command.q);
+    const Vector3d command_collision_center =
+        command.p + collisionCenterOffsetWorld(command_orientation);
+    const Vector3d e_collision = collision_center - command_collision_center;
+    const Matrix3d Kp =
+        0.5 * (command.K.topLeftCorner<3, 3>() +
+               command.K.topLeftCorner<3, 3>().transpose());
+    const Eigen::SelfAdjointEigenSolver<Matrix3d> Kp_eig(Kp);
+    Matrix3d Kp_storage = Kp;
+    if (Kp_eig.info() == Eigen::Success) {
+      Kp_storage =
+          Kp_eig.eigenvectors() *
+          Kp_eig.eigenvalues().cwiseMax(0.0).asDiagonal() *
+          Kp_eig.eigenvectors().transpose();
+      Kp_storage = 0.5 * (Kp_storage + Kp_storage.transpose());
+    }
+    terms.potential_energy =
+        std::max(
+            0.0,
+            0.5 * (e_collision.transpose() * Kp_storage * e_collision)(0, 0));
+    return terms;
+  };
+
   const ImpedanceSample candidate_budget_command = shield_dec.command;
   const Vector6d candidate_error =
       compute_error_for_command(candidate_budget_command);
+  const ContactEnergyTerms candidate_energy_terms =
+      compute_contact_energy_terms(candidate_budget_command);
+  double candidate_path_rate = commanded_path_rate_;
+  if (candidate_budget_command.nominal_path_time_valid) {
+    candidate_path_rate = std::clamp(
+        (candidate_budget_command.nominal_path_time -
+         commanded_path_time_) /
+            std::max(dt, kMinDt),
+        path_time_rate_min_,
+        path_time_rate_max_);
+  }
+
+  // In mode 2, derive the feasible speed of the same geometric path directly
+  // from the configured energy budget, current model/state, and the velocity
+  // tangent of the command that is actually about to run.  The target is
+  // allowed to rise and fall with the available energy; Ruckig enforces the
+  // path acceleration and jerk limits.  Mode 0 bypasses this energy governor
+  // and always requests the nominal path rate.
+  if (mode_ == SafetyMode::kNominalContactPossible &&
+      current_contact_relevant_for_energy &&
+      candidate_energy_terms.valid) {
+    const double planning_budget =
+        std::max(0.0,
+                 energy_budget_joule_ - energy_budget_margin_joule_);
+    const double kinetic_budget = std::max(
+        0.0,
+        planning_budget - candidate_energy_terms.potential_energy);
+    double safe_path_rate = path_time_rate_target_;
+    bool safe_path_rate_observable = false;
+
+    if (!candidate_budget_command.failsafe &&
+        candidate_path_rate > 1.0e-6) {
+      const Quaterniond command_orientation =
+          normalizedQuaternionOrIdentity(candidate_budget_command.q);
+      const Vector3d command_collision_offset =
+          collisionCenterOffsetWorld(command_orientation);
+      const Vector3d command_collision_velocity =
+          candidate_budget_command.dp +
+          candidate_budget_command.w.cross(command_collision_offset);
+      const Vector3d collision_path_tangent =
+          command_collision_velocity / candidate_path_rate;
+      const double path_kinetic_energy_at_unit_rate = std::max(
+          0.0,
+          0.5 * (collision_path_tangent.transpose() *
+                 budget_lambda_trans *
+                 collision_path_tangent)(0, 0));
+      if (path_kinetic_energy_at_unit_rate > 1.0e-9) {
+        safe_path_rate = std::min(
+            safe_path_rate,
+            std::sqrt(kinetic_budget /
+                      path_kinetic_energy_at_unit_rate));
+        safe_path_rate_observable = true;
+      }
+    }
+
+    // The command-tangent estimate is proactive.  This second bound uses the
+    // measured kinetic energy as a fallback when tracking/model mismatch has
+    // already consumed more of the configured budget than predicted.
+    const double measured_rate_reference = std::max(
+        candidate_path_rate,
+        commanded_path_rate_);
+    if (candidate_energy_terms.kinetic_energy > kinetic_budget + 1.0e-9 &&
+        measured_rate_reference > 1.0e-6) {
+      safe_path_rate = std::min(
+          safe_path_rate,
+          measured_rate_reference *
+              std::sqrt(kinetic_budget /
+                        candidate_energy_terms.kinetic_energy));
+      safe_path_rate_observable = true;
+    }
+
+    if (safe_path_rate_observable) {
+      mode2_energy_path_rate_target_ = std::clamp(
+          safe_path_rate,
+          path_time_rate_min_,
+          path_time_rate_max_);
+    }
+  } else if (mode_ != SafetyMode::kNominalContactPossible) {
+    mode2_energy_path_rate_target_ = path_time_rate_target_;
+  }
+
   CartesianEnergyBudgetInfo candidate_energy_info;
   ImpedanceSample candidate_scaled_command = applyCartesianEnergyBudget(
       candidate_budget_command,
-      candidate_error,
-      ee_twist,
-      cartesian_lambda,
-      cartesian_lambda_valid,
+      candidate_energy_terms.kinetic_energy,
+      candidate_energy_terms.potential_energy,
+      candidate_energy_terms.valid,
       use_cartesian_energy_budget,
       &candidate_energy_info);
 
@@ -3173,21 +3904,60 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   const bool cartesian_budget_limited =
       use_cartesian_energy_budget &&
       candidate_energy_info.scale < 1.0 - 1.0e-6;
+  const bool waiting_for_verified_energy_resume =
+      cartesian_effective_time_frozen_ && !last_verified_plan_.valid;
 
   Vector6d error = candidate_error;
   cartesian_energy_info = candidate_energy_info;
   shield_dec.command = candidate_scaled_command;
 
-  if (cartesian_budget_limited) {
+  if (cartesian_budget_limited || waiting_for_verified_energy_resume) {
     if (!cartesian_effective_time_frozen_) {
+      ++last_verified_plan_generation_;
+      // The energy limiter replaces the verified command stream with a hold.
+      // A plan verified against the pre-limit stream must never be resumed
+      // after that divergence; replan from the measured held state instead.
+      last_verified_plan_ = VerifiedPlan{};
+      last_async_output_valid_ = false;
+      last_shield_decision_valid_ = false;
       cartesian_effective_time_freeze_start_wall_time_ = wall_time;
-      commanded_path_rate_ = 0.0;
       const ImpedanceSample& hold_source =
           last_commanded_sample_valid_ ? last_commanded_sample_
                                        : candidate_budget_command;
+
+      // Capture d(path pose)/ds before makeEffectiveTimeHoldSample() zeros the
+      // desired velocity. It is later used for a constant-time projection of
+      // the measured TCP twist; no path lookup occurs in the 1 kHz loop.
+      cartesian_energy_hold_dp_ds_.setZero();
+      cartesian_energy_hold_w_ds_.setZero();
+      cartesian_energy_hold_tangent_valid_ = false;
+      cartesian_energy_resume_path_rate_ = 0.0;
+      cartesian_energy_resume_path_rate_valid_ = false;
+      double tangent_source_rate = commanded_path_rate_;
+      const ImpedanceSample* tangent_source = &hold_source;
+      if (tangent_source_rate <= 1.0e-6 &&
+          candidate_path_rate > 1.0e-6) {
+        tangent_source_rate = candidate_path_rate;
+        tangent_source = &candidate_budget_command;
+      }
+      if (tangent_source_rate > 1.0e-6) {
+        cartesian_energy_hold_dp_ds_ =
+            tangent_source->dp / tangent_source_rate;
+        cartesian_energy_hold_w_ds_ =
+            tangent_source->w / tangent_source_rate;
+        cartesian_energy_hold_tangent_valid_ =
+            cartesian_energy_hold_dp_ds_.allFinite() &&
+            cartesian_energy_hold_w_ds_.allFinite() &&
+            cartesian_energy_hold_dp_ds_.squaredNorm() +
+                    cartesian_energy_hold_w_ds_.squaredNorm() >
+                kSmallPositive;
+      }
+
+      commanded_path_rate_ = 0.0;
       cartesian_effective_time_hold_sample_ =
           makeEffectiveTimeHoldSample(hold_source);
       cartesian_effective_time_hold_sample_valid_ = true;
+      cartesian_effective_time_hold_monitor_ = monitor;
     }
     cartesian_effective_time_frozen_ = true;
 
@@ -3199,12 +3969,13 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
     const ImpedanceSample hold_command = cartesian_effective_time_hold_sample_;
     error = compute_error_for_command(hold_command);
+    const ContactEnergyTerms hold_energy_terms =
+        compute_contact_energy_terms(hold_command);
     shield_dec.command = applyCartesianEnergyBudget(
         hold_command,
-        error,
-        ee_twist,
-        cartesian_lambda,
-        cartesian_lambda_valid,
+        hold_energy_terms.kinetic_energy,
+        hold_energy_terms.potential_energy,
+        hold_energy_terms.valid,
         use_cartesian_energy_budget,
         &cartesian_energy_info);
   } else {
@@ -3213,12 +3984,32 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       paused_nominal_time_sec_ += std::max(
           0.0,
           wall_time - cartesian_effective_time_freeze_start_wall_time_);
-      commanded_path_time_ = nominal_guess_time;
       commanded_path_rate_ = 0.0;
     }
     cartesian_effective_time_frozen_ = false;
     cartesian_effective_time_freeze_start_wall_time_ = -1.0;
     cartesian_effective_time_hold_sample_valid_ = false;
+    cartesian_energy_hold_tangent_valid_ = false;
+    cartesian_energy_resume_path_rate_valid_ = false;
+    cartesian_effective_time_hold_monitor_ = MonitorResult{};
+  }
+
+  // Advance the nominal path state only from the command that is really sent
+  // this cycle.  Accepting an asynchronous plan must not jump path progress to
+  // that plan's future endpoint (SaRA's verified path is advanced one executed
+  // sample at a time for the same reason).
+  if (shield_dec.command.nominal_path_time_valid) {
+    const double next_path_time =
+        std::max(commanded_path_time_,
+                 shield_dec.command.nominal_path_time);
+    commanded_path_rate_ = std::clamp(
+        (next_path_time - commanded_path_time_) / std::max(dt, kMinDt),
+        path_time_rate_min_,
+        path_time_rate_max_);
+    commanded_path_time_ = next_path_time;
+  } else if (shield_dec.command.failsafe ||
+             cartesian_effective_time_frozen_) {
+    commanded_path_rate_ = 0.0;
   }
 
   last_cartesian_energy_budget_active_ = cartesian_energy_info.active;
@@ -3255,32 +4046,36 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             ee_collision_twist.head<3>(),
             human_workspace_,
             wall_time);
-    Matrix3d task_inertia_inv = Jv_collision * inertia.inverse() * Jv_collision.transpose();
-    task_inertia_inv.diagonal().array() += kSmallPositive;
-    const double denom =
-        (monitor_direction.transpose() * task_inertia_inv * monitor_direction)(0, 0);
-    const double m_eff_dir = 1.0 / std::max(denom, kSmallPositive);
-    const double v_n_now_tube =
-        std::abs(monitor_direction.dot(ee_collision_twist.head<3>())) +
-        monitor.current_vel_error_radius;
-    const double Tn_now_tube =
-        0.5 * std::max(m_eff_dir, 0.0) * v_n_now_tube * v_n_now_tube;
-    monitor.m_eff_n = m_eff_dir;
-    monitor.v_safe = std::sqrt(
-        std::max(2.0 * energy_budget_joule_ /
-                     std::max(m_eff_dir, kSmallPositive),
-                 0.0));
-    monitor.v_n_now = monitor_direction.dot(ee_collision_twist.head<3>());
-    monitor.Tn_now = 0.5 * std::max(m_eff_dir, 0.0) *
-                     monitor.v_n_now * monitor.v_n_now;
-    monitor.v_n_now_tube = v_n_now_tube;
-    monitor.Tn_now_tube  = Tn_now_tube;
-    if (mode_ == SafetyMode::kLastVerifiedMonitored) {
-      if (prev_Tn_fs_valid_)
-        monitor.Tn_dot_est = (Tn_now_tube - prev_Tn_fs_) / std::max(dt, kMinDt);
-      else
+    if (budget_task_inertia_valid) {
+      const double denom =
+          (monitor_direction.transpose() *
+           budget_task_inertia_inv *
+           monitor_direction)(0, 0);
+      const double m_eff_dir = 1.0 / std::max(denom, kSmallPositive);
+      const double v_n_now_tube =
+          std::abs(monitor_direction.dot(ee_collision_twist.head<3>()));
+      const double Tn_now_tube =
+          0.5 * std::max(m_eff_dir, 0.0) * v_n_now_tube * v_n_now_tube;
+      monitor.m_eff_n = m_eff_dir;
+      monitor.v_safe = std::sqrt(
+          std::max(2.0 * energy_budget_joule_ /
+                       std::max(m_eff_dir, kSmallPositive),
+                   0.0));
+      monitor.v_n_now = monitor_direction.dot(ee_collision_twist.head<3>());
+      monitor.Tn_now = 0.5 * std::max(m_eff_dir, 0.0) *
+                       monitor.v_n_now * monitor.v_n_now;
+      monitor.v_n_now_tube = v_n_now_tube;
+      monitor.Tn_now_tube  = Tn_now_tube;
+      if (mode_ == SafetyMode::kLastVerifiedMonitored) {
+        if (prev_Tn_fs_valid_)
+          monitor.Tn_dot_est = (Tn_now_tube - prev_Tn_fs_) / std::max(dt, kMinDt);
+        else
+          monitor.Tn_dot_est = 0.0;
+        prev_Tn_fs_ = Tn_now_tube; prev_Tn_fs_valid_ = true;
+      } else {
         monitor.Tn_dot_est = 0.0;
-      prev_Tn_fs_ = Tn_now_tube; prev_Tn_fs_valid_ = true;
+        prev_Tn_fs_valid_ = false;
+      }
     } else {
       monitor.Tn_dot_est = 0.0;
       prev_Tn_fs_valid_ = false;
@@ -3326,6 +4121,13 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
     error_log_file_ << std::fixed << std::setprecision(9)
         << wall_time << "," << nominal_guess_time << "," << paused_nominal_time_sec_ << ","
+        << commanded_path_time_ << ","
+        << shield_dec.command.nominal_path_time << ","
+        << static_cast<int>(shield_dec.command.nominal_path_time_valid) << ","
+        << commanded_path_rate_ << ","
+        << mode2_energy_path_rate_target_ << ","
+        << cartesian_energy_resume_path_rate_ << ","
+        << static_cast<int>(cartesian_energy_resume_path_rate_valid_) << ","
         << static_cast<int>(mode_) << ","
         << desired_position_cur(0) << "," << desired_position_cur(1) << "," << desired_position_cur(2) << ","
         << current_position(0) << "," << current_position(1) << "," << current_position(2) << ","
@@ -3356,6 +4158,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         << monitor.worst_case_contact_time << "," << monitor.worst_case_workspace_distance_at_candidate << ","
         << monitor.worst_case_nominal_forward_progress << ","
         << monitor.worst_case_v_n_ub << "," << monitor.worst_case_Tn_ub << ","
+        << monitor.worst_case_contact_energy_ub << ","
         << monitor.worst_case_a_pos << "," << monitor.worst_case_a_brake << "," << monitor.worst_case_a_net << ","
         << monitor.workspace_distance_margin << "," << monitor.h_monitored_energy << ","
         << monitor.h_clamping_energy << "," << monitor.h_terminal_energy << ","
@@ -3493,10 +4296,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     if (startup_via_points_source != "action") {
       auto_declare<std::vector<double>>(
           "cartesian_via_points",
-          std::vector<double>{});
+          std::vector<double>{std::numeric_limits<double>::quiet_NaN()});
       auto_declare<std::vector<double>>(
           "cartesian_via_point_quaternions",
-          std::vector<double>{});
+          std::vector<double>{std::numeric_limits<double>::quiet_NaN()});
     }
 
     auto_declare<double>("nominal_pos_stiffness", 400.0);
@@ -3507,13 +4310,15 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("failsafe_rot_damping_scale", 2.5);
 
     auto_declare<double>("n_stiffness", 0.0);
+    auto_declare<std::vector<double>>(
+        "nullspace_home_pose", defaultNullspaceHomePoseParameter());
     auto_declare<bool>("disable_nullspace_in_failsafe", true);
     auto_declare<bool>("enable_safety_monitor", true);
 
     auto_declare<double>("energy_budget_joule", 0.05);
     auto_declare<double>("energy_budget_margin_joule", 0.005);
     auto_declare<double>("cartesian_energy_min_pos_stiffness", 0.0);
-    auto_declare<double>("cartesian_energy_lambda_update_period_sec", 0.004);
+    auto_declare<double>("cartesian_energy_lambda_update_period_sec", 0.001);
     auto_declare<double>("contact_activation_margin", 0.0);
     auto_declare<double>("ee_collision_radius", 0.04);
     auto_declare<std::vector<double>>(
@@ -3522,13 +4327,14 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
         "ee_collision_center_offset", std::vector<double>{0.0, 0.0, 0.0});
     auto_declare<bool>("async_safety_monitor", true);
     auto_declare<double>("async_plan_max_age_sec", 0.05);
+    auto_declare<int>("async_planning_lead_steps", 24);
+    auto_declare<int>("async_verified_horizon_steps", 24);
 
     cps_human_workspace::HumanWorkspace::declareParameters(get_node());
     auto_declare<std::string>("human_workspace_topic", "human_workspace/state");
     auto_declare<double>("human_workspace_timeout_sec", 0.5);
 
-    auto_declare<double>("tracking_pos_error_bound", 0.005);
-    auto_declare<double>("tracking_vel_error_bound", 0.05);
+    auto_declare<double>("tracking_acc_error_bound", 0.2);
 
     auto_declare<bool>("use_dynamic_consistent_impedance", true);
 
@@ -3725,6 +4531,33 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         get_node()->get_parameter("failsafe_rot_damping_scale").as_double();
 
     n_stiffness_ = get_node()->get_parameter("n_stiffness").as_double();
+    nullspace_home_pose_.setZero();
+    nullspace_home_pose_valid_ = false;
+    const auto nullspace_home_pose =
+        get_node()->get_parameter("nullspace_home_pose").as_double_array();
+    if (nullspace_home_pose.size() == kNumJoints) {
+      bool finite_home_pose = true;
+      for (int i = 0; i < kNumJoints; ++i) {
+        nullspace_home_pose_(i) =
+            nullspace_home_pose[static_cast<std::size_t>(i)];
+        finite_home_pose =
+            finite_home_pose && std::isfinite(nullspace_home_pose_(i));
+      }
+      if (finite_home_pose) {
+        nullspace_home_pose_valid_ = true;
+      } else {
+        nullspace_home_pose_.setZero();
+        RCLCPP_WARN(
+            get_node()->get_logger(),
+            "nullspace_home_pose contains non-finite values. Falling back "
+            "to the activation joint state for the nullspace reference.");
+      }
+    } else {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "nullspace_home_pose must contain 7 joint values. Falling back "
+          "to the activation joint state for the nullspace reference.");
+    }
     disable_nullspace_in_failsafe_ = get_node()->get_parameter("disable_nullspace_in_failsafe").as_bool();
     enable_safety_monitor_ = get_node()->get_parameter("enable_safety_monitor").as_bool();
 
@@ -3768,8 +4601,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     async_plan_max_age_sec_ =
         std::max(0.0, get_node()->get_parameter("async_plan_max_age_sec").as_double());
 
-    tracking_pos_error_bound_ = std::max(0.0, get_node()->get_parameter("tracking_pos_error_bound").as_double());
-    tracking_vel_error_bound_ = std::max(0.0, get_node()->get_parameter("tracking_vel_error_bound").as_double());
+    tracking_acc_error_bound_ = std::max(0.0, get_node()->get_parameter("tracking_acc_error_bound").as_double());
 
     trajectory_generator_config_path_ =
         cps_trajectory_generators::defaultTrajectoryGeneratorConfigPath();
@@ -3789,6 +4621,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         std::clamp(trajectory_settings.path_time_rate_target,
                    path_time_rate_min_,
                    path_time_rate_max_);
+    mode2_energy_path_rate_target_ = path_time_rate_target_;
 
     local_replan_horizon_steps_ =
         std::max(1, trajectory_settings.local_replan_horizon_steps);
@@ -3799,6 +4632,14 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
             std::llround(std::max(monitor_update_period_sec_, local_replan_dt_) /
                          local_replan_dt_)));
     monitor_decimation_ = shield_intended_steps_;
+    async_planning_lead_steps_ = static_cast<std::size_t>(
+        std::max<int64_t>(
+            1,
+            get_node()->get_parameter("async_planning_lead_steps").as_int()));
+    async_verified_horizon_steps_ = static_cast<std::size_t>(
+        std::max<int64_t>(
+            1,
+            get_node()->get_parameter("async_verified_horizon_steps").as_int()));
     local_path_lookahead_sec_ =
         std::max(trajectory_settings.local_path_lookahead_sec, local_replan_dt_);
     local_replan_max_velocity_ =
@@ -3981,7 +4822,11 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   start_time_ = this->get_node()->now();
 
   const Eigen::Map<const Vector7d> q(franka_robot_model_->getRobotState()->q.data());
-  desired_qn_ = q;
+  if (nullspace_home_pose_valid_) {
+    desired_qn_ = nullspace_home_pose_;
+  } else {
+    desired_qn_ = q;
+  }
   const Eigen::Map<const Matrix4d> pose(
       franka_robot_model_->getPoseMatrix(franka::Frame::kEndEffector).data());
   desired_orientation_ = Quaterniond(pose.block<3, 3>(0, 0));
@@ -4046,6 +4891,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   last_commanded_sample_.failsafe = false;
   last_commanded_sample_valid_ = true;
   commanded_path_rate_ = 0.0;
+  mode2_energy_path_rate_target_ = path_time_rate_target_;
 
   mode_ = SafetyMode::kNominal;
   failsafe_start_time_sec_ = -1.0;
@@ -4083,15 +4929,23 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   last_cartesian_kinetic_energy_ = 0.0;
   last_cartesian_potential_energy_ = 0.0;
   last_cartesian_control_energy_ = 0.0;
-  cartesian_energy_lambda_cache_.setZero();
+  cartesian_energy_lambda_trans_cache_.setZero();
+  cartesian_energy_task_inertia_inv_cache_.setZero();
   cartesian_energy_lambda_cache_valid_ = false;
   cartesian_energy_lambda_cache_wall_time_ = -1.0;
   cartesian_effective_time_frozen_ = false;
   cartesian_effective_time_freeze_start_wall_time_ = -1.0;
   cartesian_effective_time_hold_sample_ = ImpedanceSample{};
   cartesian_effective_time_hold_sample_valid_ = false;
+  cartesian_energy_hold_dp_ds_.setZero();
+  cartesian_energy_hold_w_ds_.setZero();
+  cartesian_energy_hold_tangent_valid_ = false;
+  cartesian_energy_resume_path_rate_ = 0.0;
+  cartesian_energy_resume_path_rate_valid_ = false;
+  cartesian_effective_time_hold_monitor_ = MonitorResult{};
 
   last_verified_plan_ = VerifiedPlan{};
+  last_verified_plan_generation_ = 0;
   last_verified_command_stage_ = 0;
   last_verified_command_index_ = 0;
 
@@ -4169,6 +5023,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "enable_safety_monitor: " << static_cast<int>(enable_safety_monitor_) << "\n"
                     << "async_safety_monitor: " << static_cast<int>(async_safety_monitor_) << "\n"
                     << "async_plan_max_age_sec: " << async_plan_max_age_sec_ << "\n"
+                    << "async_planning_lead_steps: "
+                    << async_planning_lead_steps_ << "\n"
+                    << "async_verified_horizon_steps: "
+                    << async_verified_horizon_steps_ << "\n"
                     << "monitor_frequency_hz: " << monitor_frequency_hz_ << "\n"
                     << "monitor_update_period_sec: " << monitor_update_period_sec_ << "\n"
                     << "monitor_decimation: " << monitor_decimation_ << "\n"
@@ -4190,6 +5048,18 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "cartesian_effective_time_freeze_enabled: 1\n"
                     << "contact_activation_margin: "
                     << contact_activation_margin_ << "\n"
+                    << "tracking_acc_error_bound: "
+                    << tracking_acc_error_bound_ << "\n"
+                    << "nullspace_home_pose: ["
+                    << nullspace_home_pose_(0) << ", "
+                    << nullspace_home_pose_(1) << ", "
+                    << nullspace_home_pose_(2) << ", "
+                    << nullspace_home_pose_(3) << ", "
+                    << nullspace_home_pose_(4) << ", "
+                    << nullspace_home_pose_(5) << ", "
+                    << nullspace_home_pose_(6) << "]\n"
+                    << "nullspace_home_pose_valid: "
+                    << static_cast<int>(nullspace_home_pose_valid_) << "\n"
                     << "tcp_offset: ["
                     << tcp_offset_.x() << ", "
                     << tcp_offset_.y() << ", "
@@ -4250,7 +5120,11 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
     }
     error_log_file_ << std::fixed << std::setprecision(9);
     error_log_file_
-        << "wall_time_sec,nominal_time_sec,paused_nominal_time_sec,mode,"
+        << "wall_time_sec,nominal_time_sec,paused_nominal_time_sec,"
+        << "commanded_path_time_sec,command_path_time_sec,"
+        << "command_path_time_valid,commanded_path_rate,"
+        << "mode2_energy_path_rate_target,energy_resume_path_rate,"
+        << "energy_resume_path_rate_valid,mode,"
         << "des_px,des_py,des_pz,cur_px,cur_py,cur_pz,"
         << "cur_vx,cur_vy,cur_vz,cur_wx,cur_wy,cur_wz,"
         << "tcp_px,tcp_py,tcp_pz,tcp_vx,tcp_vy,tcp_vz,"
@@ -4270,7 +5144,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
         << "v_n_contact_nominal,Tn_contact_nominal,"
         << "worst_case_contact_time,worst_case_workspace_distance_at_candidate,"
         << "worst_case_nominal_forward_progress,"
-        << "worst_case_v_n_ub,worst_case_Tn_ub,"
+        << "worst_case_v_n_ub,worst_case_Tn_ub,worst_case_contact_energy_ub,"
         << "worst_case_a_pos,worst_case_a_brake,worst_case_a_net,"
         << "workspace_distance_margin,h_monitored_energy,h_clamping_energy,h_terminal_energy,"
         << "worst_case_V_potential_ub,terminal_energy_ub,"
@@ -4334,10 +5208,11 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
           << "closest_human_center_px,closest_human_center_py,closest_human_center_pz,"
           << "contact_normal_x,contact_normal_y,contact_normal_z,"
           << "distance_start,distance_next,distance_segment,"
-          << "contact_possible,k_n,e_n,v_n,T_n_ub,V_potential_ub,"
-          << "is_worst_T,is_worst_V,"
+          << "contact_possible,k_n,e_n,v_n,T_n_ub,V_potential_ub,contact_energy_ub,"
+          << "is_worst_T,is_worst_V,is_worst_contact_energy,"
           << "Kx,Ky,Kz,Dx,Dy,Dz,"
           << "monitor_worst_case_Tn_ub,monitor_worst_case_V_potential_ub,"
+          << "monitor_worst_case_contact_energy_ub,"
           << "monitor_terminal_energy_ub,monitor_workspace_distance_margin,monitor_h_clamping_energy\n";
       RCLCPP_INFO(
           get_node()->get_logger(),
@@ -4362,6 +5237,12 @@ CallbackReturn ReachableCartesianImpedanceController::on_deactivate(
   cartesian_effective_time_frozen_ = false;
   cartesian_effective_time_freeze_start_wall_time_ = -1.0;
   cartesian_effective_time_hold_sample_valid_ = false;
+  cartesian_energy_hold_dp_ds_.setZero();
+  cartesian_energy_hold_w_ds_.setZero();
+  cartesian_energy_hold_tangent_valid_ = false;
+  cartesian_energy_resume_path_rate_ = 0.0;
+  cartesian_energy_resume_path_rate_valid_ = false;
+  cartesian_effective_time_hold_monitor_ = MonitorResult{};
   human_workspace_active_ = false;
   J_geo_prev_.setZero();
   Jdot_dq_filtered_.setZero();

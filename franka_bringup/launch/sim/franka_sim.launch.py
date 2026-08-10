@@ -42,7 +42,8 @@ def generate_launch_description():
     if load_gripper:
         scene_file = 'scene.xml'
     else:
-        scene_file = 'scene_ng.xml'
+        # scene_file = 'scene_ng.xml'
+        scene_file = 'scene_ng_no_table.xml'
 
     franka_description_path = get_package_share_directory('franka_description')
     franka_bringup_path = get_package_share_directory('franka_bringup')

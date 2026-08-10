@@ -305,6 +305,39 @@ double estimatePathRateAtSample(
   return std::clamp(rate, 0.0, std::max(max_path_rate, 0.0));
 }
 
+double estimatePathAccelerationAtSample(
+    const CartesianTrajectorySample& planning_start,
+    const CartesianTrajectorySample& path_sample,
+    double path_rate,
+    double max_path_acceleration) {
+  // For a retimed path x(s(t)):
+  //   x_ddot = x_ss * s_dot^2 + x_s * s_ddot.
+  // Recover the scalar acceleration from the exact Cartesian command that
+  // will precede the new prefix.  Starting Ruckig at zero acceleration here
+  // creates a seam and can force the controller onto a non-path Cartesian
+  // fallback whenever planning overlaps already executing commands.
+  const double denom =
+      path_sample.dp.squaredNorm() + path_sample.w.squaredNorm();
+  if (denom < 1e-10) {
+    return 0.0;
+  }
+
+  const double rate_squared = path_rate * path_rate;
+  const Eigen::Vector3d residual_linear =
+      planning_start.ddp - path_sample.ddp * rate_squared;
+  const Eigen::Vector3d residual_angular =
+      planning_start.dw - path_sample.dw * rate_squared;
+  const double acceleration =
+      (path_sample.dp.dot(residual_linear) +
+       path_sample.w.dot(residual_angular)) /
+      denom;
+  if (!std::isfinite(acceleration)) {
+    return 0.0;
+  }
+  const double limit = std::max(max_path_acceleration, 0.0);
+  return std::clamp(acceleration, -limit, limit);
+}
+
 double nearestPathTimeInWindow(
     double min_path_time,
     const CartesianTrajectorySample& planning_start,
@@ -360,7 +393,7 @@ struct SmoothPathSample {
   Eigen::Vector3d d2p_ds2{Eigen::Vector3d::Zero()};
 };
 
-SmoothPathSample sampleCubicHermitePath(
+SmoothPathSample sampleSepticHermitePath(
     const std::vector<Eigen::Vector3d>& points,
     const std::vector<double>& u,
     const std::vector<Eigen::Vector3d>& tangents,
@@ -391,21 +424,40 @@ SmoothPathSample sampleCubicHermitePath(
   const double x = std::clamp((s - u[i0]) / h, 0.0, 1.0);
   const double x2 = x * x;
   const double x3 = x2 * x;
+  const double x4 = x3 * x;
+  const double x5 = x4 * x;
+  const double x6 = x5 * x;
+  const double x7 = x6 * x;
 
-  const double h00 = 2.0 * x3 - 3.0 * x2 + 1.0;
-  const double h10 = x3 - 2.0 * x2 + x;
-  const double h01 = -2.0 * x3 + 3.0 * x2;
-  const double h11 = x3 - x2;
+  // Septic Hermite with shared first derivatives and zero second and third
+  // derivatives at every waypoint.  Adjacent segments are C3, preventing
+  // both acceleration and jerk seams at via points.
+  const double h00 =
+      1.0 - 35.0 * x4 + 84.0 * x5 - 70.0 * x6 + 20.0 * x7;
+  const double h10 =
+      x - 20.0 * x4 + 45.0 * x5 - 36.0 * x6 + 10.0 * x7;
+  const double h01 =
+      35.0 * x4 - 84.0 * x5 + 70.0 * x6 - 20.0 * x7;
+  const double h11 =
+      -15.0 * x4 + 39.0 * x5 - 34.0 * x6 + 10.0 * x7;
 
-  const double dh00 = 6.0 * x2 - 6.0 * x;
-  const double dh10 = 3.0 * x2 - 4.0 * x + 1.0;
-  const double dh01 = -6.0 * x2 + 6.0 * x;
-  const double dh11 = 3.0 * x2 - 2.0 * x;
+  const double dh00 =
+      -140.0 * x3 + 420.0 * x4 - 420.0 * x5 + 140.0 * x6;
+  const double dh10 =
+      1.0 - 80.0 * x3 + 225.0 * x4 - 216.0 * x5 + 70.0 * x6;
+  const double dh01 =
+      140.0 * x3 - 420.0 * x4 + 420.0 * x5 - 140.0 * x6;
+  const double dh11 =
+      -60.0 * x3 + 195.0 * x4 - 204.0 * x5 + 70.0 * x6;
 
-  const double d2h00 = 12.0 * x - 6.0;
-  const double d2h10 = 6.0 * x - 4.0;
-  const double d2h01 = -12.0 * x + 6.0;
-  const double d2h11 = 6.0 * x - 2.0;
+  const double d2h00 =
+      -420.0 * x2 + 1680.0 * x3 - 2100.0 * x4 + 840.0 * x5;
+  const double d2h10 =
+      -240.0 * x2 + 900.0 * x3 - 1080.0 * x4 + 420.0 * x5;
+  const double d2h01 =
+      420.0 * x2 - 1680.0 * x3 + 2100.0 * x4 - 840.0 * x5;
+  const double d2h11 =
+      -180.0 * x2 + 780.0 * x3 - 1020.0 * x4 + 420.0 * x5;
 
   const Eigen::Vector3d& p0 = points[i0];
   const Eigen::Vector3d& p1 = points[i1];
@@ -463,6 +515,15 @@ Eigen::Vector3d clampVelocityToNonnegativeSegmentProgress(
 }
 
 }  // namespace
+
+CartesianTrajectorySample makeRetimedPathState(
+    const std::vector<CartesianTrajectorySample>& timed_path,
+    double path_time,
+    double path_rate,
+    double path_acceleration) {
+  return retimeTimedPathSample(
+      timed_path, path_time, path_rate, path_acceleration);
+}
 
 std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
     const std::vector<Eigen::Vector3d>& waypoints,
@@ -574,6 +635,55 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
         std::max(u[i + 1] - u[i - 1], kMinDt);
   }
 
+  // The scalar Ruckig limit is converted through the geometric derivative.
+  // A curved high-order segment can have |dp/ds| > 1 even when s is based on
+  // chord length, so using max_velocity directly can exceed a Cartesian-axis
+  // limit.  Bound the scalar derivatives from the whole geometric route.
+  double max_linear_axis_derivative = 0.0;
+  double max_angular_axis_derivative = 0.0;
+  constexpr int kDerivativeSamplesPerSegment = 64;
+  for (std::size_t segment = 0; segment + 1 < u.size(); ++segment) {
+    for (int j = 0; j <= kDerivativeSamplesPerSegment; ++j) {
+      const double alpha =
+          static_cast<double>(j) /
+          static_cast<double>(kDerivativeSamplesPerSegment);
+      const double path_s =
+          (1.0 - alpha) * u[segment] + alpha * u[segment + 1];
+      const SmoothPathSample linear_sample =
+          sampleSepticHermitePath(points, u, tangents, path_s);
+      const SmoothPathSample angular_sample =
+          sampleSepticHermitePath(
+              rotation_vectors, u, rotation_tangents, path_s);
+      max_linear_axis_derivative = std::max(
+          max_linear_axis_derivative,
+          linear_sample.dp_ds.cwiseAbs().maxCoeff());
+      max_angular_axis_derivative = std::max(
+          max_angular_axis_derivative,
+          angular_sample.dp_ds.cwiseAbs().maxCoeff());
+    }
+  }
+
+  double scalar_max_velocity = max_velocity;
+  if (max_linear_axis_derivative > kSmallPositive) {
+    scalar_max_velocity = std::min(
+        scalar_max_velocity,
+        max_velocity / max_linear_axis_derivative);
+  }
+  if (max_angular_axis_derivative > kSmallPositive) {
+    scalar_max_velocity = std::min(
+        scalar_max_velocity,
+        max_angular_velocity / max_angular_axis_derivative);
+  }
+  scalar_max_velocity = std::max(scalar_max_velocity, 1e-4);
+  const double derivative_scale = std::clamp(
+      scalar_max_velocity / max_velocity, 1e-3, 1.0);
+  const double scalar_max_acceleration =
+      std::max(max_acceleration * derivative_scale * derivative_scale, 1e-4);
+  const double scalar_max_jerk =
+      std::max(max_jerk * derivative_scale * derivative_scale *
+                   derivative_scale,
+               1e-4);
+
   ruckig::Ruckig<1> otg;
   ruckig::InputParameter<1> input;
   ruckig::Trajectory<1> trajectory;
@@ -584,9 +694,9 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
   input.target_position = {path_length};
   input.target_velocity = {0.0};
   input.target_acceleration = {0.0};
-  input.max_velocity = {max_velocity};
-  input.max_acceleration = {max_acceleration};
-  input.max_jerk = {max_jerk};
+  input.max_velocity = {scalar_max_velocity};
+  input.max_acceleration = {scalar_max_acceleration};
+  input.max_jerk = {scalar_max_jerk};
 
   const auto result = otg.calculate(input, trajectory);
   if (result < ruckig::Result::Working) {
@@ -614,9 +724,9 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
     const double ds_path = std::max(0.0, ds_arr[0]);
     previous_path_s = s_path;
     const SmoothPathSample path_sample =
-        sampleCubicHermitePath(points, u, tangents, s_path);
+        sampleSepticHermitePath(points, u, tangents, s_path);
     const SmoothPathSample orientation_sample =
-        sampleCubicHermitePath(
+        sampleSepticHermitePath(
             rotation_vectors, u, rotation_tangents, s_path);
 
     CartesianTrajectorySample sample;
@@ -903,8 +1013,12 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathReplan(
   const double max_rate = std::max(config.max_path_rate, 1e-4);
   const double max_accel = std::max(config.max_path_acceleration, 1e-4);
   const double max_jerk = std::max(config.max_path_jerk, 1e-4);
-  const double start_path_time = nearestPathTimeInWindow(
-      min_path_time, planning_start, timed_path, config.path_lookahead_sec);
+  const double start_path_time = config.project_start_to_nearest_path_state
+      ? nearestPathTimeInWindow(
+            min_path_time, planning_start, timed_path,
+            config.path_lookahead_sec)
+      : std::clamp(
+            min_path_time, timed_path.front().t, timed_path.back().t);
   const CartesianTrajectorySample path_start =
       sampleTimedPathAt(timed_path, start_path_time);
   const double estimated_start_rate =
@@ -913,6 +1027,8 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathReplan(
       config.initial_path_rate >= 0.0
           ? std::clamp(config.initial_path_rate, 0.0, max_rate)
           : estimated_start_rate;
+  const double start_acceleration = estimatePathAccelerationAtSample(
+      planning_start, path_start, start_rate, max_accel);
   const double target_path_time = std::min(
       std::max(start_path_time + std::max(config.path_lookahead_sec, dt),
                start_path_time + dt),
@@ -937,7 +1053,7 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathReplan(
 
   input.current_position = {start_path_time};
   input.current_velocity = {start_rate};
-  input.current_acceleration = {0.0};
+  input.current_acceleration = {start_acceleration};
   input.target_position = {target_path_time};
   const bool target_is_path_end =
       target_path_time >= timed_path.back().t - kMinDt;
@@ -994,8 +1110,12 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathIntendedPrefix
   const double max_rate = std::max(config.max_path_rate, 1e-4);
   const double max_accel = std::max(config.max_path_acceleration, 1e-4);
   const double max_jerk = std::max(config.max_path_jerk, 1e-4);
-  const double start_path_time = nearestPathTimeInWindow(
-      min_path_time, planning_start, timed_path, config.path_lookahead_sec);
+  const double start_path_time = config.project_start_to_nearest_path_state
+      ? nearestPathTimeInWindow(
+            min_path_time, planning_start, timed_path,
+            config.path_lookahead_sec)
+      : std::clamp(
+            min_path_time, timed_path.front().t, timed_path.back().t);
   const CartesianTrajectorySample path_start =
       sampleTimedPathAt(timed_path, start_path_time);
   const double estimated_start_rate =
@@ -1004,6 +1124,8 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathIntendedPrefix
       config.initial_path_rate >= 0.0
           ? std::clamp(config.initial_path_rate, 0.0, max_rate)
           : estimated_start_rate;
+  const double start_acceleration = estimatePathAccelerationAtSample(
+      planning_start, path_start, start_rate, max_accel);
   const double target_rate =
       std::clamp(config.target_path_rate, 0.0, max_rate);
 
@@ -1027,7 +1149,7 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathIntendedPrefix
   input.control_interface = ruckig::ControlInterface::Velocity;
   input.current_position = {start_path_time};
   input.current_velocity = {start_rate};
-  input.current_acceleration = {0.0};
+  input.current_acceleration = {start_acceleration};
   input.target_velocity = {target_rate};
   input.target_acceleration = {0.0};
   input.max_velocity = {max_rate};
@@ -1093,6 +1215,8 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathBrake(
       sampleTimedPathAt(timed_path, start_path_time);
   const double start_rate =
       estimatePathRateAtSample(brake_start, path_start, max_rate);
+  const double start_acceleration = estimatePathAccelerationAtSample(
+      brake_start, path_start, start_rate, max_accel);
 
   ruckig::Ruckig<1> otg;
   ruckig::InputParameter<1> input;
@@ -1100,7 +1224,7 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathBrake(
   input.control_interface = ruckig::ControlInterface::Velocity;
   input.current_position = {start_path_time};
   input.current_velocity = {start_rate};
-  input.current_acceleration = {0.0};
+  input.current_acceleration = {start_acceleration};
   input.target_velocity = {0.0};
   input.target_acceleration = {0.0};
   input.max_velocity = {max_rate};

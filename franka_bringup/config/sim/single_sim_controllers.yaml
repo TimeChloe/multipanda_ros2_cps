@@ -213,25 +213,34 @@ reachable_cartesian_impedance_controller:
     # type of an empty YAML sequence here.
     # cartesian_via_points: []
 
-
-    nominal_pos_stiffness: 1200.0
-    nominal_rot_stiffness: 200.0
+    nominal_pos_stiffness: 1500.0
+    nominal_rot_stiffness: 500.0
 
     # Failsafe 建议比 nominal 更软，但阻尼更大，用于安全吸收动能。
-    failsafe_pos_stiffness: 1200.0
-    failsafe_rot_stiffness: 200.0
+    failsafe_pos_stiffness: 1500.0
+    failsafe_rot_stiffness: 500.0
     failsafe_pos_damping_scale: 0.8
     failsafe_rot_damping_scale: 0.8
 
-    n_stiffness: 0.0
+    n_stiffness: 20.0
+    # Panda home/ready joint pose used as the nullspace reference when
+    # n_stiffness is enabled.
+    nullspace_home_pose:
+      - 0.0
+      - -0.7853981633974483
+      - 0.0
+      - -2.356194490192345
+      - 0.0
+      - 1.5707963267948966
+      - 0.7853981633974483
     disable_nullspace_in_failsafe: true
 
     enable_safety_monitor: true
 
     energy_budget_joule: 0.12
     energy_budget_margin_joule: 0.000
-    cartesian_energy_min_pos_stiffness: 400.0
-    cartesian_energy_lambda_update_period_sec: 0.004
+    cartesian_energy_min_pos_stiffness: 0.0
+    cartesian_energy_lambda_update_period_sec: 0.001
     contact_activation_margin: 0.00
 
     # Collision model for the safety monitor:
@@ -239,18 +248,24 @@ reachable_cartesian_impedance_controller:
     # tcp_offset keeps Cartesian control at the metal-ball TCP
     # (panda_link8 + [0, 0, 0.06]); ee_collision_center_offset moves the
     # safety collision model back to the metal-ball center.
-    # ee_collision_radius expands the monitored sphere around that center.
+    # ee_collision_radius expands theterminal_energy_ub monitored sphere around that center.
     ee_collision_radius: 0.03
     tcp_offset: [0.0, 0.0, 0.06]
     ee_collision_center_offset: [0.0, 0.0, -0.03]
     async_safety_monitor: true
     async_plan_max_age_sec: 0.05
+    # At most 24 already-verified commands cover worker latency. In nominal
+    # mode this prefix stops at the intended/failsafe boundary; the result must
+    # arrive before that shorter prefix expires instead of pre-committing to a
+    # brake. The separate 24-step horizon is the fresh intended tail after
+    # activation. Latest measured compute latency was at most 16 ms.
+    async_planning_lead_steps: 24
+    async_verified_horizon_steps: 24
     enable_mujoco_contact_logging: true
     mujoco_contact_sensor_topic: /panda_metal_ball_touch
     mujoco_contact_threshold: 1.0e-6
 
-    # 误差管道 tracking error tube 边界
-    tracking_pos_error_bound: 0.000
-    tracking_vel_error_bound: 0.0
+    # Residual acceleration disturbance for the measured-state rollout.
+    tracking_acc_error_bound: 0.2
 
     use_dynamic_consistent_impedance: true

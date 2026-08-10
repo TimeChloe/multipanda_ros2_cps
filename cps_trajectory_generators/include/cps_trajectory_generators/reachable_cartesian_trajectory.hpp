@@ -34,6 +34,10 @@ struct PathConsistentTimedPathConfig {
   int intended_steps{1};
   double dt{0.001};
   double path_lookahead_sec{0.08};
+  // Reprojection is useful when reconnecting an arbitrary Cartesian state.
+  // It must be disabled when the caller already owns an exact verified scalar
+  // path state, otherwise nearby/crossing path branches can be skipped.
+  bool project_start_to_nearest_path_state{true};
   double max_path_rate{1.0};
   double max_path_acceleration{0.5};
   double max_path_jerk{5.0};
@@ -88,6 +92,12 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
     const CartesianTrajectorySample& planning_start,
     const std::vector<CartesianTrajectorySample>& timed_path,
     const LocalCartesianReplanConfig& config);
+
+CartesianTrajectorySample makeRetimedPathState(
+    const std::vector<CartesianTrajectorySample>& timed_path,
+    double path_time,
+    double path_rate,
+    double path_acceleration);
 
 std::vector<CartesianTrajectorySample> makePathConsistentTimedPathReplan(
     double min_path_time,

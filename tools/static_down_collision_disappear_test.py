@@ -10,7 +10,7 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 
 from mujoco_ros_msgs.msg import ScalarStamped
-from mujoco_ros_msgs.srv import SetGeomProperties, SetPause
+from mujoco_ros_msgs.srv import GetGeomProperties, SetGeomProperties, SetPause
 from panda_motion_generator_msgs.action import CartesianViaMotion
 
 
@@ -68,6 +68,8 @@ class StaticDownCollisionDisappearTest(Node):
             self, CartesianViaMotion, args.action_name)
         self.geom_client = self.create_client(
             SetGeomProperties, args.set_geom_properties_service)
+        self.geom_properties_client = self.create_client(
+            GetGeomProperties, args.get_geom_properties_service)
         self.pause_client = self.create_client(SetPause, args.pause_service)
 
         self.start_timer = self.create_timer(0.1, self.try_start)
@@ -231,6 +233,14 @@ class StaticDownCollisionDisappearTest(Node):
             self.exit_code = 3
             rclpy.shutdown()
             return
+        if not self.geom_properties_client.wait_for_service(
+                timeout_sec=self.args.service_timeout):
+            self.get_logger().error(
+                "Get-geom-properties service "
+                f"{self.args.get_geom_properties_service} is not available.")
+            self.exit_code = 3
+            rclpy.shutdown()
+            return
 
         self.get_logger().info(
             "Shrinking table, spring, and hand-surface geoms to make them disappear.")
@@ -253,11 +263,46 @@ class StaticDownCollisionDisappearTest(Node):
 
         geom_name = DISAPPEARING_GEOMS[self.geom_index]
 
+        request = GetGeomProperties.Request()
+        request.geom_name = geom_name
+        request.admin_hash = self.args.admin_hash
+
+        future = self.geom_properties_client.call_async(request)
+        future.add_done_callback(
+            lambda done_future, name=geom_name: self.handle_geom_properties_result(
+                name, done_future))
+
+    def handle_geom_properties_result(self, geom_name, future):
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().error(
+                f"Get-geom-properties call failed for {geom_name}: {exc}")
+            self.failed_geoms.append(geom_name)
+            self.geom_index += 1
+            self.call_next_disappear_geom()
+            return
+
+        if not response.success:
+            self.get_logger().error(
+                f"Could not read {geom_name}: {response.status_message}")
+            self.failed_geoms.append(geom_name)
+            self.geom_index += 1
+            self.call_next_disappear_geom()
+            return
+
+        size = self.args.hidden_geom_size
+        sizes = (
+            min(size, max(0.0, response.properties.size_0)),
+            min(size, max(0.0, response.properties.size_1)),
+            min(size, max(0.0, response.properties.size_2)),
+        )
+
         request = SetGeomProperties.Request()
         request.properties.name = geom_name
-        request.properties.size_0 = self.args.hidden_geom_size
-        request.properties.size_1 = self.args.hidden_geom_size
-        request.properties.size_2 = self.args.hidden_geom_size
+        request.properties.size_0 = sizes[0]
+        request.properties.size_1 = sizes[1]
+        request.properties.size_2 = sizes[2]
         request.set_size = True
         request.admin_hash = self.args.admin_hash
 
@@ -302,6 +347,9 @@ def parse_args(argv):
     parser.add_argument(
         "--set-geom-properties-service",
         default="/set_geom_properties")
+    parser.add_argument(
+        "--get-geom-properties-service",
+        default="/get_geom_properties")
     parser.add_argument("--hidden-geom-size", type=float, default=1.0e-5)
     parser.add_argument("--pause-service", default="/set_pause")
     parser.add_argument(

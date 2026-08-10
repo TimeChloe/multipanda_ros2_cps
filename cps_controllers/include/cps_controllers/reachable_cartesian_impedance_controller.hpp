@@ -144,7 +144,10 @@ class ReachableCartesianImpedanceController
       double nominal_guess_time,
       const ImpedanceSample& planning_start_command,
       double initial_path_rate,
-      double commanded_path_time) const;
+      double target_path_rate,
+      double commanded_path_time,
+      bool reanchor_path_kinematics,
+      double reanchor_path_rate) const;
 
   VerifiedPlan buildCandidatePlan(
       double wall_time,
@@ -155,7 +158,8 @@ class ReachableCartesianImpedanceController
       const Matrix37d& Jv,
       const Matrix6d& K_runtime,
       const Matrix6d& D_runtime,
-      const std::vector<ImpedanceSample>& intended_samples) const;
+      const std::vector<ImpedanceSample>& intended_samples,
+      std::size_t derivative_reanchor_index) const;
 
   MonitorResult evaluateCandidatePlan(const VerifiedPlan& plan,
                                       const Vector3d& current_position,
@@ -197,6 +201,7 @@ class ReachableCartesianImpedanceController
   struct AsyncMonitorInput {
     std::uint64_t sequence{0};
     std::uint64_t control_loop_sequence{0};
+    std::uint64_t source_plan_generation{0};
     double wall_time{0.0};
     double nominal_guess_time{0.0};
 
@@ -214,6 +219,11 @@ class ReachableCartesianImpedanceController
     bool last_commanded_sample_valid{false};
     double commanded_path_time{0.0};
     double commanded_path_rate{0.0};
+    double target_path_rate{1.0};
+    bool reanchor_path_kinematics{false};
+    double reanchor_path_rate{0.0};
+    std::size_t nominal_advance_steps{0};
+    std::vector<ImpedanceSample> committed_prefix;
   };
 
   struct AsyncMonitorOutput {
@@ -349,6 +359,11 @@ class ReachableCartesianImpedanceController
 
   ImpedanceSample getNextVerifiedTrajectoryCommandFromCache(bool advance_index);
 
+  bool getVerifiedTrajectoryCommandAtOffset(
+      const VerifiedPlan& plan,
+      std::size_t offset,
+      ImpedanceSample* command) const;
+
   void alignVerifiedPlanExecutionIndex(
       VerifiedPlan* plan,
       std::size_t elapsed_control_steps) const;
@@ -379,6 +394,10 @@ class ReachableCartesianImpedanceController
   bool computeTaskInertia(const Matrix7d& inertia,
                           const Matrix67d& J_geo,
                           Matrix6d* lambda) const;
+  bool computeTranslationalTaskInertia(const Matrix7d& inertia,
+                                       const Matrix37d& Jv,
+                                       Matrix3d* lambda_trans,
+                                       Matrix3d* task_inertia_inv) const;
 
   ImpedanceSample makeEffectiveTimeHoldSample(
       const ImpedanceSample& command) const;
@@ -386,10 +405,9 @@ class ReachableCartesianImpedanceController
 
   ImpedanceSample applyCartesianEnergyBudget(
       const ImpedanceSample& command,
-      const Vector6d& error,
-      const Vector6d& xdot,
-      const Matrix6d& lambda,
-      bool lambda_valid,
+      double kinetic_energy,
+      double potential_energy,
+      bool energy_valid,
       bool active,
       CartesianEnergyBudgetInfo* info) const;
 
@@ -447,6 +465,8 @@ class ReachableCartesianImpedanceController
   Quaterniond desired_orientation_;
   Vector3d desired_position_;
   Vector7d desired_qn_;
+  Vector7d nullspace_home_pose_{Vector7d::Zero()};
+  bool nullspace_home_pose_valid_{false};
 
   SafetyMode mode_{SafetyMode::kNominal};
   double failsafe_start_time_sec_{-1.0};
@@ -472,6 +492,12 @@ class ReachableCartesianImpedanceController
   int monitor_decimation_{1};
   bool async_safety_monitor_{true};
   double async_plan_max_age_sec_{0.05};
+  // The lead is the maximum already-verified command prefix executed while
+  // the worker runs. In nominal mode it is truncated at the intended/failsafe
+  // boundary so a new candidate never promises to brake just to fill it.
+  // The horizon is the fresh intended tail available after activation.
+  std::size_t async_planning_lead_steps_{24};
+  std::size_t async_verified_horizon_steps_{24};
 
   cps_human_workspace::HumanWorkspace human_workspace_;
   realtime_tools::RealtimeBuffer<cps_human_workspace::HumanWorkspace::Parameters>
@@ -486,8 +512,7 @@ class ReachableCartesianImpedanceController
   std::atomic<double> latest_human_workspace_msg_time_sec_{-1.0};
 
   // 替换了旧的 error_pos_gain_alpha_ 等常数，改用固定的误差管道边界
-  double tracking_pos_error_bound_{0.000};
-  double tracking_vel_error_bound_{0.00};
+  double tracking_acc_error_bound_{0.2};
 
   double shield_plan_dt_{0.01};
   int shield_intended_steps_{1};
@@ -553,6 +578,7 @@ class ReachableCartesianImpedanceController
   double last_async_input_publish_wall_time_{-1.0};
 
   VerifiedPlan last_verified_plan_{};
+  std::uint64_t last_verified_plan_generation_{0};
   int last_verified_command_stage_{0};
   std::size_t last_verified_command_index_{0};
 
@@ -599,8 +625,12 @@ class ReachableCartesianImpedanceController
 
   double energy_budget_margin_joule_{0.005};
   double cartesian_energy_min_pos_stiffness_{0.0};
-  double cartesian_energy_lambda_update_period_sec_{0.004};
-  Matrix6d cartesian_energy_lambda_cache_{};
+  double cartesian_energy_lambda_update_period_sec_{0.001};
+  // Only scalar path progress is retimed in mode 2; the Cartesian path is
+  // unchanged. Mode 0 always requests the nominal path rate.
+  double mode2_energy_path_rate_target_{1.0};
+  Matrix3d cartesian_energy_lambda_trans_cache_{Matrix3d::Zero()};
+  Matrix3d cartesian_energy_task_inertia_inv_cache_{Matrix3d::Zero()};
   bool cartesian_energy_lambda_cache_valid_{false};
   double cartesian_energy_lambda_cache_wall_time_{-1.0};
   bool last_cartesian_energy_budget_active_{false};
@@ -613,6 +643,18 @@ class ReachableCartesianImpedanceController
   double cartesian_effective_time_freeze_start_wall_time_{-1.0};
   ImpedanceSample cartesian_effective_time_hold_sample_{};
   bool cartesian_effective_time_hold_sample_valid_{false};
+  // Fixed-size state used by the 1 kHz loop to project the measured TCP twist
+  // onto the original path tangent while an energy hold is active. No path
+  // search, allocation, or mutex is needed in the real-time loop.
+  Vector3d cartesian_energy_hold_dp_ds_{Vector3d::Zero()};
+  Vector3d cartesian_energy_hold_w_ds_{Vector3d::Zero()};
+  bool cartesian_energy_hold_tangent_valid_{false};
+  double cartesian_energy_resume_path_rate_{0.0};
+  bool cartesian_energy_resume_path_rate_valid_{false};
+  // Preserve the monitor state that caused the Lachner energy hold. The
+  // controller remains in mode 2 until a newly verified candidate explicitly
+  // proves that the robot has left the human workspace.
+  MonitorResult cartesian_effective_time_hold_monitor_{};
   double contact_activation_margin_{0.0};
   double failsafe_min_pos_stiffness_{5.0};
 

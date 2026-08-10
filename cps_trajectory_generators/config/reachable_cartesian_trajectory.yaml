@@ -3,10 +3,10 @@
 
 # Sparse interval used by shield prediction/verification.
 # Dense command and failsafe trajectories still use local_replan_dt.
-shield_plan_dt: 0.004
+shield_plan_dt: 0.002
 monitor_frequency_hz: 250.0
 
-local_replan_horizon_steps: 25
+local_replan_horizon_steps: 50
 local_replan_dt: 0.001
 local_path_lookahead_sec: 0.50
 local_replan_max_velocity: 0.40

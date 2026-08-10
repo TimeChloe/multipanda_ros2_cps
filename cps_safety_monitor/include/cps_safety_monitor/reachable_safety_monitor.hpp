@@ -49,6 +49,7 @@ struct MonitorResult {
 
   double worst_case_v_n_ub{0.0};
   double worst_case_Tn_ub{0.0};
+  double worst_case_contact_energy_ub{0.0};
   double worst_case_a_pos{0.0};
   double worst_case_a_brake{0.0};
   double worst_case_a_net{0.0};
@@ -77,6 +78,10 @@ struct MonitorResult {
 
 struct ImpedanceSample {
   double t{0.0};
+  // Progress on the nominal timed path.  This is kept separate from t,
+  // because t is retimed to the monitored/execution horizon.
+  double nominal_path_time{0.0};
+  bool nominal_path_time_valid{false};
 
   Vector3d p{Vector3d::Zero()};
   Vector3d dp{Vector3d::Zero()};
@@ -117,8 +122,7 @@ struct SafetyMonitorConfig {
   double energy_budget_margin_joule{0.005};
   double ee_collision_radius{0.04};
   double contact_activation_margin{0.0};
-  double tracking_pos_error_bound{0.005};
-  double tracking_vel_error_bound{0.05};
+  double tracking_acc_error_bound{0.2};
   bool use_dynamic_consistent_impedance{true};
 };
 

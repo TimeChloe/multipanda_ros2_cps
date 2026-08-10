@@ -4,9 +4,6 @@ ros2 control load_controller --set-state active reachable_cartesian_impedance_co
 
 ros2 run franka_simple_publishers clear_mujoco_obstacles
 
-ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian_via_points \
-  panda_motion_generator_msgs/action/CartesianViaMotion \
-  "$(cat src/cps_trajectory_generators/config/examples/reachable_via_points_dynamic_human_crossing_action_goal.yaml)"
   
 ros2 launch cps_human_workspace human_workspace.launch.py \
   human_workspace_config_path:=/path/to/your_workspace.yaml
@@ -31,3 +28,20 @@ human_workspace_config:=human_workspace_dynamic_crossing.yaml \
 use_sim_time:=true
 
 ros2 run franka_simple_publishers clear_mujoco_obstacles
+
+
+some other goal via points:
+ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian_via_points \
+  panda_motion_generator_msgs/action/CartesianViaMotion \
+  "$(cat src/cps_trajectory_generators/config/examples/reachable_via_points_dynamic_human_crossing_action_goal.yaml)"
+  
+ 
+ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian_via_points \
+  panda_motion_generator_msgs/action/CartesianViaMotion \
+  "$(cat src/cps_trajectory_generators/config/examples/reachable_via_points_table_corner_back_right_action_goal.yaml)"
+  
+
+ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian_via_points \
+  panda_motion_generator_msgs/action/CartesianViaMotion \
+  "$(cat src/cps_trajectory_generators/config/examples/reachable_via_points_table_center_high_action_goal.yaml)"
+  

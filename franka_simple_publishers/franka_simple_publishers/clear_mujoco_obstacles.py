@@ -2,7 +2,7 @@ import argparse
 import sys
 
 import rclpy
-from mujoco_ros_msgs.srv import SetGeomProperties
+from mujoco_ros_msgs.srv import GetGeomProperties, SetGeomProperties
 
 
 DEFAULT_GEOMS = (
@@ -33,6 +33,10 @@ def parse_args(argv):
         default='/set_geom_properties',
         help='MuJoCo SetGeomProperties service name.')
     parser.add_argument(
+        '--get-service',
+        default='/get_geom_properties',
+        help='MuJoCo GetGeomProperties service name.')
+    parser.add_argument(
         '--timeout',
         type=float,
         default=5.0,
@@ -56,16 +60,24 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
-def make_request(geom_name, size, admin_hash):
+def hidden_sizes(size, properties):
+    return (
+        min(size, max(0.0, properties.size_0)),
+        min(size, max(0.0, properties.size_1)),
+        min(size, max(0.0, properties.size_2)),
+    )
+
+
+def make_request(geom_name, sizes, admin_hash):
     request = SetGeomProperties.Request()
     request.properties.name = geom_name
     request.set_collision = True
     request.properties.contype = 0
     request.properties.conaffinity = 0
     request.set_size = True
-    request.properties.size_0 = size
-    request.properties.size_1 = size
-    request.properties.size_2 = size
+    request.properties.size_0 = sizes[0]
+    request.properties.size_1 = sizes[1]
+    request.properties.size_2 = sizes[2]
     request.set_friction = True
     request.properties.friction_slide = 0.0
     request.properties.friction_spin = 0.0
@@ -74,8 +86,32 @@ def make_request(geom_name, size, admin_hash):
     return request
 
 
-def clear_geom(node, client, geom_name, size, admin_hash, timeout):
-    future = client.call_async(make_request(geom_name, size, admin_hash))
+def get_geom_properties(node, client, geom_name, admin_hash, timeout):
+    request = GetGeomProperties.Request()
+    request.geom_name = geom_name
+    request.admin_hash = admin_hash
+    future = client.call_async(request)
+    rclpy.spin_until_future_complete(node, future, timeout_sec=timeout)
+
+    if not future.done():
+        return None, 'get properties timed out'
+
+    response = future.result()
+    if response is None:
+        return None, 'get properties returned no response'
+    if not response.success:
+        return None, response.status_message
+    return response.properties, ''
+
+
+def clear_geom(node, set_client, get_client, geom_name, size, admin_hash, timeout):
+    properties, error = get_geom_properties(
+        node, get_client, geom_name, admin_hash, timeout)
+    if properties is None:
+        return False, error
+
+    future = set_client.call_async(
+        make_request(geom_name, hidden_sizes(size, properties), admin_hash))
     rclpy.spin_until_future_complete(node, future, timeout_sec=timeout)
 
     if not future.done():
@@ -95,19 +131,25 @@ def main(argv=None):
 
     rclpy.init()
     node = rclpy.create_node('clear_mujoco_obstacles')
-    client = node.create_client(SetGeomProperties, args.service)
+    set_client = node.create_client(SetGeomProperties, args.service)
+    get_client = node.create_client(GetGeomProperties, args.get_service)
 
     try:
-        if not client.wait_for_service(timeout_sec=args.timeout):
+        if not set_client.wait_for_service(timeout_sec=args.timeout):
             node.get_logger().error(
                 "Service '%s' is not available." % args.service)
+            return 1
+        if not get_client.wait_for_service(timeout_sec=args.timeout):
+            node.get_logger().error(
+                "Service '%s' is not available." % args.get_service)
             return 1
 
         failures = []
         for geom_name in geoms:
             success, message = clear_geom(
                 node,
-                client,
+                set_client,
+                get_client,
                 geom_name,
                 size,
                 args.admin_hash,
