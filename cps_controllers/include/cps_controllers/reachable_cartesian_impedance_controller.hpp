@@ -129,16 +129,12 @@ class ReachableCartesianImpedanceController
 
   bool refreshHumanWorkspaceForMonitor(double wall_time);
 
-  ImpedanceSample makeFrozenFailsafeSample(
-      double nominal_time,
-      const ImpedanceSample& freeze_sample,
-      const Matrix6d& K_target,
-      const Matrix6d& D_target) const;
-
   ImpedanceSample makeEmergencyStopCommand(
       const Vector3d& current_position,
       const Quaterniond& current_orientation,
       double wall_time) const;
+
+  bool anchorLastCommandedSampleToPathStart();
 
   std::vector<ImpedanceSample> makeIntendedBufferFromReplanner(
       double nominal_guess_time,

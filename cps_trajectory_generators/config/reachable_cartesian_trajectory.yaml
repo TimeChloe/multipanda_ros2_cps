@@ -1,12 +1,16 @@
 # Reachable Cartesian trajectory generator settings.
 # Controller ROS parameters should only choose the task, not tune Ruckig internals.
+# The reachable Cartesian impedance controller enforces strict path-consistent
+# execution: Cartesian reconnect and Cartesian braking utilities are not used as
+# fallbacks. A candidate without valid scalar path progress or a continuous
+# scalar braking continuation is rejected.
 
 # Sparse interval used by shield prediction/verification.
 # Dense command and failsafe trajectories still use local_replan_dt.
-shield_plan_dt: 0.002
-monitor_frequency_hz: 250.0
+shield_plan_dt: 0.004
+monitor_frequency_hz: 200.0
 
-local_replan_horizon_steps: 50
+local_replan_horizon_steps: 25
 local_replan_dt: 0.001
 local_path_lookahead_sec: 0.50
 local_replan_max_velocity: 0.40

@@ -73,7 +73,6 @@ using LocalCartesianReplanConfig = cps_trajectory_generators::LocalCartesianRepl
 using PathConsistentTimedPathConfig =
     cps_trajectory_generators::PathConsistentTimedPathConfig;
 using cps_trajectory_generators::loadTrajectoryGeneratorSettings;
-using cps_trajectory_generators::makeLocalCartesianReplanFromTimedPath;
 using cps_trajectory_generators::makePathConsistentTimedPathBrake;
 using cps_trajectory_generators::makePathConsistentTimedPathIntendedPrefix;
 using cps_trajectory_generators::makeRetimedPathState;
@@ -746,22 +745,6 @@ ReachableCartesianImpedanceController::state_interface_configuration() const {
   return config;
 }
 
-ImpedanceSample ReachableCartesianImpedanceController::makeFrozenFailsafeSample(
-    double nominal_time, const ImpedanceSample& freeze_sample,
-    const Matrix6d& K_target, const Matrix6d& D_target) const {
-  ImpedanceSample s;
-  s.t = nominal_time;
-  s.nominal_path_time = freeze_sample.nominal_path_time;
-  s.nominal_path_time_valid = freeze_sample.nominal_path_time_valid;
-  s.p = freeze_sample.p;
-  s.dp.setZero(); s.ddp.setZero();
-  s.q = freeze_sample.q; s.q.normalize();
-  s.w.setZero(); s.dw.setZero();
-  s.K = K_target; s.D = D_target;
-  s.failsafe = true;
-  return s;
-}
-
 ImpedanceSample ReachableCartesianImpedanceController::makeEmergencyStopCommand(
     const Vector3d& current_position, const Quaterniond& current_orientation,
     double wall_time) const {
@@ -774,6 +757,46 @@ ImpedanceSample ReachableCartesianImpedanceController::makeEmergencyStopCommand(
   emergency.K = K_f_target_; emergency.D = D_f_target_;
   emergency.failsafe = true;
   return emergency;
+}
+
+bool ReachableCartesianImpedanceController::anchorLastCommandedSampleToPathStart() {
+  std::vector<CartesianTrajectorySample> active_path;
+  {
+    std::lock_guard<std::mutex> lock(cartesian_via_point_path_mutex_);
+    active_path = cartesian_via_point_path_;
+  }
+  if (!last_commanded_sample_valid_ || active_path.empty()) {
+    return false;
+  }
+
+  const CartesianTrajectorySample& path_start = active_path.front();
+  constexpr double kPositionTolerance = 1.0e-8;
+  constexpr double kDerivativeTolerance = 1.0e-8;
+  constexpr double kOrientationTolerance = 1.0e-8;
+  const Quaterniond command_orientation =
+      normalizedQuaternionOrIdentity(last_commanded_sample_.q);
+  const Quaterniond path_orientation =
+      normalizedQuaternionOrIdentity(path_start.q);
+  const bool continuous =
+      (last_commanded_sample_.p - path_start.p).norm() <=
+          kPositionTolerance &&
+      (last_commanded_sample_.dp - path_start.dp).norm() <=
+          kDerivativeTolerance &&
+      (last_commanded_sample_.ddp - path_start.ddp).norm() <=
+          kDerivativeTolerance &&
+      (last_commanded_sample_.w - path_start.w).norm() <=
+          kDerivativeTolerance &&
+      (last_commanded_sample_.dw - path_start.dw).norm() <=
+          kDerivativeTolerance &&
+      1.0 - std::abs(command_orientation.dot(path_orientation)) <=
+          kOrientationTolerance;
+  if (!continuous) {
+    return false;
+  }
+
+  last_commanded_sample_.nominal_path_time = path_start.t;
+  last_commanded_sample_.nominal_path_time_valid = true;
+  return true;
 }
 
 ImpedanceSample ReachableCartesianImpedanceController::getNextFailsafeCommandFromCache(
@@ -925,6 +948,11 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     double commanded_path_time,
     bool reanchor_path_kinematics,
     double reanchor_path_rate) const {
+  // Strict path-consistent execution never reconstructs scalar progress from an
+  // arbitrary Cartesian state.  These time guesses are retained in the caller
+  // interface for logging/backward compatibility, but cannot authorize motion.
+  (void)nominal_guess_time;
+  (void)commanded_path_time;
   CartesianTrajectorySample planning_start;
   planning_start.t = planning_start_command.t;
   planning_start.p = planning_start_command.p;
@@ -934,17 +962,6 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
   planning_start.q.normalize();
   planning_start.w = planning_start_command.w;
   planning_start.dw = planning_start_command.dw;
-
-  LocalCartesianReplanConfig config;
-  config.horizon_steps = local_replan_horizon_steps_;
-  config.dt = local_replan_dt_;
-  config.path_lookahead_sec = local_path_lookahead_sec_;
-  config.max_velocity = local_replan_max_velocity_;
-  config.max_acceleration = local_replan_max_acceleration_;
-  config.max_jerk = local_replan_max_jerk_;
-  config.max_angular_velocity = local_replan_max_angular_velocity_;
-  config.max_angular_acceleration = local_replan_max_angular_acceleration_;
-  config.max_angular_jerk = local_replan_max_angular_jerk_;
 
   std::vector<CartesianTrajectorySample> active_path;
   {
@@ -997,11 +1014,10 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
             angular_jerk_step + kSeamTolerance;
   };
 
-  if (!active_path.empty()) {
+  if (!active_path.empty() &&
+      planning_start_command.nominal_path_time_valid) {
     const double path_start_time =
-        planning_start_command.nominal_path_time_valid
-            ? planning_start_command.nominal_path_time
-            : std::max(nominal_guess_time, commanded_path_time);
+        planning_start_command.nominal_path_time;
 
     // During a Lachner hold, the frozen command has zero desired derivatives
     // even though the physical robot can still be moving. Reconstruct the
@@ -1028,8 +1044,7 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     path_config.intended_steps = std::max(1, local_replan_horizon_steps_);
     path_config.dt = local_replan_dt_;
     path_config.path_lookahead_sec = local_path_lookahead_sec_;
-    path_config.project_start_to_nearest_path_state =
-        !planning_start_command.nominal_path_time_valid;
+    path_config.project_start_to_nearest_path_state = false;
     path_config.max_path_rate = std::max(path_time_rate_max_, 1e-4);
     path_config.max_path_acceleration =
         std::max(path_time_acc_limit_, 1e-4);
@@ -1057,22 +1072,6 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
       planned_samples.clear();
     } else {
       planned_samples_are_path_consistent = true;
-    }
-
-    // Only an explicitly off-path state may use the Cartesian reconnect.  If
-    // an exact verified scalar path state fails the seam check, rejecting this
-    // candidate preserves the old verified path/failsafe.  Silently replacing
-    // it with a Cartesian shortcut can skip a nearby or crossing route branch.
-    if (planned_samples.empty() &&
-        !planning_start_command.nominal_path_time_valid) {
-      planned_samples = makeLocalCartesianReplanFromTimedPath(
-          path_start_time,
-          planning_start,
-          active_path,
-          config);
-      if (!has_continuous_seam(planned_samples)) {
-        planned_samples.clear();
-      }
     }
   }
 
@@ -1137,6 +1136,19 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
   plan.intended_exec_index = 0;
   plan.failsafe_exec_index = 0;
 
+  // Pin one geometric path for the complete candidate.  Besides avoiding a
+  // mixed old-path intended/new-path brake during an action update, this
+  // snapshot lets the final executable check prove that every command still
+  // belongs to the path identified by its scalar progress coordinate.
+  std::vector<CartesianTrajectorySample> active_path;
+  {
+    std::lock_guard<std::mutex> lock(cartesian_via_point_path_mutex_);
+    active_path = cartesian_via_point_path_;
+  }
+  if (active_path.empty()) {
+    return plan;
+  }
+
   plan.anchor.t = 0.0;
   plan.anchor.p = current_position;
   plan.anchor.dp = ee_twist.head<3>();
@@ -1182,24 +1194,9 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     brake_start.w = freeze_anchor.w;
     brake_start.dw = freeze_anchor.dw;
 
-    LocalCartesianReplanConfig brake_config;
-    brake_config.dt = failsafe_plan_dt;
-    brake_config.max_velocity = failsafe_brake_max_velocity_;
-    brake_config.max_acceleration = failsafe_brake_max_acceleration_;
-    brake_config.max_jerk = failsafe_brake_max_jerk_;
-    brake_config.max_angular_velocity = failsafe_brake_max_angular_velocity_;
-    brake_config.max_angular_acceleration =
-        failsafe_brake_max_angular_acceleration_;
-    brake_config.max_angular_jerk = failsafe_brake_max_angular_jerk_;
-
     std::vector<CartesianTrajectorySample> brake_samples;
     bool path_consistent_brake = false;
     if (freeze_anchor.nominal_path_time_valid) {
-      std::vector<CartesianTrajectorySample> active_path;
-      {
-        std::lock_guard<std::mutex> lock(cartesian_via_point_path_mutex_);
-        active_path = cartesian_via_point_path_;
-      }
       PathConsistentTimedPathConfig path_brake_config;
       path_brake_config.dt = failsafe_plan_dt;
       path_brake_config.path_lookahead_sec = local_path_lookahead_sec_;
@@ -1210,13 +1207,11 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
           std::max(failsafe_brake_max_jerk_, 1e-4);
       path_brake_config.target_path_rate = 0.0;
 
-      if (!active_path.empty()) {
-        brake_samples = makePathConsistentTimedPathBrake(
-            freeze_anchor.nominal_path_time,
-            brake_start,
-            active_path,
-            path_brake_config);
-      }
+      brake_samples = makePathConsistentTimedPathBrake(
+          freeze_anchor.nominal_path_time,
+          brake_start,
+          active_path,
+          path_brake_config);
 
       // A path-consistent stop is admissible only if the intended endpoint is
       // actually on that path state.  This rejects the former hybrid jump
@@ -1265,15 +1260,9 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
       }
     }
 
+    // Strict path consistency: an unavailable or discontinuous scalar brake
+    // invalidates the candidate.  Never replace it with a Cartesian shortcut.
     if (brake_samples.empty()) {
-      brake_samples = makeCartesianBrakeTrajectory(brake_start, brake_config);
-      path_consistent_brake = false;
-    }
-
-    if (brake_samples.empty()) {
-      const double tk = freeze_anchor.t + failsafe_plan_dt;
-      plan.failsafe.push_back(
-          makeFrozenFailsafeSample(tk, freeze_anchor, K_terminal, D_f_target_));
       return;
     }
 
@@ -1339,7 +1328,30 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     const double max_angular_acceleration =
         failsafe_limits ? failsafe_brake_max_angular_acceleration_
                         : local_replan_max_angular_acceleration_;
-    return std::isfinite(sample.t) && sample.p.allFinite() &&
+    constexpr double kPathPoseTolerance = 1.0e-8;
+    constexpr double kPathOrientationTolerance = 1.0e-8;
+    const bool has_scalar_path_state =
+        sample.nominal_path_time_valid &&
+        std::isfinite(sample.nominal_path_time) &&
+        sample.nominal_path_time >=
+            active_path.front().t - kPathPoseTolerance &&
+        sample.nominal_path_time <=
+            active_path.back().t + kPathPoseTolerance;
+    bool pose_is_on_active_path = false;
+    if (has_scalar_path_state) {
+      const CartesianTrajectorySample path_state = makeRetimedPathState(
+          active_path, sample.nominal_path_time, 0.0, 0.0);
+      const Quaterniond sample_orientation =
+          normalizedQuaternionOrIdentity(sample.q);
+      const Quaterniond path_orientation =
+          normalizedQuaternionOrIdentity(path_state.q);
+      pose_is_on_active_path =
+          (sample.p - path_state.p).norm() <= kPathPoseTolerance &&
+          1.0 - std::abs(sample_orientation.dot(path_orientation)) <=
+              kPathOrientationTolerance;
+    }
+    return has_scalar_path_state && pose_is_on_active_path &&
+           std::isfinite(sample.t) && sample.p.allFinite() &&
            sample.dp.allFinite() && sample.ddp.allFinite() &&
            sample.q.coeffs().allFinite() && sample.w.allFinite() &&
            sample.dw.allFinite() && sample.K.allFinite() &&
@@ -1374,12 +1386,12 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     constexpr double kAccelerationTolerance = 1.0e-4;
     constexpr double kPathTimeTolerance = 1.0e-6;
     const bool path_state_continuous =
-        !previous.nominal_path_time_valid ||
-        !current.nominal_path_time_valid ||
-        (current.nominal_path_time >=
-             previous.nominal_path_time - kPathTimeTolerance &&
-         current.nominal_path_time - previous.nominal_path_time <=
-             path_time_rate_max_ * dt + kPathTimeTolerance);
+        previous.nominal_path_time_valid &&
+        current.nominal_path_time_valid &&
+        current.nominal_path_time >=
+            previous.nominal_path_time - kPathTimeTolerance &&
+        current.nominal_path_time - previous.nominal_path_time <=
+            path_time_rate_max_ * dt + kPathTimeTolerance;
     const bool pose_and_path_continuous =
         path_state_continuous &&
         (current.p - previous.p).norm() <=
@@ -2285,6 +2297,17 @@ void ReachableCartesianImpedanceController::resetViaPointExecutionState(
   last_commanded_sample_.D = D_nominal_;
   last_commanded_sample_.failsafe = false;
   last_commanded_sample_valid_ = true;
+  bool active_path_available = false;
+  {
+    std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
+    active_path_available = !cartesian_via_point_path_.empty();
+  }
+  if (active_path_available && !anchorLastCommandedSampleToPathStart()) {
+    RCLCPP_ERROR(
+        get_node()->get_logger(),
+        "Strict path-consistent execution could not anchor the new path to "
+        "the current command state. Holding until a continuous path is supplied.");
+  }
 }
 
 void ReachableCartesianImpedanceController::updateCartesianViaPointsActionStatus(
@@ -4890,6 +4913,12 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   last_commanded_sample_.D = D_nominal_;
   last_commanded_sample_.failsafe = false;
   last_commanded_sample_valid_ = true;
+  if (!startup_path.empty() && !anchorLastCommandedSampleToPathStart()) {
+    RCLCPP_ERROR(
+        get_node()->get_logger(),
+        "Strict path-consistent execution could not anchor the startup path "
+        "to the initial command state. Holding instead of using a Cartesian reconnect.");
+  }
   commanded_path_rate_ = 0.0;
   mode2_energy_path_rate_target_ = path_time_rate_target_;
 
