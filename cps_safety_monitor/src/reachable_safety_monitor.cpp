@@ -11,47 +11,6 @@ constexpr double kMinDt = 1.0e-6;
 constexpr double kLambdaReg = 1.0e-9;
 constexpr double kSmallPositive = 1.0e-9;
 
-Vector3d normalizedOrZero(const Vector3d& v) {
-  const double norm = v.norm();
-  if (norm < 1.0e-9) {
-    return Vector3d::Zero();
-  }
-  return v / norm;
-}
-
-Vector3d fallbackDirection(const Vector3d& point,
-                           const Vector3d& velocity,
-                           const cps_human_workspace::HumanWorkspace& human_workspace,
-                           double time_sec) {
-  Vector3d direction =
-      normalizedOrZero(point - human_workspace.centerAtTime(time_sec));
-  if (direction.squaredNorm() > 0.0) {
-    return direction;
-  }
-
-  direction = normalizedOrZero(velocity);
-  if (direction.squaredNorm() > 0.0) {
-    return direction;
-  }
-
-  return human_workspace.direction();
-}
-
-Vector3d contactNormalDirection(
-    const Vector3d& robot_point,
-    const Vector3d& human_center,
-    const Vector3d& fallback_point,
-    const Vector3d& fallback_velocity,
-    const cps_human_workspace::HumanWorkspace& human_workspace,
-    double time_sec) {
-  Vector3d direction = normalizedOrZero(robot_point - human_center);
-  if (direction.squaredNorm() > 0.0) {
-    return direction;
-  }
-  return fallbackDirection(
-      fallback_point, fallback_velocity, human_workspace, time_sec);
-}
-
 Matrix6d symmetrized(const Matrix6d& matrix) {
   return 0.5 * (matrix + matrix.transpose());
 }
@@ -69,6 +28,68 @@ Matrix3d positiveSemidefinitePart(const Matrix3d& matrix) {
   return 0.5 * (psd + psd.transpose());
 }
 
+Matrix6d positiveSemidefinitePart(const Matrix6d& matrix) {
+  const Matrix6d symmetric = symmetrized(matrix);
+  const Eigen::SelfAdjointEigenSolver<Matrix6d> eig(symmetric);
+  if (eig.info() != Eigen::Success) {
+    return symmetric;
+  }
+  Matrix6d psd =
+      eig.eigenvectors() *
+      eig.eigenvalues().cwiseMax(0.0).asDiagonal() *
+      eig.eigenvectors().transpose();
+  return symmetrized(psd);
+}
+
+Vector3d orientationError(const Quaterniond& current,
+                          const Quaterniond& desired) {
+  Quaterniond q_current = current.normalized();
+  Quaterniond q_desired = desired.normalized();
+  if (q_desired.coeffs().dot(q_current.coeffs()) < 0.0) {
+    q_current.coeffs() *= -1.0;
+  }
+  const Quaterniond q_error(q_current * q_desired.inverse());
+  const Eigen::AngleAxisd angle_axis(q_error);
+  return angle_axis.axis() * angle_axis.angle();
+}
+
+Quaterniond integrateWorldAngularVelocity(const Quaterniond& orientation,
+                                           const Vector3d& angular_velocity,
+                                           double dt) {
+  const double angle = angular_velocity.norm() * std::max(dt, 0.0);
+  if (angle <= kSmallPositive) {
+    return orientation.normalized();
+  }
+  const Quaterniond delta(
+      Eigen::AngleAxisd(angle, angular_velocity.normalized()));
+  return (delta * orientation).normalized();
+}
+
+double quadraticEnergyUpperBound(const Vector6d& state,
+                                 const Matrix6d& metric_psd,
+                                 double translational_error_radius) {
+  const double nominal_metric_norm = std::sqrt(std::max(
+      0.0, (state.transpose() * metric_psd * state)(0, 0)));
+  // The reachable tube currently bounds translational position/velocity only.
+  // Do not pretend that this radius is also an angular uncertainty: that would
+  // be dimensionally wrong and needlessly conservative. For a disturbance
+  // delta=[delta_translation, 0], only the leading 3x3 metric block enters
+  // delta^T metric delta; the triangle inequality then gives this upper bound.
+  const Matrix3d translational_metric = positiveSemidefinitePart(
+      Matrix3d(metric_psd.topLeftCorner<3, 3>()));
+  const Eigen::SelfAdjointEigenSolver<Matrix3d> eig(translational_metric);
+  const double max_eigenvalue =
+      eig.info() == Eigen::Success
+          ? std::max(0.0, eig.eigenvalues().maxCoeff())
+          : std::max(0.0, translational_metric.norm());
+  const double uncertainty_metric_norm =
+      std::sqrt(max_eigenvalue) *
+      std::max(0.0, translational_error_radius);
+  const double upper_metric_norm =
+      nominal_metric_norm + uncertainty_metric_norm;
+  return 0.5 * upper_metric_norm * upper_metric_norm;
+}
+
 double maxBlockRadius(const Matrix6d& tube, int block_start) {
   const Matrix3d block =
       0.5 * (tube.block<3, 3>(block_start, block_start) +
@@ -78,22 +99,6 @@ double maxBlockRadius(const Matrix6d& tube, int block_start) {
     return std::sqrt(std::max(0.0, block.norm()));
   }
   return std::sqrt(std::max(0.0, eig.eigenvalues().maxCoeff()));
-}
-
-double directionalBlockRadius(
-    const Matrix6d& tube,
-    int block_start,
-    const Vector3d& direction) {
-  const Vector3d unit_direction = normalizedOrZero(direction);
-  if (unit_direction.squaredNorm() <= 0.0) {
-    return maxBlockRadius(tube, block_start);
-  }
-  const Matrix3d block =
-      0.5 * (tube.block<3, 3>(block_start, block_start) +
-             tube.block<3, 3>(block_start, block_start).transpose());
-  const double radius_squared =
-      (unit_direction.transpose() * block * unit_direction)(0, 0);
-  return std::sqrt(std::max(0.0, radius_squared));
 }
 
 Matrix6d propagateTrackingTube(
@@ -124,53 +129,66 @@ Matrix6d propagateTrackingTube(
 
 MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
                                   const Vector3d& current_position,
+                                  const Quaterniond& current_orientation,
                                   const Vector6d& ee_twist,
                                   const Matrix7d& inertia,
-                                  const Matrix37d& Jv,
+                                  const Matrix67d& J_geo,
                                   const SafetyMonitorConfig& config) {
   MonitorResult out;
 
   Vector3d x_pred = current_position;
   Vector3d v_pred = ee_twist.head<3>();
+  Quaterniond q_pred = current_orientation.normalized();
+  Vector3d w_pred = ee_twist.tail<3>();
 
-  Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
+  const Eigen::LDLT<Matrix7d> inertia_ldlt(inertia);
+  Matrix7d inertia_inv = Matrix7d::Zero();
+  if (inertia_ldlt.info() == Eigen::Success) {
+    inertia_inv = inertia_ldlt.solve(Matrix7d::Identity());
+  } else {
+    inertia_inv = inertia.inverse();
+  }
+  Matrix6d cartesian_inertia_inv = J_geo * inertia_inv * J_geo.transpose();
+  cartesian_inertia_inv = symmetrized(cartesian_inertia_inv);
+  Matrix6d cartesian_inertia_inv_regularized = cartesian_inertia_inv;
+  cartesian_inertia_inv_regularized.diagonal().array() += kLambdaReg;
+  const Eigen::LDLT<Matrix6d> cartesian_inertia_ldlt(
+      cartesian_inertia_inv_regularized);
+  Matrix6d cartesian_inertia = Matrix6d::Identity() / kLambdaReg;
+  if (cartesian_inertia_ldlt.info() == Eigen::Success) {
+    cartesian_inertia = symmetrized(
+        cartesian_inertia_ldlt.solve(Matrix6d::Identity()));
+  }
+  cartesian_inertia = positiveSemidefinitePart(cartesian_inertia);
+  Matrix3d task_inertia_inv =
+      cartesian_inertia_inv.topLeftCorner<3, 3>();
   task_inertia_inv.diagonal().array() += kLambdaReg;
-
-  const Vector3d direction_now =
-      contactNormalDirection(
-          current_position,
-          config.human_workspace.centerAtTime(config.wall_time_sec),
-          current_position,
-          v_pred,
-          config.human_workspace,
-          config.wall_time_sec);
-  const double denom0 = (direction_now.transpose() * task_inertia_inv * direction_now)(0, 0);
-  out.m_eff_n = 1.0 / std::max(denom0, kSmallPositive);
 
   const double acc_error_bound =
       std::max(0.0, config.tracking_acc_error_bound);
   Matrix6d tracking_tube = Matrix6d::Zero();
 
-  // The current state is measured, so the instantaneous contact check should
-  // use the measured collision point and twist directly. The tracking tube is
-  // reserved for future prediction uncertainty around the measured-state
-  // rollout.
-  out.current_pos_error_radius = 0.0;
-  out.current_vel_error_radius = 0.0;
   out.worst_case_pos_error_radius = maxBlockRadius(tracking_tube, 0);
   out.worst_case_vel_error_radius = maxBlockRadius(tracking_tube, 3);
 
-  const double v_n_now_raw = direction_now.dot(v_pred);
-  out.v_n_now = v_n_now_raw;
-  out.Tn_now = 0.5 * out.m_eff_n * v_n_now_raw * v_n_now_raw;
-  out.v_n_now_tube = std::abs(v_n_now_raw);
-  out.Tn_now_tube = 0.5 * out.m_eff_n * out.v_n_now_tube * out.v_n_now_tube;
-
-  out.v_safe = std::sqrt(
-      std::max(
-          2.0 * config.energy_budget_joule /
-              std::max(out.m_eff_n, kSmallPositive),
-          0.0));
+  if (config.current_energy_reference_valid) {
+    const ImpedanceSample& current_reference =
+        config.current_energy_reference;
+    Vector6d current_error = Vector6d::Zero();
+    current_error.head<3>() = current_position - current_reference.p;
+    current_error.tail<3>() =
+        orientationError(current_orientation, current_reference.q);
+    const Matrix6d current_stiffness =
+        positiveSemidefinitePart(current_reference.K);
+    out.current_cartesian_kinetic_energy = quadraticEnergyUpperBound(
+        ee_twist, cartesian_inertia, 0.0);
+    out.current_cartesian_potential_energy = quadraticEnergyUpperBound(
+        current_error, current_stiffness, 0.0);
+    out.current_cartesian_control_energy =
+        out.current_cartesian_kinetic_energy +
+        out.current_cartesian_potential_energy;
+    out.current_cartesian_energy_valid = true;
+  }
 
   const double inflated_contact_radius_now =
       config.human_workspace.inflatedCollisionRadius(
@@ -202,26 +220,40 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     K_exec = s.K;
     D_exec = s.D;
 
+    const Matrix6d K_cartesian = positiveSemidefinitePart(K_exec);
     const Matrix3d Kp_raw = K_exec.topLeftCorner<3, 3>();
     const Matrix3d Dp_raw = D_exec.topLeftCorner<3, 3>();
     const Matrix3d Kp = positiveSemidefinitePart(Kp_raw);
     const Matrix3d Dp = positiveSemidefinitePart(Dp_raw);
 
-    const Vector3d force_pred =
-        Kp_raw * (s.p - x_pred) - Dp_raw * (v_pred - s.dp);
-
-    Vector3d a_pred = Vector3d::Zero();
-
+    Vector6d pose_error = Vector6d::Zero();
+    pose_error.head<3>() = x_pred - s.p;
+    pose_error.tail<3>() = orientationError(q_pred, s.q);
+    Vector6d twist_pred = Vector6d::Zero();
+    twist_pred.head<3>() = v_pred;
+    twist_pred.tail<3>() = w_pred;
+    Vector6d desired_twist = Vector6d::Zero();
+    desired_twist.head<3>() = s.dp;
+    desired_twist.tail<3>() = s.w;
+    Vector6d desired_acceleration = Vector6d::Zero();
+    desired_acceleration.head<3>() = s.ddp;
+    desired_acceleration.tail<3>() = s.dw;
+    const Vector6d wrench_pred =
+        -K_exec * pose_error - D_exec * (twist_pred - desired_twist);
+    Vector6d acceleration_pred = cartesian_inertia_inv * wrench_pred;
     if (config.use_dynamic_consistent_impedance) {
-      a_pred = s.ddp + task_inertia_inv * force_pred;
-    } else {
-      a_pred = task_inertia_inv * force_pred;
+      acceleration_pred += desired_acceleration;
     }
+    const Vector3d a_pred = acceleration_pred.head<3>();
+    const Vector3d alpha_pred = acceleration_pred.tail<3>();
 
     const Vector3d x_next =
         x_pred + v_pred * dtp + 0.5 * a_pred * dtp * dtp;
 
     const Vector3d v_next = v_pred + a_pred * dtp;
+    const Vector3d w_next = w_pred + alpha_pred * dtp;
+    const Quaterniond q_next = integrateWorldAngularVelocity(
+        q_pred, 0.5 * (w_pred + w_next), dtp);
 
     const Matrix6d tracking_tube_next =
         propagateTrackingTube(
@@ -239,85 +271,57 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
             config.ee_collision_radius,
             rho_p_segment);
 
-    const double d_pred =
-        config.human_workspace.signedDistanceToInflatedSphere(
-            x_pred,
-            inflated_contact_radius_segment,
-            segment_start_time_sec);
-
-    Vector3d closest_predicted_point = Vector3d::Zero();
-    Vector3d closest_human_center = Vector3d::Zero();
     const double d_segment =
         config.human_workspace.signedDistanceSegmentToInflatedSphere(
             x_pred,
             x_next,
             inflated_contact_radius_segment,
             segment_start_time_sec,
-            segment_end_time_sec,
-            &closest_predicted_point,
-            &closest_human_center);
+            segment_end_time_sec);
 
     out.workspace_distance_min = std::min(out.workspace_distance_min, d_segment);
 
-    const Vector3d direction =
-        contactNormalDirection(
-            closest_predicted_point,
-            closest_human_center,
-            x_next,
-            v_next,
-            config.human_workspace,
-            segment_end_time_sec);
-    const double denom = (direction.transpose() * task_inertia_inv * direction)(0, 0);
-    const double m_eff = 1.0 / std::max(denom, kSmallPositive);
-    const double k_n =
-        std::max((direction.transpose() * Kp * direction)(0, 0), 0.0);
-    const double rho_p_dir =
-        directionalBlockRadius(tracking_tube_next, 0, direction);
-    const double rho_v_dir =
-        directionalBlockRadius(tracking_tube_next, 3, direction);
-    const double e_n = std::abs(direction.dot(x_next - s.p)) + rho_p_dir;
-    const double v_n = std::abs(direction.dot(v_next)) + rho_v_dir;
-
-    const double T_n_ub = 0.5 * m_eff * v_n * v_n;
-    const double V_n_ub = 0.5 * k_n * e_n * e_n;
+    Vector6d next_twist = Vector6d::Zero();
+    next_twist.head<3>() = v_next;
+    next_twist.tail<3>() = w_next;
+    Vector6d next_pose_error = Vector6d::Zero();
+    next_pose_error.head<3>() = x_next - s.p;
+    next_pose_error.tail<3>() = orientationError(q_next, s.q);
+    const double cartesian_T_ub = quadraticEnergyUpperBound(
+        next_twist,
+        cartesian_inertia,
+        maxBlockRadius(tracking_tube_next, 3));
+    const double cartesian_V_ub = quadraticEnergyUpperBound(
+        next_pose_error,
+        K_cartesian,
+        maxBlockRadius(tracking_tube_next, 0));
 
     const bool contact_possible_step = d_segment <= 0.0;
-    if (contact_possible_step && !out.nominal_contact_sample_found) {
-      const bool contact_at_segment_start = d_pred <= 0.0;
-      out.nominal_contact_sample_found = true;
-      out.nominal_contact_time = contact_at_segment_start ? t_prev : s.t;
-      out.nominal_contact_distance = d_segment;
-      out.v_n_contact_nominal = v_n;
-      out.Tn_contact_nominal = T_n_ub;
-      out.nominal_contact_point_world =
-          contact_at_segment_start ? x_pred : closest_predicted_point;
-    }
-
-    const double E_contact_ub = T_n_ub + V_n_ub;
+    // Candidate acceptance is based on the maximum complete Cartesian control
+    // energy over every monitored sample that may intersect the workspace.
+    // The normal-projected energy remains available only as a collision
+    // diagnostic and must not authorize a 6D-energetic trajectory.
+    const double E_contact_ub = cartesian_T_ub + cartesian_V_ub;
     if (contact_possible_step && E_contact_ub > E_contact_max) {
       E_contact_max = E_contact_ub;
 
       out.worst_case_contact_time = s.t;
       out.worst_case_workspace_distance_at_candidate = d_segment;
-      out.worst_case_nominal_forward_progress = direction.dot(x_next - current_position);
-      out.worst_case_v_n_ub = v_n;
-      out.worst_case_Tn_ub = T_n_ub;
-      out.worst_case_V_potential_ub = V_n_ub;
-      out.worst_case_contact_energy_ub = E_contact_ub;
-
-      out.worst_case_a_pos = 0.0;
-      out.worst_case_a_brake = 0.0;
-      out.worst_case_a_net = 0.0;
+      out.worst_case_cartesian_kinetic_energy_ub = cartesian_T_ub;
+      out.worst_case_cartesian_potential_energy_ub = cartesian_V_ub;
+      out.worst_case_cartesian_control_energy_ub = E_contact_ub;
     }
 
     if (s.failsafe) {
-      terminal_T_ub = T_n_ub;
-      terminal_V_ub = V_n_ub;
+      terminal_T_ub = cartesian_T_ub;
+      terminal_V_ub = cartesian_V_ub;
       terminal_sample_found = true;
     }
 
     x_pred = x_next;
     v_pred = v_next;
+    q_pred = q_next;
+    w_pred = w_next;
     tracking_tube = tracking_tube_next;
     out.worst_case_pos_error_radius =
         std::max(out.worst_case_pos_error_radius,
@@ -346,7 +350,7 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
 
   out.monitored_contact_possible = out.workspace_distance_min <= 0.0;
   out.workspace_distance_margin = out.workspace_distance_min;
-  out.worst_case_contact_energy_ub = E_contact_max;
+  out.worst_case_cartesian_control_energy_ub = E_contact_max;
   out.terminal_energy_ub = terminal_T_ub + terminal_V_ub;
 
   const double energy_budget_eff =
@@ -361,26 +365,27 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
       out.monitored_contact_possible && !out.contact_relevant_for_energy;
 
   const bool current_collision_energy_unsafe =
-      out.contact_relevant_for_energy && out.Tn_now_tube > energy_budget_eff;
+      out.contact_relevant_for_energy &&
+      out.current_cartesian_energy_valid &&
+      out.current_cartesian_control_energy > energy_budget_eff;
   const bool predicted_contact_energy_unsafe =
       predicted_contact_requires_verification &&
-      out.worst_case_contact_energy_ub > energy_budget_eff;
+      out.worst_case_cartesian_control_energy_ub > energy_budget_eff;
 
   out.predicted_trigger = predicted_contact_energy_unsafe;
 
   const double monitored_contact_energy_ub =
-      std::max(out.worst_case_contact_energy_ub,
-               out.contact_relevant_for_energy ? out.Tn_now_tube : 0.0);
+      std::max(out.worst_case_cartesian_control_energy_ub,
+               out.contact_relevant_for_energy
+                       && out.current_cartesian_energy_valid
+                   ? out.current_cartesian_control_energy
+                   : 0.0);
 
   out.h_monitored_energy = energy_budget_eff - monitored_contact_energy_ub;
-  out.h_clamping_energy = energy_budget_eff - out.worst_case_V_potential_ub;
   out.h_terminal_energy = energy_budget_eff - out.terminal_energy_ub;
 
   out.collision_energy_unsafe =
       current_collision_energy_unsafe || predicted_contact_energy_unsafe;
-  out.clamping_energy_unsafe = false;
-  out.terminal_energy_unsafe = false;
-
   out.monitored_unsafe =
       out.predicted_trigger ||
       (out.contact_relevant_for_energy && current_collision_energy_unsafe);

@@ -15,6 +15,7 @@ using Matrix3d = Eigen::Matrix3d;
 using Matrix6d = Eigen::Matrix<double, 6, 6>;
 using Matrix7d = Eigen::Matrix<double, 7, 7>;
 using Matrix37d = Eigen::Matrix<double, 3, 7>;
+using Matrix67d = Eigen::Matrix<double, 6, 7>;
 
 using Vector3d = Eigen::Matrix<double, 3, 1>;
 using Vector6d = Eigen::Matrix<double, 6, 1>;
@@ -30,50 +31,29 @@ struct MonitorResult {
   double workspace_distance_now{0.0};
   double workspace_distance_min{0.0};
 
-  double m_eff_n{0.0};
-  double v_n_now{0.0};
-  double Tn_now{0.0};
-  double v_safe{0.0};
-
-  // First contact predicted on the whole monitored path: intended + failsafe.
-  bool nominal_contact_sample_found{false};
-  double nominal_contact_time{0.0};
-  double nominal_contact_distance{0.0};
-  double v_n_contact_nominal{0.0};
-  double Tn_contact_nominal{0.0};
-  Vector3d nominal_contact_point_world{Vector3d::Zero()};
-
   double worst_case_contact_time{0.0};
   double worst_case_workspace_distance_at_candidate{0.0};
-  double worst_case_nominal_forward_progress{0.0};
-
-  double worst_case_v_n_ub{0.0};
-  double worst_case_Tn_ub{0.0};
-  double worst_case_contact_energy_ub{0.0};
-  double worst_case_a_pos{0.0};
-  double worst_case_a_brake{0.0};
-  double worst_case_a_net{0.0};
+  // Full 6D Cartesian control-energy upper bounds at the worst monitored
+  // contact sample.
+  double worst_case_cartesian_kinetic_energy_ub{0.0};
+  double worst_case_cartesian_potential_energy_ub{0.0};
+  double worst_case_cartesian_control_energy_ub{0.0};
 
   double workspace_distance_margin{0.0};
   double h_monitored_energy{0.0};
 
-  double v_n_now_tube{0.0};
-  double Tn_now_tube{0.0};
-  double Tn_dot_est{0.0};
+  double current_cartesian_kinetic_energy{0.0};
+  double current_cartesian_potential_energy{0.0};
+  double current_cartesian_control_energy{0.0};
+  bool current_cartesian_energy_valid{false};
 
-  double current_pos_error_radius{0.0};
-  double current_vel_error_radius{0.0};
   double worst_case_pos_error_radius{0.0};
   double worst_case_vel_error_radius{0.0};
 
-  double worst_case_V_potential_ub{0.0};
-  double h_clamping_energy{std::numeric_limits<double>::infinity()};
-  bool clamping_energy_unsafe{false};
   bool collision_energy_unsafe{false};
 
   double terminal_energy_ub{0.0};
   double h_terminal_energy{std::numeric_limits<double>::infinity()};
-  bool terminal_energy_unsafe{false};
 };
 
 struct ImpedanceSample {
@@ -117,6 +97,12 @@ struct SafetyMonitorConfig {
   Matrix6d K_runtime{Matrix6d::Zero()};
   Matrix6d D_runtime{Matrix6d::Zero()};
 
+  // Command that was actually being executed when the measured state used by
+  // this monitor snapshot was captured. It must be expressed at the same
+  // Cartesian point as current_position and J_geo.
+  ImpedanceSample current_energy_reference;
+  bool current_energy_reference_valid{false};
+
   double wall_time_sec{0.0};
   double energy_budget_joule{0.05};
   double energy_budget_margin_joule{0.005};
@@ -128,9 +114,10 @@ struct SafetyMonitorConfig {
 
 MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
                                   const Vector3d& current_position,
+                                  const Quaterniond& current_orientation,
                                   const Vector6d& ee_twist,
                                   const Matrix7d& inertia,
-                                  const Matrix37d& Jv,
+                                  const Matrix67d& J_geo,
                                   const SafetyMonitorConfig& config);
 
 }  // namespace cps_safety_monitor

@@ -121,7 +121,6 @@ class StaticDownCollisionDisappearTest(Node):
     def send_goal(self):
         goal = CartesianViaMotion.Goal()
         goal.via_poses = [self.make_pose(values) for values in DEFAULT_VIA_POSES]
-        goal.v_scale = self.args.v_scale
 
         self.get_logger().info(
             f"Sending straight-down goal with {len(goal.via_poses)} poses.")
@@ -359,13 +358,11 @@ def parse_args(argv):
         help="Do not call the MuJoCo set_pause service before sending the goal.")
     parser.add_argument("--service-timeout", type=float, default=5.0)
     parser.add_argument("--admin-hash", default="")
-    parser.add_argument("--v-scale", type=float, default=1.0)
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    args.v_scale = max(1.0e-3, min(args.v_scale, 1.0))
     args.contact_timeout = max(args.contact_timeout, 0.1)
     args.hidden_geom_size = max(args.hidden_geom_size, 1.0e-8)
 

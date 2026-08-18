@@ -189,12 +189,18 @@ reachable_cartesian_impedance_controller:
   ros__parameters:
     arm_id: panda
 
+    # Both logs use bounded preallocated queues. The 1 kHz control path only
+    # copies a fixed-size record; CSV formatting and filesystem I/O run on
+    # background threads. A full queue drops log records, never control cycles.
     enable_error_logging: true
     error_log_root_dir: /home/developer/multipanda_ws/src/data_log
     error_log_file_name: reachable_cartesian_impedance_validation.csv
     enable_prediction_logging: true
     prediction_log_file_name: shield_prediction_trajectory.csv
+    control_log_max_queue_size: 16384
     prediction_log_max_queue_size: 256
+    log_batch_size: 512
+    log_flush_period_sec: 1.0
 
     # Cartesian via points are followed without stopping.
     # Each state is a robot-base-frame pose [x, y, z, qx, qy, qz, qw].
@@ -237,11 +243,15 @@ reachable_cartesian_impedance_controller:
 
     enable_safety_monitor: true
 
-    energy_budget_joule: 0.12
+    energy_budget_joule: 0.05
     energy_budget_margin_joule: 0.000
     cartesian_energy_min_pos_stiffness: 0.0
     cartesian_energy_lambda_update_period_sec: 0.001
+    # Lachner Eq. (9a): modal Cartesian damping ratio used with the current
+    # task inertia and the energy-scaled 6D stiffness matrix.
+    cartesian_energy_damping_ratio: 0.8
     contact_activation_margin: 0.00
+
 
     # Collision model for the safety monitor:
     # center = metal ball center = panda_link8 + [0, 0, 0.03].
@@ -253,14 +263,13 @@ reachable_cartesian_impedance_controller:
     tcp_offset: [0.0, 0.0, 0.06]
     ee_collision_center_offset: [0.0, 0.0, -0.03]
     async_safety_monitor: true
-    async_plan_max_age_sec: 0.05
-    # At most 24 already-verified commands cover worker latency. In nominal
-    # mode this prefix stops at the intended/failsafe boundary; the result must
-    # arrive before that shorter prefix expires instead of pre-committing to a
-    # brake. The separate 24-step horizon is the fresh intended tail after
-    # activation. Latest measured compute latency was at most 16 ms.
-    async_planning_lead_steps: 24
-    async_verified_horizon_steps: 24
+    async_plan_max_age_sec: 0.02
+    # The 200 Hz monitor period consumes five dense 1 ms commands. Keep an
+    # eight-step committed prefix for handoff/scheduling margin and four monitor
+    # periods (twenty steps) of fresh intended motion after activation. This
+    # covers the measured 12-19 ms worker delays without a long 50 ms reserve.
+    async_planning_lead_steps: 8
+    async_verified_horizon_steps: 20
     enable_mujoco_contact_logging: true
     mujoco_contact_sensor_topic: /panda_metal_ball_touch
     mujoco_contact_threshold: 1.0e-6

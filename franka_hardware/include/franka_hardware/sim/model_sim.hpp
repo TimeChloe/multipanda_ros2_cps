@@ -15,6 +15,7 @@
 #pragma once
 
 #include <array>
+#include <vector>
 #include "franka_hardware/common/model_base.hpp"
 #include <franka/model.h>
 #include "mujoco/mujoco.h"
@@ -208,9 +209,16 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
    * Gets the 6x7 jacobian (r x c) of the robot, based on the site # l.
   */
   void get6x7Jacobian(double (&jacRes)[42], int l) const {
-    double *jacp = new double[3*model_->nv];
-    double *jacr = new double[3*model_->nv];
-    mj_jacSite(model_, data_, jacp, jacr, l);
+    // Reuse per-thread workspaces. This function is called in the 1 kHz path;
+    // allocating and freeing both arrays on every invocation adds jitter and
+    // previously paired new[] with scalar delete (undefined behavior).
+    thread_local std::vector<mjtNum> jacp;
+    thread_local std::vector<mjtNum> jacr;
+    const std::size_t workspace_size =
+        3U * static_cast<std::size_t>(model_->nv);
+    jacp.resize(workspace_size);
+    jacr.resize(workspace_size);
+    mj_jacSite(model_, data_, jacp.data(), jacr.data(), l);
     // compose the 6*7
     // mujoco is row-major, so 3 rows, nv cols for the jacp
     for(int i = 0; i < 3; i++){
@@ -223,8 +231,6 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
         jacRes[i*7 + j] = jacr[(i-3)*model_->nv + joint_qvel_indices_[j]];
       }
     }
-    delete jacp;
-    delete jacr;
   }
 
  private:
@@ -506,16 +512,22 @@ class ModelSim : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-type
       const noexcept override final {
     // Mass matrix is symmetric, so it shouldn't matter. 
     std::array<double, 49> result{0};
-    double *M = new double[model_->nv * model_->nv];
-    mj_fullM(model_, M, data_->qM);
+    // mj_fullM needs a dense nv-by-nv workspace. Keep one per calling thread
+    // so the 1 kHz control path performs no steady-state heap allocation.
+    thread_local std::vector<mjtNum> mass_matrix;
+    const std::size_t workspace_size =
+        static_cast<std::size_t>(model_->nv) *
+        static_cast<std::size_t>(model_->nv);
+    mass_matrix.resize(workspace_size);
+    mj_fullM(model_, mass_matrix.data(), data_->qM);
     int m_i = 0;
     for(int i=0; i<7; i++){
       for(int j=0; j<7; j++){
-        result[m_i] = M[joint_qvel_indices_[i] * model_->nv + joint_qvel_indices_[j]];
+        result[m_i] = mass_matrix[
+            joint_qvel_indices_[i] * model_->nv + joint_qvel_indices_[j]];
         m_i++;
       }
     }
-    delete M;
     return result;
   }
 

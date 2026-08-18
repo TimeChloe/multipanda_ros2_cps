@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.8)
 project(cps_safety_monitor)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+    "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
+endif()
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
@@ -46,10 +52,19 @@ ament_export_targets(export_${PROJECT_NAME})
 ament_export_dependencies(Eigen3 cps_human_workspace)
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  ament_add_gtest(test_reachable_safety_monitor
+    test/test_reachable_safety_monitor.cpp
+  )
+  target_link_libraries(test_reachable_safety_monitor
+    ${PROJECT_NAME}
+    Eigen3::Eigen
+  )
 endif()
 
 ament_package()

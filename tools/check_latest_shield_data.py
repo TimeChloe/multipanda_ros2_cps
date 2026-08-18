@@ -12,12 +12,40 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+from collections import Counter
 from pathlib import Path
 from statistics import mean
 
 
 VALIDATION_CSV = "reachable_cartesian_impedance_validation.csv"
 PREDICTION_CSV = "shield_prediction_trajectory.csv"
+
+FALLBACK_REASON_NAMES = {
+    0: "none",
+    1: "bootstrap_no_verified_plan",
+    2: "candidate_predicted_unsafe",
+    3: "planner_or_plan_build_failure",
+    4: "async_output_stale",
+    5: "source_plan_generation_mismatch",
+    6: "activation_deadline_missed",
+    7: "verified_intended_exhausted",
+    8: "emergency_stop_no_command",
+}
+
+PLAN_FAILURE_REASON_NAMES = {
+    0: "none",
+    1: "no_active_path",
+    2: "missing_nominal_path_state",
+    3: "intended_generation_empty",
+    4: "intended_seam_invalid",
+    5: "failsafe_generation_empty",
+    6: "failsafe_seam_invalid",
+    7: "intended_sample_invalid",
+    8: "intended_transition_invalid",
+    9: "failsafe_sample_invalid",
+    10: "failsafe_transition_invalid",
+    11: "candidate_invalid_unknown",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode1-only",
         action="store_true",
-        help="Only generate the mode=1 nominal prediction vs measurement diagnostic.",
+        help="Only generate the fallback nominal prediction vs measurement diagnostic.",
     )
     parser.add_argument(
         "--no-plot",
@@ -104,6 +132,27 @@ def to_int(row: dict[str, str], key: str, default: int = 0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return default
+
+
+def execution_stage(row: dict[str, str]) -> int:
+    """Return the actual command source for new and legacy validation logs."""
+    if row.get("execution_stage") not in (None, ""):
+        return to_int(row, "execution_stage")
+
+    # Legacy logs only encoded fallback in mode=1. Recover intended/failsafe
+    # from the cached-command stage where possible.
+    if to_int(row, "mode") == 1:
+        return 2 if to_int(row, "verified_command_stage") == 2 else 1
+    return 0
+
+
+def first_execution_stage_time(
+    rows: list[dict[str, str]], stage: int
+) -> float | None:
+    for row in rows:
+        if execution_stage(row) == stage:
+            return to_float(row, "wall_time_sec")
+    return None
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -183,10 +232,15 @@ def build_comparison(
                 "pred_error_pz": pred_next_pz - measured_pz,
                 "target_error_pz": target_pz - measured_pz,
                 "contact_possible": to_int(pred, "contact_possible"),
-                "is_worst_T": to_int(pred, "is_worst_T"),
-                "is_worst_V": to_int(pred, "is_worst_V"),
-                "V_potential_ub": to_float(pred, "V_potential_ub"),
-                "T_n_ub": to_float(pred, "T_n_ub"),
+                "monitor_cartesian_kinetic_energy_ub": to_float(
+                    pred, "monitor_worst_case_cartesian_kinetic_energy_ub"
+                ),
+                "monitor_cartesian_potential_energy_ub": to_float(
+                    pred, "monitor_worst_case_cartesian_potential_energy_ub"
+                ),
+                "monitor_cartesian_control_energy_ub": to_float(
+                    pred, "monitor_worst_case_cartesian_control_energy_ub"
+                ),
                 "mode": to_int(measured, "mode"),
                 "predicted_trigger": to_int(measured, "predicted_trigger"),
             }
@@ -201,14 +255,13 @@ def build_executed_reference_comparison(
 ) -> list[dict[str, float | str]]:
     """Build one comparison row per control loop.
 
-    mode 0:
+    execution stage 0:
       compare measured collision-center pz with the accepted intended prediction
       for stage=intended,index=0.
 
-    mode 1:
-      compare measured TCP pz with the actually executed failsafe command pz.
-      The command pz is validation.csv des_pz, which is assigned from
-      last_verified_plan_.failsafe[next_index] in failsafe mode.
+    execution stages 1-3:
+      compare measured TCP pz with the command actually sent by the controller.
+      The command pz is validation.csv des_pz.
     """
 
     accepted_intended = sorted(
@@ -227,10 +280,12 @@ def build_executed_reference_comparison(
     for measured in validation_rows:
       t = to_float(measured, "wall_time_sec")
       mode = to_int(measured, "mode")
+      command_stage = execution_stage(measured)
 
       row: dict[str, float | str] = {
           "t": t,
           "mode": mode,
+          "execution_stage": command_stage,
           "measured_tcp_pz": to_float(measured, "cur_pz"),
           "measured_collision_center_pz": to_float(measured, "collision_center_pz"),
           "command_des_pz": to_float(measured, "des_pz"),
@@ -242,7 +297,7 @@ def build_executed_reference_comparison(
           "error_mm": math.nan,
       }
 
-      if mode == 0:
+      if command_stage == 0:
           while (
               pred_idx + 1 < len(accepted_intended)
               and to_float(accepted_intended[pred_idx + 1], "wall_time_sec") <= t
@@ -272,7 +327,7 @@ def build_executed_reference_comparison(
           reference_pz = to_float(measured, "des_pz")
           measured_pz = to_float(measured, "cur_pz")
           row["reference_pz"] = reference_pz
-          row["reference_kind"] = "executed_cached_failsafe_command_tcp_pz"
+          row["reference_kind"] = "executed_controller_command_tcp_pz"
           row["reference_time_error_sec"] = 0.0
           row["error_mm"] = 1000.0 * (reference_pz - measured_pz)
 
@@ -286,7 +341,7 @@ def build_mode1_nominal_prediction_comparison(
     prediction_rows: list[dict[str, str]],
     match_tolerance: float,
 ) -> list[dict[str, float | str]]:
-    """For mode=1 rows, compare monitored nominal prediction with measurement.
+    """For fallback rows, compare monitored nominal prediction with measurement.
 
     This intentionally looks at the nominal/intended command still being
     monitored while the robot is already executing failsafe.
@@ -304,7 +359,7 @@ def build_mode1_nominal_prediction_comparison(
     comparison = []
     pred_idx = 0
     for measured in validation_rows:
-        if to_int(measured, "mode") != 1:
+        if execution_stage(measured) not in (1, 2):
             continue
 
         t = to_float(measured, "wall_time_sec")
@@ -347,10 +402,15 @@ def build_mode1_nominal_prediction_comparison(
                 "predicted_trigger": to_int(pred, "predicted_trigger"),
                 "monitored_contact_possible": to_int(pred, "monitored_contact_possible"),
                 "contact_possible": to_int(pred, "contact_possible"),
-                "is_worst_T": to_int(pred, "is_worst_T"),
-                "is_worst_V": to_int(pred, "is_worst_V"),
-                "T_n_ub": to_float(pred, "T_n_ub"),
-                "V_potential_ub": to_float(pred, "V_potential_ub"),
+                "monitor_cartesian_kinetic_energy_ub": to_float(
+                    pred, "monitor_worst_case_cartesian_kinetic_energy_ub"
+                ),
+                "monitor_cartesian_potential_energy_ub": to_float(
+                    pred, "monitor_worst_case_cartesian_potential_energy_ub"
+                ),
+                "monitor_cartesian_control_energy_ub": to_float(
+                    pred, "monitor_worst_case_cartesian_control_energy_ub"
+                ),
                 "distance_segment": to_float(pred, "distance_segment"),
             }
         )
@@ -365,11 +425,11 @@ def build_verification_aligned_comparison(
 ) -> list[dict[str, float | str]]:
     """Compare each measured loop with the verified prediction for that loop.
 
-    mode 0:
+    nominal/last-verified intended execution:
       use the accepted intended prediction whose absolute predicted time
       wall_time + sample_t corresponds to the measured loop.
 
-    mode 1:
+    failsafe execution:
       use the failsafe prediction from the most recent accepted verification
       whose absolute predicted time corresponds to the measured loop.
     """
@@ -400,13 +460,15 @@ def build_verification_aligned_comparison(
     for measured in validation_rows:
         t = to_float(measured, "wall_time_sec")
         mode = to_int(measured, "mode")
-        predictions = accepted_intended if mode == 0 else accepted_failsafe
-        start_idx = intended_idx if mode == 0 else failsafe_idx
+        command_stage = execution_stage(measured)
+        use_failsafe_prediction = command_stage == 2
+        predictions = accepted_failsafe if use_failsafe_prediction else accepted_intended
+        start_idx = failsafe_idx if use_failsafe_prediction else intended_idx
         pred, new_idx = find_nearest_prediction(predictions, t, start_idx)
-        if mode == 0:
-            intended_idx = new_idx
-        else:
+        if use_failsafe_prediction:
             failsafe_idx = new_idx
+        else:
+            intended_idx = new_idx
 
         pred_time = prediction_absolute_time(pred) if pred is not None else math.nan
         time_error = pred_time - t if pred is not None else math.nan
@@ -420,6 +482,7 @@ def build_verification_aligned_comparison(
             {
                 "t": t,
                 "mode": mode,
+                "execution_stage": command_stage,
                 "prediction_stage": pred.get("stage", "") if has_match else "",
                 "prediction_index": to_int(pred, "index", -1) if has_match else -1,
                 "verification_wall_time_sec": to_float(pred, "wall_time_sec") if has_match else math.nan,
@@ -436,10 +499,15 @@ def build_verification_aligned_comparison(
                 "candidate_verified": to_int(pred, "candidate_verified") if has_match else 0,
                 "prediction_predicted_trigger": to_int(pred, "predicted_trigger") if has_match else 0,
                 "contact_possible": to_int(pred, "contact_possible") if has_match else 0,
-                "is_worst_T": to_int(pred, "is_worst_T") if has_match else 0,
-                "is_worst_V": to_int(pred, "is_worst_V") if has_match else 0,
-                "T_n_ub": to_float(pred, "T_n_ub") if has_match else math.nan,
-                "V_potential_ub": to_float(pred, "V_potential_ub") if has_match else math.nan,
+                "monitor_cartesian_kinetic_energy_ub": to_float(
+                    pred, "monitor_worst_case_cartesian_kinetic_energy_ub"
+                ) if has_match else math.nan,
+                "monitor_cartesian_potential_energy_ub": to_float(
+                    pred, "monitor_worst_case_cartesian_potential_energy_ub"
+                ) if has_match else math.nan,
+                "monitor_cartesian_control_energy_ub": to_float(
+                    pred, "monitor_worst_case_cartesian_control_energy_ub"
+                ) if has_match else math.nan,
                 "distance_segment": to_float(pred, "distance_segment") if has_match else math.nan,
             }
         )
@@ -461,17 +529,19 @@ def summarize(
 ) -> str:
     first_contact = first_time(validation_rows, "monitored_contact_possible")
     first_trigger = first_time(validation_rows, "predicted_trigger")
-    first_failsafe = first_time(validation_rows, "mode")
+    first_failsafe = first_execution_stage_time(validation_rows, 2)
+    first_contact_verification_hold = first_execution_stage_time(validation_rows, 4)
+    first_contact_energy_intended = first_execution_stage_time(validation_rows, 5)
     first_mujoco_contact = first_time(validation_rows, "mujoco_contact_active")
 
     errors_mm = finite_values([1000.0 * row["pred_error_pz"] for row in comparison])
     abs_errors_mm = [abs(v) for v in errors_mm]
 
-    worst_v_rows = [
-        row for row in prediction_rows if to_int(row, "is_worst_V") == 1
-    ]
-    first_worst_v = (
-        to_float(worst_v_rows[0], "wall_time_sec") if worst_v_rows else None
+    monitored_energy_values = finite_values(
+        [
+            to_float(row, "monitor_worst_case_cartesian_control_energy_ub")
+            for row in prediction_rows
+        ]
     )
 
     lines = [
@@ -483,10 +553,71 @@ def summarize(
         f"comparison_rows: {len(comparison)}",
         f"first_monitored_contact_possible_sec: {first_contact}",
         f"first_predicted_trigger_sec: {first_trigger}",
-        f"first_mode_1_failsafe_sec: {first_failsafe}",
+        f"first_execution_stage_2_failsafe_sec: {first_failsafe}",
+        "first_execution_stage_4_contact_verification_hold_sec: "
+        f"{first_contact_verification_hold}",
+        "first_execution_stage_5_contact_energy_intended_sec: "
+        f"{first_contact_energy_intended}",
         f"first_mujoco_contact_active_sec: {first_mujoco_contact}",
-        f"first_prediction_worst_V_sec: {first_worst_v}",
+        "max_monitored_cartesian_control_energy_ub_joule: "
+        f"{max(monitored_energy_values) if monitored_energy_values else None}",
     ]
+
+    if validation_rows and "fallback_reason" in validation_rows[0]:
+        fallback_counts = Counter(
+            to_int(row, "fallback_reason")
+            for row in validation_rows
+            if to_int(row, "fallback_reason") != 0
+        )
+        for reason, count in sorted(fallback_counts.items()):
+            reason_name = FALLBACK_REASON_NAMES.get(reason, f"unknown_{reason}")
+            lines.append(f"fallback_reason_{reason}_{reason_name}_rows: {count}")
+
+    if validation_rows and "plan_failure_reason" in validation_rows[0]:
+        plan_failure_counts = Counter(
+            to_int(row, "plan_failure_reason")
+            for row in validation_rows
+            if to_int(row, "plan_failure_reason") != 0
+        )
+        for reason, count in sorted(plan_failure_counts.items()):
+            reason_name = PLAN_FAILURE_REASON_NAMES.get(reason, f"unknown_{reason}")
+            lines.append(f"plan_failure_reason_{reason}_{reason_name}_rows: {count}")
+
+    if validation_rows:
+        execution_stage_counts = Counter(
+            execution_stage(row) for row in validation_rows
+        )
+        for execution_stage_value, count in sorted(execution_stage_counts.items()):
+            lines.append(
+                f"execution_stage_{execution_stage_value}_rows: {count}"
+            )
+        has_prediction_valid_field = "monitor_prediction_valid" in validation_rows[0]
+        prediction_invalid_rows = sum(
+            1
+            for row in validation_rows
+            if (
+                to_int(row, "monitor_prediction_valid") == 0
+                if has_prediction_valid_field
+                else to_int(row, "monitored_steps") == 0
+            )
+        )
+        current_contact_rows = sum(
+            to_int(row, "contact_relevant_for_energy") == 1
+            for row in validation_rows
+        )
+        combined_contact_false_while_current_contact_rows = sum(
+            to_int(row, "contact_relevant_for_energy") == 1
+            and to_int(row, "monitored_contact_possible") == 0
+            for row in validation_rows
+        )
+        lines.extend(
+            [
+                f"monitor_prediction_invalid_rows: {prediction_invalid_rows}",
+                f"current_contact_relevant_rows: {current_contact_rows}",
+                "combined_contact_false_while_current_contact_rows: "
+                f"{combined_contact_false_while_current_contact_rows}",
+            ]
+        )
 
     if first_trigger is not None and first_failsafe is not None:
         lines.append(
@@ -591,7 +722,7 @@ def make_plots(
     target_pz = [row["collision_target_pz"] for row in comparison]
     pred_error_mm = [1000.0 * row["pred_error_pz"] for row in comparison]
 
-    first_failsafe = first_time(validation_rows, "mode")
+    first_failsafe = first_execution_stage_time(validation_rows, 2)
     first_trigger = first_time(validation_rows, "predicted_trigger")
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
@@ -637,7 +768,7 @@ def make_plots(
         ax.plot(t_pred, target_pz, label="prediction target pz", lw=1.0, alpha=0.8)
         if first_trigger is not None:
             ax.axvline(first_trigger, color="orange", linestyle="--", label="first trigger")
-        ax.axvline(first_failsafe, color="purple", linestyle="--", label="first mode=1")
+        ax.axvline(first_failsafe, color="purple", linestyle="--", label="first failsafe stage")
         ax.set_xlim(xmin, xmax)
         ax.set_xlabel("wall_time_sec")
         ax.set_ylabel("z [m]")
@@ -674,14 +805,14 @@ def make_executed_reference_plot(
     reference_pz = [float(row["reference_pz"]) for row in rows]
     measured_pz = [
         float(row["measured_collision_center_pz"])
-        if int(row["mode"]) == 0
+        if int(row["execution_stage"]) == 0
         else float(row["measured_tcp_pz"])
         for row in rows
     ]
     error_mm = [float(row["error_mm"]) for row in rows]
     mode = [int(row["mode"]) for row in rows]
 
-    first_failsafe = first_time(validation_rows, "mode")
+    first_failsafe = first_execution_stage_time(validation_rows, 2)
     first_trigger = first_time(validation_rows, "predicted_trigger")
 
     out_paths = []
@@ -725,7 +856,7 @@ def make_executed_reference_plot(
         ax.plot(t, reference_pz, label="executed reference pz", lw=1.1)
         if first_trigger is not None:
             ax.axvline(first_trigger, color="orange", linestyle="--", label="first trigger")
-        ax.axvline(first_failsafe, color="purple", linestyle="--", label="first mode=1")
+        ax.axvline(first_failsafe, color="purple", linestyle="--", label="first failsafe stage")
         ax.set_xlim(xmin, xmax)
         ax.set_xlabel("wall_time_sec")
         ax.set_ylabel("z [m]")
@@ -788,7 +919,7 @@ def make_mode1_nominal_plot(
     axes[2].legend(loc="best")
     axes[2].grid(True)
 
-    fig.suptitle("Mode=1: monitored nominal prediction vs measured pose")
+    fig.suptitle("Fallback: monitored nominal prediction vs measured pose")
     fig.tight_layout()
     out_path = run_dir / "mode1_nominal_prediction_vs_measured_pz.png"
     fig.savefig(out_path, dpi=160)
@@ -821,7 +952,7 @@ def make_verification_aligned_plot(
     mode = [int(row["mode"]) for row in rows]
     stage_numeric = [0 if row["prediction_stage"] == "intended" else 1 for row in rows]
 
-    first_failsafe = first_time(validation_rows, "mode")
+    first_failsafe = first_execution_stage_time(validation_rows, 2)
     first_trigger = first_time(validation_rows, "predicted_trigger")
 
     out_paths = []

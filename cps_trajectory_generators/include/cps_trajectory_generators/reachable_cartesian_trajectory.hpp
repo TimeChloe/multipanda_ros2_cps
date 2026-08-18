@@ -47,9 +47,9 @@ struct PathConsistentTimedPathConfig {
 
 struct TrajectoryGeneratorSettings {
   double shield_plan_dt{0.001};
-  double monitor_frequency_hz{50.0};
+  double monitor_frequency_hz{200.0};
 
-  int local_replan_horizon_steps{500};
+  int local_replan_horizon_steps{64};
   double local_replan_dt{0.001};
   double local_path_lookahead_sec{0.50};
   double local_replan_max_velocity{0.5};
