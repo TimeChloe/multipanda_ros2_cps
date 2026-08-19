@@ -19,7 +19,51 @@ using Matrix67d = Eigen::Matrix<double, 6, 7>;
 
 using Vector3d = Eigen::Matrix<double, 3, 1>;
 using Vector6d = Eigen::Matrix<double, 6, 1>;
+using Vector7d = Eigen::Matrix<double, 7, 1>;
 using Quaterniond = Eigen::Quaterniond;
+
+// Robot-model quantities evaluated at one predicted joint state.  The safety
+// monitor deliberately depends on this small interface instead of a concrete
+// rigid-body library, so a controller can own a thread-local Pinocchio model.
+struct JointDynamicsSample {
+  bool valid{false};
+  Vector3d control_position{Vector3d::Zero()};
+  Quaterniond control_orientation{Quaterniond::Identity()};
+  Matrix67d control_jacobian{Matrix67d::Zero()};
+  Vector6d control_jdot_dq{Vector6d::Zero()};
+  Matrix7d inertia{Matrix7d::Zero()};
+  Vector7d coriolis{Vector7d::Zero()};
+};
+
+struct JointDynamicsLimits {
+  Vector7d position_lower{Vector7d::Constant(
+      -std::numeric_limits<double>::infinity())};
+  Vector7d position_upper{Vector7d::Constant(
+      std::numeric_limits<double>::infinity())};
+  Vector7d velocity{Vector7d::Constant(
+      std::numeric_limits<double>::infinity())};
+  Vector7d acceleration{Vector7d::Constant(
+      std::numeric_limits<double>::infinity())};
+  Vector7d torque{Vector7d::Constant(
+      std::numeric_limits<double>::infinity())};
+};
+
+// One state from the joint-space rollout.  This is an optional diagnostic
+// trace: control decisions never depend on whether the trace is requested.
+struct JointPredictionSample {
+  double t{0.0};
+  Vector7d q{Vector7d::Zero()};
+  Vector7d dq{Vector7d::Zero()};
+};
+
+class JointDynamicsProvider {
+ public:
+  virtual ~JointDynamicsProvider() = default;
+  virtual bool evaluate(const Vector7d& q,
+                        const Vector7d& dq,
+                        JointDynamicsSample* sample) const = 0;
+  virtual JointDynamicsLimits limits() const = 0;
+};
 
 struct MonitorResult {
   bool monitored_contact_possible{false};
@@ -33,11 +77,15 @@ struct MonitorResult {
 
   double worst_case_contact_time{0.0};
   double worst_case_workspace_distance_at_candidate{0.0};
-  // Full 6D Cartesian control-energy upper bounds at the worst monitored
-  // contact sample.
+  // Cartesian projection retained for diagnosis at the worst monitored
+  // contact sample. Candidate gating uses joint kinetic + Cartesian potential.
   double worst_case_cartesian_kinetic_energy_ub{0.0};
   double worst_case_cartesian_potential_energy_ub{0.0};
   double worst_case_cartesian_control_energy_ub{0.0};
+  // Paper-consistent total kinetic energy 1/2 dq^T M(q) dq.  Cartesian
+  // kinetic values above are retained as diagnostics only.
+  double worst_case_joint_kinetic_energy_ub{0.0};
+  double worst_case_total_control_energy_ub{0.0};
 
   double workspace_distance_margin{0.0};
   double h_monitored_energy{0.0};
@@ -46,11 +94,20 @@ struct MonitorResult {
   double current_cartesian_potential_energy{0.0};
   double current_cartesian_control_energy{0.0};
   bool current_cartesian_energy_valid{false};
+  double current_joint_kinetic_energy{0.0};
+  double current_total_control_energy{0.0};
+  bool current_joint_energy_valid{false};
 
   double worst_case_pos_error_radius{0.0};
   double worst_case_vel_error_radius{0.0};
 
   bool collision_energy_unsafe{false};
+  bool joint_limit_unsafe{false};
+  int joint_limit_index{-1};
+  double joint_position_violation{0.0};
+  double joint_velocity_violation{0.0};
+  double joint_acceleration_violation{0.0};
+  double joint_torque_violation{0.0};
 
   double terminal_energy_ub{0.0};
   double h_terminal_energy{std::numeric_limits<double>::infinity()};
@@ -109,8 +166,24 @@ struct SafetyMonitorConfig {
   double ee_collision_radius{0.04};
   double contact_activation_margin{0.0};
   double tracking_acc_error_bound{0.2};
+  double joint_velocity_error_bound{0.0};
   bool use_dynamic_consistent_impedance{true};
+  Vector7d nullspace_reference{Vector7d::Zero()};
+  double nullspace_stiffness{0.0};
+  Vector7d previous_torque_command{Vector7d::Zero()};
+  bool previous_torque_command_valid{false};
+  double torque_rate_limit{1000.0};
+  double joint_rollout_max_dt{0.001};
+  Vector3d collision_center_offset{Vector3d::Zero()};
 };
+
+MonitorResult verifyReachablePlanJointSpace(
+    const VerifiedPlan& plan,
+    const Vector7d& current_q,
+    const Vector7d& current_dq,
+    const JointDynamicsProvider& dynamics,
+    const SafetyMonitorConfig& config,
+    std::vector<JointPredictionSample>* prediction_trace = nullptr);
 
 MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
                                   const Vector3d& current_position,

@@ -262,6 +262,10 @@ reachable_cartesian_impedance_controller:
     ee_collision_radius: 0.03
     tcp_offset: [0.0, 0.0, 0.06]
     ee_collision_center_offset: [0.0, 0.0, -0.03]
+    # The 200 Hz monitor rolls q,dq and recomputes M,J,Jdot*dq with this
+    # independent model. The 1 kHz controller still reads dynamics from the
+    # Franka semantic model.
+    monitor_urdf_model_path: /home/developer/multipanda_ws/src/model_urdf/panda_ng.urdf
     async_safety_monitor: true
     async_plan_max_age_sec: 0.02
     # The 200 Hz monitor period consumes five dense 1 ms commands. Keep an
@@ -276,5 +280,6 @@ reachable_cartesian_impedance_controller:
 
     # Residual acceleration disturbance for the measured-state rollout.
     tracking_acc_error_bound: 0.2
+    joint_velocity_error_bound: 0.0
 
     use_dynamic_consistent_impedance: true

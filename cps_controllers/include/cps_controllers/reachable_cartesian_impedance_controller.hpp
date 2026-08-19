@@ -120,6 +120,7 @@ using MonitorResult = cps_safety_monitor::MonitorResult;
 using ImpedanceSample = cps_safety_monitor::ImpedanceSample;
 using VerifiedPlan = cps_safety_monitor::VerifiedPlan;
 using SafetyMonitorConfig = cps_safety_monitor::SafetyMonitorConfig;
+using JointPredictionSample = cps_safety_monitor::JointPredictionSample;
 
 struct ShieldDecision {
   bool candidate_verified{false};
@@ -132,6 +133,9 @@ struct ShieldDecision {
   ImpedanceSample command;
   MonitorResult monitor;
   VerifiedPlan evaluated_plan;
+  // Filled only when prediction logging is enabled.  It is produced by the
+  // same joint rollout that made the monitor decision.
+  std::vector<JointPredictionSample> joint_prediction_trace;
   // A path-consistent intended stream may still be valid when construction of
   // the separate fail-safe reserve fails. It is executable only in measured
   // contact, under the 1 kHz Cartesian energy governor.
@@ -215,17 +219,22 @@ class ReachableCartesianImpedanceController
       PlanFailureReason* failure_reason = nullptr) const;
 
   MonitorResult evaluateCandidatePlan(const VerifiedPlan& plan,
+                                      const Vector7d& q,
+                                      const Vector7d& dq,
                                       const Vector3d& current_position,
                                       const Quaterniond& current_orientation,
                                       const Vector6d& ee_twist,
                                       const Matrix7d& inertia,
                                       const Matrix67d& J_geo,
+                                      const Vector7d& previous_torque_command,
                                       const Matrix6d& K_runtime,
                                       const Matrix6d& D_runtime,
                                       const cps_human_workspace::HumanWorkspace& human_workspace,
                                       bool human_workspace_active,
                                       const ImpedanceSample& current_command_reference,
-                                      bool current_command_reference_valid) const;
+                                      bool current_command_reference_valid,
+                                      std::vector<JointPredictionSample>*
+                                          joint_prediction_trace = nullptr) const;
 
   Vector3d collisionCenterOffsetWorld(const Quaterniond& orientation) const;
 
@@ -244,6 +253,8 @@ class ReachableCartesianImpedanceController
 
   ShieldDecision computeShieldDecision(double wall_time,
                                        double nominal_guess_time,
+                                       const Vector7d& q,
+                                       const Vector7d& dq,
                                        const Vector3d& current_position,
                                        const Quaterniond& current_orientation,
                                        const Vector6d& ee_twist,
@@ -263,12 +274,15 @@ class ReachableCartesianImpedanceController
     double wall_time{0.0};
     double nominal_guess_time{0.0};
 
+    Vector7d q{Vector7d::Zero()};
+    Vector7d dq{Vector7d::Zero()};
     Vector3d current_position{Vector3d::Zero()};
     Quaterniond current_orientation{Quaterniond::Identity()};
     Vector6d ee_twist{Vector6d::Zero()};
     Matrix7d inertia{Matrix7d::Zero()};
     Matrix37d Jv{Matrix37d::Zero()};
     Matrix67d J_geo{Matrix67d::Zero()};
+    Vector7d previous_torque_command{Vector7d::Zero()};
     Matrix6d K_runtime{Matrix6d::Zero()};
     Matrix6d D_runtime{Matrix6d::Zero()};
     cps_human_workspace::HumanWorkspace human_workspace;
@@ -340,6 +354,8 @@ class ReachableCartesianImpedanceController
   void logShieldPredictionTrajectory(
       double wall_time,
       double nominal_guess_time,
+      const Vector7d& current_q,
+      const Vector7d& current_dq,
       const Vector3d& current_position,
       const Quaterniond& current_orientation,
       const Vector6d& ee_twist,
@@ -349,6 +365,7 @@ class ReachableCartesianImpedanceController
       const Matrix6d& D_runtime,
       const cps_human_workspace::HumanWorkspace& human_workspace,
       const VerifiedPlan& evaluated_plan,
+      const std::vector<JointPredictionSample>& joint_prediction_trace,
       const MonitorResult& monitor,
       int mode,
       bool candidate_verified,
@@ -362,6 +379,8 @@ class ReachableCartesianImpedanceController
   struct PredictionLogRecord {
     double wall_time{0.0};
     double nominal_guess_time{0.0};
+    Vector7d current_q{Vector7d::Zero()};
+    Vector7d current_dq{Vector7d::Zero()};
     Vector3d current_position{Vector3d::Zero()};
     Quaterniond current_orientation{Quaterniond::Identity()};
     Vector6d ee_twist{Vector6d::Zero()};
@@ -371,6 +390,7 @@ class ReachableCartesianImpedanceController
     Matrix6d D_runtime{Matrix6d::Zero()};
     cps_human_workspace::HumanWorkspace human_workspace;
     VerifiedPlan evaluated_plan{};
+    std::vector<JointPredictionSample> joint_prediction_trace;
     MonitorResult monitor{};
     int mode{0};
     bool candidate_verified{false};
@@ -386,6 +406,8 @@ class ReachableCartesianImpedanceController
       std::ostream& output,
       double wall_time,
       double nominal_guess_time,
+      const Vector7d& current_q,
+      const Vector7d& current_dq,
       const Vector3d& current_position,
       const Quaterniond& current_orientation,
       const Vector6d& ee_twist,
@@ -395,6 +417,7 @@ class ReachableCartesianImpedanceController
       const Matrix6d& D_runtime,
       const cps_human_workspace::HumanWorkspace& human_workspace,
       const VerifiedPlan& evaluated_plan,
+      const std::vector<JointPredictionSample>& joint_prediction_trace,
       const MonitorResult& monitor,
       int mode,
       bool candidate_verified,
@@ -406,7 +429,7 @@ class ReachableCartesianImpedanceController
       const char* source);
 
   struct ControlLogRecord {
-    static constexpr std::size_t kMaxValues = 112;
+    static constexpr std::size_t kMaxValues = 128;
     std::array<double, kMaxValues> values{};
     std::size_t value_count{0};
   };
@@ -422,6 +445,7 @@ class ReachableCartesianImpedanceController
                                   const Vector3d& current_position,
                                   const Quaterniond& current_orientation,
                                   const ImpedanceSample& cmd,
+                                  bool cartesian_energy_budget_active,
                                   double dt);
 
   ImpedanceSample getNextFailsafeCommandFromCache(bool advance_index);
@@ -531,6 +555,10 @@ class ReachableCartesianImpedanceController
   double cartesian_via_points_action_feedback_period_sec_{0.1};
 
   std::unique_ptr<franka_semantic_components::FrankaRobotModel> franka_robot_model_;
+  class PinocchioJointDynamicsProvider;
+  std::unique_ptr<PinocchioJointDynamicsProvider>
+      monitor_joint_dynamics_provider_;
+  std::string monitor_urdf_model_path_;
 
   rclcpp::Time start_time_;
 
@@ -589,6 +617,7 @@ class ReachableCartesianImpedanceController
 
   // 替换了旧的 error_pos_gain_alpha_ 等常数，改用固定的误差管道边界
   double tracking_acc_error_bound_{0.2};
+  double joint_velocity_error_bound_{0.0};
 
   double shield_plan_dt_{0.01};
   int shield_intended_steps_{1};
@@ -705,9 +734,6 @@ class ReachableCartesianImpedanceController
   double cartesian_energy_min_pos_stiffness_{0.0};
   double cartesian_energy_lambda_update_period_sec_{0.001};
   double cartesian_energy_damping_ratio_{0.8};
-  // Only scalar path progress is retimed in mode 2; the Cartesian path is
-  // unchanged. Mode 0 always requests the nominal path rate.
-  double mode2_energy_path_rate_target_{1.0};
   Matrix6d cartesian_energy_task_inertia_cache_{Matrix6d::Zero()};
   Matrix6d cartesian_energy_task_inertia_sqrt_cache_{Matrix6d::Zero()};
   bool cartesian_energy_task_inertia_cache_valid_{false};
@@ -715,7 +741,7 @@ class ReachableCartesianImpedanceController
   bool last_cartesian_energy_budget_active_{false};
   bool last_cartesian_energy_budget_lambda_valid_{false};
   double last_cartesian_energy_scale_{1.0};
-  double last_cartesian_kinetic_energy_{0.0};
+  double last_joint_kinetic_energy_{0.0};
   double last_cartesian_potential_energy_{0.0};
   double last_cartesian_control_energy_{0.0};
   bool cartesian_effective_time_frozen_{false};
@@ -732,8 +758,13 @@ class ReachableCartesianImpedanceController
   Vector3d cartesian_energy_hold_dp_ds_{Vector3d::Zero()};
   Vector3d cartesian_energy_hold_w_ds_{Vector3d::Zero()};
   bool cartesian_energy_hold_tangent_valid_{false};
-  double cartesian_energy_resume_path_rate_{0.0};
-  bool cartesian_energy_resume_path_rate_valid_{false};
+  // The nominal replanner is anchored at the last command position, while its
+  // scalar path velocity and acceleration come from the measured TCP motion.
+  // These states deliberately contain no energy-budget information.
+  double measured_path_rate_{0.0};
+  bool measured_path_rate_valid_{false};
+  double measured_path_acceleration_{0.0};
+  bool measured_path_acceleration_valid_{false};
   // Preserve the monitor state that caused the Lachner energy hold. The
   // controller remains in mode 2 until a newly verified candidate explicitly
   // proves that the robot has left the human workspace.

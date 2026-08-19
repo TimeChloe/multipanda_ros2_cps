@@ -5,7 +5,13 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import FrontendLaunchDescriptionSource
-from launch.substitutions import Command, FindExecutable, LaunchConfiguration
+from launch.substitutions import (
+    Command,
+    FindExecutable,
+    LaunchConfiguration,
+    PathJoinSubstitution,
+    PythonExpression,
+)
 from launch_ros.actions import Node
 
 
@@ -31,19 +37,15 @@ def concatenate_ns(ns1, ns2, absolute=False):
 def generate_launch_description():
     arm_id_param = 'arm_id'
     initial_positions_param = 'initial_positions'
+    scene_param = 'scene'
     use_rviz_param = 'use_rviz'
 
     arm_id = LaunchConfiguration(arm_id_param)
     initial_positions = LaunchConfiguration(initial_positions_param)
+    scene = LaunchConfiguration(scene_param)
     use_rviz = LaunchConfiguration(use_rviz_param)
 
     load_gripper = False
-
-    if load_gripper:
-        scene_file = 'scene.xml'
-    else:
-        # scene_file = 'scene_ng.xml'
-        scene_file = 'scene_ng_no_table.xml'
 
     franka_description_path = get_package_share_directory('franka_description')
     franka_bringup_path = get_package_share_directory('franka_bringup')
@@ -52,11 +54,17 @@ def generate_launch_description():
         'robots',
         'sim',
         'panda_arm_sim.urdf.xacro')
-    xml_file = os.path.join(
+    scene_file = PythonExpression([
+        "'scene_ng.xml' if '",
+        scene,
+        "' == 'table_spring' else 'scene_ng_no_table.xml'",
+    ])
+    xml_file = PathJoinSubstitution([
         franka_description_path,
         'mujoco',
         'franka',
-        scene_file)
+        scene_file,
+    ])
     mjros_config_file = os.path.join(
         franka_bringup_path,
         'config',
@@ -119,6 +127,14 @@ def generate_launch_description():
             initial_positions_param,
             default_value='"0.0 -0.578 0.0 -1.753 0.0 1.175 0.785"',
             description='Initial joint positions of the robot.'),
+        DeclareLaunchArgument(
+            scene_param,
+            default_value='no_table',
+            choices=['no_table', 'table_spring'],
+            description=(
+                'MuJoCo scene: no_table loads only the robot and floor; '
+                'table_spring adds the table, visual spring, and compliant '
+                'hand-surface pad.')),
         IncludeLaunchDescription(
             FrontendLaunchDescriptionSource(
                 franka_bringup_path +

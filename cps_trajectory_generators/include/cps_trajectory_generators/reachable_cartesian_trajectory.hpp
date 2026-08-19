@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,11 @@ struct PathConsistentTimedPathConfig {
   double max_path_jerk{5.0};
   double target_path_rate{1.0};
   double initial_path_rate{-1.0};
+  // A finite value explicitly reanchors Ruckig to the measured scalar path
+  // acceleration. NaN preserves the legacy estimate from Cartesian command
+  // derivatives.
+  double initial_path_acceleration{
+      std::numeric_limits<double>::quiet_NaN()};
 };
 
 struct TrajectoryGeneratorSettings {

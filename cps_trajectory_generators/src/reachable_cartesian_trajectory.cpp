@@ -115,6 +115,29 @@ Eigen::Vector3d clampVectorComponents(
       std::clamp(v.z(), -clamped_limit, clamped_limit));
 }
 
+double makeNonreversingInitialPathAcceleration(
+    double path_rate,
+    double path_acceleration,
+    double max_path_acceleration,
+    double max_path_jerk) {
+  const double acceleration_limit =
+      std::max(max_path_acceleration, 0.0);
+  double acceleration = std::clamp(
+      path_acceleration, -acceleration_limit, acceleration_limit);
+
+  // With negative initial acceleration, the rate keeps falling until bounded
+  // positive jerk can bring acceleration back to zero. Limit that deceleration
+  // to the largest value that cannot make a nonnegative path rate reverse:
+  //   delta_v = a^2 / (2 j) <= v.
+  if (acceleration < 0.0) {
+    const double nonreversing_deceleration = std::sqrt(
+        2.0 * std::max(max_path_jerk, kSmallPositive) *
+        std::max(path_rate, 0.0));
+    acceleration = std::max(acceleration, -nonreversing_deceleration);
+  }
+  return acceleration;
+}
+
 }  // namespace
 
 std::string defaultTrajectoryGeneratorConfigPath() {
@@ -1027,8 +1050,16 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathReplan(
       config.initial_path_rate >= 0.0
           ? std::clamp(config.initial_path_rate, 0.0, max_rate)
           : estimated_start_rate;
-  const double start_acceleration = estimatePathAccelerationAtSample(
-      planning_start, path_start, start_rate, max_accel);
+  const double estimated_start_acceleration =
+      estimatePathAccelerationAtSample(
+          planning_start, path_start, start_rate, max_accel);
+  const double requested_start_acceleration =
+      std::isfinite(config.initial_path_acceleration)
+          ? config.initial_path_acceleration
+          : estimated_start_acceleration;
+  const double start_acceleration =
+      makeNonreversingInitialPathAcceleration(
+          start_rate, requested_start_acceleration, max_accel, max_jerk);
   const double target_path_time = std::min(
       std::max(start_path_time + std::max(config.path_lookahead_sec, dt),
                start_path_time + dt),
@@ -1063,6 +1094,7 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathReplan(
           : std::clamp(config.target_path_rate, 0.0, max_rate)};
   input.target_acceleration = {0.0};
   input.max_velocity = {max_rate};
+  input.min_velocity = {0.0};
   input.max_acceleration = {max_accel};
   input.max_jerk = {max_jerk};
 
@@ -1081,15 +1113,21 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathReplan(
       std::max(1, static_cast<int>(std::ceil(duration / dt))));
   samples.reserve(static_cast<std::size_t>(n_steps));
 
+  double previous_path_time = start_path_time;
   for (int i = 0; i < n_steps; ++i) {
     const double tau = std::min(static_cast<double>(i + 1) * dt, duration);
     std::array<double, 1> s_arr{}, ds_arr{}, dds_arr{};
     trajectory.at_time(tau, s_arr, ds_arr, dds_arr);
+    const double path_time = std::clamp(
+        std::max(previous_path_time, s_arr[0]),
+        timed_path.front().t,
+        timed_path.back().t);
     samples.push_back(retimeTimedPathSample(
         timed_path,
-        std::clamp(s_arr[0], timed_path.front().t, timed_path.back().t),
+        path_time,
         std::clamp(ds_arr[0], 0.0, max_rate),
         dds_arr[0]));
+    previous_path_time = path_time;
   }
 
   return samples;
@@ -1124,8 +1162,16 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathIntendedPrefix
       config.initial_path_rate >= 0.0
           ? std::clamp(config.initial_path_rate, 0.0, max_rate)
           : estimated_start_rate;
-  const double start_acceleration = estimatePathAccelerationAtSample(
-      planning_start, path_start, start_rate, max_accel);
+  const double estimated_start_acceleration =
+      estimatePathAccelerationAtSample(
+          planning_start, path_start, start_rate, max_accel);
+  const double requested_start_acceleration =
+      std::isfinite(config.initial_path_acceleration)
+          ? config.initial_path_acceleration
+          : estimated_start_acceleration;
+  const double start_acceleration =
+      makeNonreversingInitialPathAcceleration(
+          start_rate, requested_start_acceleration, max_accel, max_jerk);
   const double target_rate =
       std::clamp(config.target_path_rate, 0.0, max_rate);
 
@@ -1153,6 +1199,7 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathIntendedPrefix
   input.target_velocity = {target_rate};
   input.target_acceleration = {0.0};
   input.max_velocity = {max_rate};
+  input.min_velocity = {0.0};
   input.max_acceleration = {max_accel};
   input.max_jerk = {max_jerk};
 
@@ -1169,6 +1216,7 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathIntendedPrefix
     trajectory.at_time(duration, s_final, ds_final, dds_final);
   }
 
+  double previous_path_time = start_path_time;
   for (int i = 0; i < intended_steps; ++i) {
     const double tau = static_cast<double>(i + 1) * dt;
     std::array<double, 1> s_arr{}, ds_arr{}, dds_arr{};
@@ -1182,14 +1230,17 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathIntendedPrefix
       dds_arr[0] = 0.0;
     }
 
-    const double path_time =
-        std::clamp(s_arr[0], timed_path.front().t, timed_path.back().t);
+    const double path_time = std::clamp(
+        std::max(previous_path_time, s_arr[0]),
+        timed_path.front().t,
+        timed_path.back().t);
     const bool at_path_end = path_time >= timed_path.back().t - kMinDt;
     samples.push_back(retimeTimedPathSample(
         timed_path,
         path_time,
         at_path_end ? 0.0 : std::clamp(ds_arr[0], 0.0, max_rate),
         at_path_end ? 0.0 : dds_arr[0]));
+    previous_path_time = path_time;
   }
 
   return samples;
@@ -1215,8 +1266,13 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathBrake(
       sampleTimedPathAt(timed_path, start_path_time);
   const double start_rate =
       estimatePathRateAtSample(brake_start, path_start, max_rate);
-  const double start_acceleration = estimatePathAccelerationAtSample(
-      brake_start, path_start, start_rate, max_accel);
+  const double start_acceleration =
+      makeNonreversingInitialPathAcceleration(
+          start_rate,
+          estimatePathAccelerationAtSample(
+              brake_start, path_start, start_rate, max_accel),
+          max_accel,
+          max_jerk);
 
   ruckig::Ruckig<1> otg;
   ruckig::InputParameter<1> input;
@@ -1228,6 +1284,7 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathBrake(
   input.target_velocity = {0.0};
   input.target_acceleration = {0.0};
   input.max_velocity = {max_rate};
+  input.min_velocity = {0.0};
   input.max_acceleration = {max_accel};
   input.max_jerk = {max_jerk};
 
@@ -1240,15 +1297,21 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathBrake(
   const int n_steps = std::max(1, static_cast<int>(std::ceil(duration / dt)));
   samples.reserve(static_cast<std::size_t>(n_steps));
 
+  double previous_path_time = start_path_time;
   for (int i = 0; i < n_steps; ++i) {
     const double tau = std::min(static_cast<double>(i + 1) * dt, duration);
     std::array<double, 1> s_arr{}, ds_arr{}, dds_arr{};
     trajectory.at_time(tau, s_arr, ds_arr, dds_arr);
+    const double sample_path_time = std::clamp(
+        std::max(previous_path_time, s_arr[0]),
+        timed_path.front().t,
+        timed_path.back().t);
     CartesianTrajectorySample s = retimeTimedPathSample(
         timed_path,
-        std::clamp(s_arr[0], timed_path.front().t, timed_path.back().t),
+        sample_path_time,
         std::clamp(ds_arr[0], 0.0, max_rate),
         dds_arr[0]);
+    previous_path_time = sample_path_time;
     if (i + 1 == n_steps) {
       s.dp.setZero();
       s.ddp.setZero();

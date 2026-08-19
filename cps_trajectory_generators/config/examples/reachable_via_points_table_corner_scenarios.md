@@ -12,6 +12,15 @@ All examples are `geometry_msgs/msg/PoseArray` payloads and use:
   `[0.923956, -0.382499, 0.000000, 0.000000]`
 - a final approach point near `[0.306957, 0.000000, 0.279912]`
 
+Start MuJoCo with the table, visual spring, and compliant hand-surface pad:
+
+```bash
+ros2 launch franka_bringup franka_sim.launch.py scene:=table_spring
+```
+
+The backward-compatible robot-and-floor scene remains available with
+`scene:=no_table`, which is also the default.
+
 ## Scenarios
 
 - `reachable_via_points_table_corner_front_left.yaml`

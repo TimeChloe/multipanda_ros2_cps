@@ -26,6 +26,7 @@
 #include <limits>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -36,6 +37,13 @@
 #include <controller_interface/controller_interface.hpp>
 #include <franka/model.h>
 #include <franka_semantic_components/franka_robot_model.hpp>
+#include <pinocchio/algorithm/crba.hpp>
+#include <pinocchio/algorithm/frames.hpp>
+#include <pinocchio/algorithm/jacobian.hpp>
+#include <pinocchio/algorithm/kinematics.hpp>
+#include <pinocchio/algorithm/kinematics-derivatives.hpp>
+#include <pinocchio/algorithm/rnea.hpp>
+#include <pinocchio/parsers/urdf.hpp>
 #include <pluginlib/class_list_macros.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/state.hpp>
@@ -50,6 +58,7 @@ namespace {
 
 constexpr double kMinDt = 1e-6;
 constexpr double kSmallPositive = 1e-9;
+constexpr double kMeasuredPathAccelerationFilterTimeSec = 0.01;
 constexpr const char* kDefaultErrorLogRootDir =
     "/home/developer/multipanda_ws/src/data_log";
 constexpr const char* kDefaultErrorLogFileName =
@@ -342,6 +351,118 @@ bool symmetricPositiveSemidefiniteSquareRoot(
 }  // namespace
 
 namespace cps_controllers {
+
+class ReachableCartesianImpedanceController::PinocchioJointDynamicsProvider
+    final : public cps_safety_monitor::JointDynamicsProvider {
+ public:
+  PinocchioJointDynamicsProvider(const std::string& urdf_model_path,
+                                 const Vector3d& tcp_offset) {
+    pinocchio::urdf::buildModel(urdf_model_path, model_);
+    if (model_.nq != 7 || model_.nv != 7) {
+      throw std::runtime_error(
+          "Reachable monitor URDF must contain exactly seven actuated joints");
+    }
+    data_ = std::make_unique<pinocchio::Data>(model_);
+    frame_id_ = model_.getFrameId("panda_link8");
+    if (frame_id_ >= static_cast<pinocchio::FrameIndex>(model_.nframes)) {
+      throw std::runtime_error(
+          "Reachable monitor URDF does not contain frame panda_link8");
+    }
+    tcp_offset_ = tcp_offset;
+
+    for (int i = 0; i < 7; ++i) {
+      limits_.position_lower(i) = panda_limits::kPositionLower[i];
+      limits_.position_upper(i) = panda_limits::kPositionUpper[i];
+      limits_.velocity(i) = panda_limits::kVelocity[i];
+      limits_.acceleration(i) = panda_limits::kAcceleration[i];
+      limits_.torque(i) = panda_limits::kTorque[i];
+    }
+  }
+
+  bool evaluate(
+      const Vector7d& q,
+      const Vector7d& dq,
+      cps_safety_monitor::JointDynamicsSample* sample) const override {
+    if (sample == nullptr || !q.allFinite() || !dq.allFinite()) {
+      return false;
+    }
+
+    try {
+      const Vector7d ddq_zero = Vector7d::Zero();
+      pinocchio::forwardKinematics(model_, *data_, q, dq, ddq_zero);
+      pinocchio::computeJointJacobians(model_, *data_, q);
+      pinocchio::updateFramePlacements(model_, *data_);
+
+      Matrix67d pin_jacobian = Matrix67d::Zero();
+      pinocchio::getFrameJacobian(
+          model_, *data_, frame_id_,
+          pinocchio::ReferenceFrame::LOCAL_WORLD_ALIGNED,
+          pin_jacobian);
+
+      // Pinocchio in this ROS distribution and the controller both use the
+      // [linear; angular] 6D ordering.
+      const Matrix67d frame_jacobian = pin_jacobian;
+
+      const auto& placement = data_->oMf[frame_id_];
+      const Vector3d offset_world = placement.rotation() * tcp_offset_;
+      Matrix67d control_jacobian = frame_jacobian;
+      control_jacobian.topRows<3>() =
+          frame_jacobian.topRows<3>() -
+          skewSymmetric(offset_world) * frame_jacobian.bottomRows<3>();
+
+      const pinocchio::Motion frame_velocity =
+          pinocchio::getFrameVelocity(
+              model_, *data_, frame_id_,
+              pinocchio::ReferenceFrame::LOCAL_WORLD_ALIGNED);
+      const pinocchio::Motion frame_acceleration =
+          pinocchio::getFrameClassicalAcceleration(
+              model_, *data_, frame_id_,
+              pinocchio::ReferenceFrame::LOCAL_WORLD_ALIGNED);
+      const Vector3d omega = frame_velocity.angular();
+      const Vector3d alpha = frame_acceleration.angular();
+      Vector6d control_jdot_dq = Vector6d::Zero();
+      control_jdot_dq.head<3>() =
+          frame_acceleration.linear() + alpha.cross(offset_world) +
+          omega.cross(omega.cross(offset_world));
+      control_jdot_dq.tail<3>() = alpha;
+
+      pinocchio::crba(model_, *data_, q);
+      Matrix7d inertia = data_->M;
+      inertia.triangularView<Eigen::StrictlyLower>() =
+          inertia.transpose().triangularView<Eigen::StrictlyLower>();
+      pinocchio::computeCoriolisMatrix(model_, *data_, q, dq);
+
+      sample->control_position =
+          placement.translation() + offset_world;
+      sample->control_orientation =
+          Quaterniond(placement.rotation()).normalized();
+      sample->control_jacobian = control_jacobian;
+      sample->control_jdot_dq = control_jdot_dq;
+      sample->inertia = 0.5 * (inertia + inertia.transpose());
+      sample->coriolis = data_->C * dq;
+      sample->valid = sample->control_position.allFinite() &&
+                      sample->control_jacobian.allFinite() &&
+                      sample->control_jdot_dq.allFinite() &&
+                      sample->inertia.allFinite() &&
+                      sample->coriolis.allFinite();
+      return sample->valid;
+    } catch (const std::exception&) {
+      sample->valid = false;
+      return false;
+    }
+  }
+
+  cps_safety_monitor::JointDynamicsLimits limits() const override {
+    return limits_;
+  }
+
+ private:
+  pinocchio::Model model_;
+  mutable std::unique_ptr<pinocchio::Data> data_;
+  pinocchio::FrameIndex frame_id_{0};
+  Vector3d tcp_offset_{Vector3d::Zero()};
+  cps_safety_monitor::JointDynamicsLimits limits_;
+};
 
 ReachableCartesianImpedanceController::~ReachableCartesianImpedanceController() {
   stopSafetyMonitorWorker();
@@ -902,12 +1023,10 @@ bool ReachableCartesianImpedanceController::isOneStepCommandTransitionContinuous
           max_angular_acceleration * transition_dt + kVelocityTolerance &&
       (next.dw - previous.dw).norm() <=
           max_angular_jerk * transition_dt + kAccelerationTolerance;
-  // During an effective-time hold the published hold command deliberately has
-  // zero derivatives.  The async replanner, however, reanchors the intended
-  // stream to the velocity still measured on the robot.  Comparing that
-  // reanchored velocity with the artificial zero hold velocity would reject
-  // every valid resume indefinitely.  Pose and scalar path state must remain
-  // continuous; only this explicitly requested derivative reanchor is exempt.
+  // The general replanner keeps position/path progress command-continuous but
+  // intentionally reanchors derivatives to measured robot motion. Pose and
+  // scalar path state must remain continuous; only this explicitly requested
+  // derivative seam is exempt from command-to-command derivative comparison.
   return path_state_continuous && pose_continuous &&
          (allow_measured_derivative_reanchor || derivatives_continuous);
 }
@@ -1031,12 +1150,10 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     const double path_start_time =
         planning_start_command.nominal_path_time;
 
-    // During a Lachner hold, the frozen command has zero desired derivatives
-    // even though the physical robot can still be moving. Reconstruct the
-    // planning state at the same scalar path position, but use the measured
-    // along-path rate. This changes neither the Cartesian route nor its
-    // frozen progress; it only makes the new command state agree with the
-    // robot state from which execution will resume.
+    // Keep the command position on its exact scalar path state, but initialize
+    // the new Ruckig segment with measured along-path velocity and
+    // acceleration. This preserves forward command-position continuity while
+    // avoiding a restart from artificial zero command derivatives.
     if (reanchor_path_kinematics &&
         planning_start_command.nominal_path_time_valid) {
       planning_start = makeRetimedPathState(
@@ -1071,6 +1188,10 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     if (reanchor_path_kinematics) {
       path_config.initial_path_rate = std::clamp(
           reanchor_path_rate, path_time_rate_min_, path_time_rate_max_);
+      path_config.initial_path_acceleration = std::clamp(
+          reanchor_path_acceleration,
+          -path_time_acc_limit_,
+          path_time_acc_limit_);
     } else if (starting_new_timed_path) {
       path_config.initial_path_rate = std::clamp(
           initial_path_rate, path_time_rate_min_, path_time_rate_max_);
@@ -1460,9 +1581,8 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
             max_angular_acceleration * dt + kVelocityTolerance &&
         (current.dw - previous.dw).norm() <=
             max_angular_jerk * dt + kAccelerationTolerance;
-    // The sole exception is the hold-to-resume seam: the hold command's
-    // desired derivatives are zero by definition, while the robot's measured
-    // derivatives are not. Pose and scalar path progress must remain
+    // At the explicit measured-state reanchor, desired derivatives may differ
+    // from the preceding command. Pose and scalar path progress remain
     // continuous, and the complete candidate is still rolled out from the
     // measured state by the safety monitor before it can be executed.
     return pose_and_path_continuous &&
@@ -1681,28 +1801,29 @@ ReachableCartesianImpedanceController::makeCollisionCenterSampleForMonitor(
 // ============================================================================
 MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
     const VerifiedPlan& plan,
+    const Vector7d& q,
+    const Vector7d& dq,
     const Vector3d& current_position,
     const Quaterniond& current_orientation,
     const Vector6d& ee_twist,
     const Matrix7d& inertia,
     const Matrix67d& J_geo,
+    const Vector7d& previous_torque_command,
     const Matrix6d& K_runtime,
     const Matrix6d& D_runtime,
     const cps_human_workspace::HumanWorkspace& human_workspace,
     bool human_workspace_active,
     const ImpedanceSample& current_command_reference,
-    bool current_command_reference_valid) const {
+    bool current_command_reference_valid,
+    std::vector<JointPredictionSample>* joint_prediction_trace) const {
+  if (joint_prediction_trace != nullptr) {
+    joint_prediction_trace->clear();
+  }
   if (!enable_safety_monitor_ || !human_workspace_active) {
     return MonitorResult{};
   }
 
   const VerifiedPlan monitor_plan = makeSparsePlanForMonitor(plan);
-  const VerifiedPlan collision_center_plan =
-      makeCollisionCenterPlanForMonitor(monitor_plan);
-  const Vector3d collision_center =
-      current_position + collisionCenterOffsetWorld(current_orientation);
-  const Vector6d collision_twist =
-      twistAtCollisionCenter(current_orientation, ee_twist);
 
   SafetyMonitorConfig config = makeSafetyMonitorConfig(
       human_workspace,
@@ -1711,9 +1832,33 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
       plan.generated_wall_time);
   config.current_energy_reference_valid = current_command_reference_valid;
   if (current_command_reference_valid) {
-    config.current_energy_reference =
-        makeCollisionCenterSampleForMonitor(current_command_reference);
+    config.current_energy_reference = current_command_reference;
   }
+  config.nullspace_reference = desired_qn_;
+  config.nullspace_stiffness = n_stiffness_;
+  config.collision_center_offset = ee_collision_center_offset_;
+  config.joint_velocity_error_bound = joint_velocity_error_bound_;
+  config.previous_torque_command = previous_torque_command;
+  config.previous_torque_command_valid = true;
+  config.torque_rate_limit = panda_limits::kTorqueRateLimit;
+  config.joint_rollout_max_dt = local_replan_dt_;
+
+  if (monitor_joint_dynamics_provider_) {
+    return cps_safety_monitor::verifyReachablePlanJointSpace(
+        plan,
+        q,
+        dq,
+        *monitor_joint_dynamics_provider_,
+        config,
+        joint_prediction_trace);
+  }
+
+  const VerifiedPlan collision_center_plan =
+      makeCollisionCenterPlanForMonitor(monitor_plan);
+  const Vector3d collision_center =
+      current_position + collisionCenterOffsetWorld(current_orientation);
+  const Vector6d collision_twist =
+      twistAtCollisionCenter(current_orientation, ee_twist);
 
   return cps_safety_monitor::verifyReachablePlan(
       collision_center_plan,
@@ -1730,6 +1875,7 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
 // ============================================================================
 ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     double wall_time, double nominal_guess_time,
+    const Vector7d& q, const Vector7d& dq,
     const Vector3d& current_position, const Quaterniond& current_orientation,
     const Vector6d& ee_twist, const Matrix7d& inertia, const Matrix67d& J_geo) {
   const auto decision_tic = SteadyClock::now();
@@ -1750,17 +1896,21 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
   auto evaluate_plan = [&](const VerifiedPlan& plan) {
     return evaluateCandidatePlan(
         plan,
+        q,
+        dq,
         current_position,
         current_orientation,
         ee_twist,
         inertia,
         J_geo,
+        tau_cmd_prev_,
         K_runtime_,
         D_runtime_,
         human_workspace_,
         human_workspace_active_,
         last_commanded_sample_,
-        last_commanded_sample_valid_);
+        last_commanded_sample_valid_,
+        enable_prediction_logging_ ? &dec.joint_prediction_trace : nullptr);
   };
 
   auto execute_last_verified_monitored = [&](FallbackReason reason) {
@@ -1808,19 +1958,24 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
 
     planning_start_command.failsafe = false;
 
+    const bool reanchor_from_measured_hold =
+        cartesian_effective_time_frozen_ &&
+        cartesian_effective_time_hold_sample_valid_ &&
+        measured_path_rate_valid_;
     const auto planner_tic = SteadyClock::now();
     const std::vector<ImpedanceSample> intended_buffer =
         makeIntendedBufferFromReplanner(
             nominal_guess_time,
             planning_start_command,
             commanded_path_rate_,
-            isContactEnergyMode(mode_)
-                ? mode2_energy_path_rate_target_
-                : path_time_rate_target_,
+            path_time_rate_target_,
             commanded_path_time_,
-            false,
-            0.0,
-            0.0,
+            reanchor_from_measured_hold,
+            reanchor_from_measured_hold ? measured_path_rate_ : 0.0,
+            reanchor_from_measured_hold &&
+                    measured_path_acceleration_valid_
+                ? measured_path_acceleration_
+                : 0.0,
             &plan_failure_reason);
     planner_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - planner_tic).count();
@@ -2127,17 +2282,21 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
     const auto eval_tic = SteadyClock::now();
     dec.monitor = evaluateCandidatePlan(
         candidate_plan,
+        input.q,
+        input.dq,
         input.current_position,
         input.current_orientation,
         input.ee_twist,
         input.inertia,
         input.J_geo,
+        input.previous_torque_command,
         input.K_runtime,
         input.D_runtime,
         input.human_workspace,
         input.human_workspace_active,
         input.last_commanded_sample,
-        input.last_commanded_sample_valid);
+        input.last_commanded_sample_valid,
+        enable_prediction_logging_ ? &dec.joint_prediction_trace : nullptr);
     monitor_eval_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - eval_tic).count();
     dec.evaluated_plan = candidate_plan;
@@ -2397,7 +2556,6 @@ void ReachableCartesianImpedanceController::resetViaPointExecutionState(
   // nominal rate immediately; ramping this scalar from zero would apply a
   // second acceleration profile on top of the smooth timed path.
   commanded_path_rate_ = path_time_rate_target_;
-  mode2_energy_path_rate_target_ = path_time_rate_target_;
   mode_ = SafetyMode::kNominal;
 
   last_verified_plan_ = VerifiedPlan{};
@@ -2419,8 +2577,10 @@ void ReachableCartesianImpedanceController::resetViaPointExecutionState(
   cartesian_energy_hold_dp_ds_.setZero();
   cartesian_energy_hold_w_ds_.setZero();
   cartesian_energy_hold_tangent_valid_ = false;
-  cartesian_energy_resume_path_rate_ = 0.0;
-  cartesian_energy_resume_path_rate_valid_ = false;
+  measured_path_rate_ = 0.0;
+  measured_path_rate_valid_ = false;
+  measured_path_acceleration_ = 0.0;
+  measured_path_acceleration_valid_ = false;
   cartesian_effective_time_hold_monitor_ = MonitorResult{};
 
   {
@@ -2828,6 +2988,8 @@ void ReachableCartesianImpedanceController::handleMujocoContactSensor(
 void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
     double wall_time,
     double nominal_guess_time,
+    const Vector7d& current_q,
+    const Vector7d& current_dq,
     const Vector3d& current_position,
     const Quaterniond& current_orientation,
     const Vector6d& ee_twist,
@@ -2837,6 +2999,7 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
     const Matrix6d& D_runtime,
     const cps_human_workspace::HumanWorkspace& human_workspace,
     const VerifiedPlan& evaluated_plan,
+    const std::vector<JointPredictionSample>& joint_prediction_trace,
     const MonitorResult& monitor,
     int mode,
     bool candidate_verified,
@@ -2855,6 +3018,8 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
   prediction_log_writer_.tryEmplace([&](PredictionLogRecord& record) {
     record.wall_time = wall_time;
     record.nominal_guess_time = nominal_guess_time;
+    record.current_q = current_q;
+    record.current_dq = current_dq;
     record.current_position = current_position;
     record.current_orientation = current_orientation;
     record.ee_twist = ee_twist;
@@ -2864,6 +3029,7 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
     record.D_runtime = D_runtime;
     record.human_workspace = human_workspace;
     record.evaluated_plan = evaluated_plan;
+    record.joint_prediction_trace = joint_prediction_trace;
     record.monitor = monitor;
     record.mode = mode;
     record.candidate_verified = candidate_verified;
@@ -2881,6 +3047,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     std::ostream& output,
     double wall_time,
     double nominal_guess_time,
+    const Vector7d& current_q,
+    const Vector7d& current_dq,
     const Vector3d& current_position,
     const Quaterniond& current_orientation,
     const Vector6d& ee_twist,
@@ -2890,6 +3058,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     const Matrix6d& D_runtime,
     const cps_human_workspace::HumanWorkspace& human_workspace,
     const VerifiedPlan& evaluated_plan,
+    const std::vector<JointPredictionSample>& joint_prediction_trace,
     const MonitorResult& monitor,
     int mode,
     bool candidate_verified,
@@ -2915,6 +3084,12 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     Vector3d x_next{Vector3d::Zero()};
     Vector3d v_next{Vector3d::Zero()};
     Vector3d a_pred{Vector3d::Zero()};
+    bool joint_state_valid{false};
+    double joint_sample_t{std::numeric_limits<double>::quiet_NaN()};
+    Vector7d joint_q{Vector7d::Constant(
+        std::numeric_limits<double>::quiet_NaN())};
+    Vector7d joint_dq{Vector7d::Constant(
+        std::numeric_limits<double>::quiet_NaN())};
     double d_segment{0.0};
     Vector3d human_center_end{Vector3d::Zero()};
     bool contact_possible{false};
@@ -2948,6 +3123,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   double t_prev = collision_plan.anchor.t;
   std::vector<PredictionRow> rows;
   rows.reserve(1 + collision_plan.intended.size() + collision_plan.failsafe.size());
+  std::size_t joint_trace_index = 0;
 
   auto append_row = [&](const char* stage,
                         int index,
@@ -3004,6 +3180,24 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     row.x_next = x_next;
     row.v_next = v_next;
     row.a_pred = a_pred;
+    while (joint_trace_index + 1 < joint_prediction_trace.size() &&
+           std::abs(joint_prediction_trace[joint_trace_index + 1].t -
+                    collision_sample.t) <=
+               std::abs(joint_prediction_trace[joint_trace_index].t -
+                        collision_sample.t)) {
+      ++joint_trace_index;
+    }
+    if (joint_trace_index < joint_prediction_trace.size()) {
+      const JointPredictionSample& joint_sample =
+          joint_prediction_trace[joint_trace_index];
+      if (std::abs(joint_sample.t - collision_sample.t) <= 1.0e-8 &&
+          joint_sample.q.allFinite() && joint_sample.dq.allFinite()) {
+        row.joint_state_valid = true;
+        row.joint_sample_t = joint_sample.t;
+        row.joint_q = joint_sample.q;
+        row.joint_dq = joint_sample.dq;
+      }
+    }
     row.human_center_end = human_workspace.centerAtTime(segment_end_time_sec);
     row.d_segment =
         human_workspace.signedDistanceSegmentToInflatedSphere(
@@ -3072,27 +3266,50 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         << collision_center(0) << "," << collision_center(1) << "," << collision_center(2) << ","
         << actual_human_center(0) << "," << actual_human_center(1) << "," << actual_human_center(2) << ","
         << actual_collision_distance << ","
+        << current_q(0) << "," << current_q(1) << "," << current_q(2) << ","
+        << current_q(3) << "," << current_q(4) << "," << current_q(5) << ","
+        << current_q(6) << ","
+        << current_dq(0) << "," << current_dq(1) << "," << current_dq(2) << ","
+        << current_dq(3) << "," << current_dq(4) << "," << current_dq(5) << ","
+        << current_dq(6) << ","
         << row.collision_target_p(0) << "," << row.collision_target_p(1) << "," << row.collision_target_p(2) << ","
         << row.x_pred(0) << "," << row.x_pred(1) << "," << row.x_pred(2) << ","
         << row.v_pred(0) << "," << row.v_pred(1) << "," << row.v_pred(2) << ","
         << row.x_next(0) << "," << row.x_next(1) << "," << row.x_next(2) << ","
         << row.v_next(0) << "," << row.v_next(1) << "," << row.v_next(2) << ","
         << row.a_pred(0) << "," << row.a_pred(1) << "," << row.a_pred(2) << ","
+        << static_cast<int>(row.joint_state_valid) << ","
+        << row.joint_sample_t << ","
+        << row.joint_q(0) << "," << row.joint_q(1) << "," << row.joint_q(2) << ","
+        << row.joint_q(3) << "," << row.joint_q(4) << "," << row.joint_q(5) << ","
+        << row.joint_q(6) << ","
+        << row.joint_dq(0) << "," << row.joint_dq(1) << "," << row.joint_dq(2) << ","
+        << row.joint_dq(3) << "," << row.joint_dq(4) << "," << row.joint_dq(5) << ","
+        << row.joint_dq(6) << ","
         << row.human_center_end(0) << "," << row.human_center_end(1) << "," << row.human_center_end(2) << ","
         << row.d_segment << ","
         << static_cast<int>(row.contact_possible) << ","
         << row.Kx << "," << row.Ky << "," << row.Kz << ","
         << row.Dx << "," << row.Dy << "," << row.Dz << ","
         << monitor.worst_case_cartesian_kinetic_energy_ub << ","
+        << monitor.worst_case_joint_kinetic_energy_ub << ","
         << monitor.worst_case_cartesian_potential_energy_ub << ","
-        << monitor.worst_case_cartesian_control_energy_ub << ","
+        << monitor.worst_case_total_control_energy_ub << ","
         << monitor.terminal_energy_ub << ","
         << monitor.workspace_distance_margin << ","
         << monitor.h_monitored_energy << ","
         << static_cast<int>(monitor.current_cartesian_energy_valid) << ","
         << monitor.current_cartesian_kinetic_energy << ","
+        << static_cast<int>(monitor.current_joint_energy_valid) << ","
+        << monitor.current_joint_kinetic_energy << ","
         << monitor.current_cartesian_potential_energy << ","
-        << monitor.current_cartesian_control_energy << "\n";
+        << monitor.current_total_control_energy << ","
+        << static_cast<int>(monitor.joint_limit_unsafe) << ","
+        << monitor.joint_limit_index << ","
+        << monitor.joint_position_violation << ","
+        << monitor.joint_velocity_violation << ","
+        << monitor.joint_acceleration_violation << ","
+        << monitor.joint_torque_violation << "\n";
   }
 }
 
@@ -3101,13 +3318,19 @@ bool ReachableCartesianImpedanceController::startLogWriters() {
       "wall_time_sec,nominal_time_sec,paused_nominal_time_sec,"
       "commanded_path_time_sec,command_path_time_sec,"
       "command_path_time_valid,commanded_path_rate,"
-      "mode2_energy_path_rate_target,energy_resume_path_rate,"
-      "energy_resume_path_rate_valid,mode,execution_stage,fallback_reason,"
+      "generator_target_path_rate,measured_path_rate,"
+      "measured_path_rate_valid,measured_path_acceleration,"
+      "measured_path_acceleration_valid,mode,execution_stage,fallback_reason,"
       "plan_failure_reason,candidate_verified,monitor_prediction_valid,"
       "predicted_trigger,predicted_contact_possible,"
       "monitored_contact_possible,contact_relevant_for_energy,"
-      "collision_energy_unsafe,monitored_unsafe,workspace_distance_now,"
+      "collision_energy_unsafe,monitored_unsafe,joint_limit_unsafe,"
+      "joint_limit_index,joint_position_violation,joint_velocity_violation,"
+      "joint_acceleration_violation,joint_torque_violation,workspace_distance_now,"
       "workspace_distance_min,workspace_distance_margin,"
+      "measured_q1,measured_q2,measured_q3,measured_q4,measured_q5,"
+      "measured_q6,measured_q7,measured_dq1,measured_dq2,measured_dq3,"
+      "measured_dq4,measured_dq5,measured_dq6,measured_dq7,"
       "des_px,des_py,des_pz,cur_px,cur_py,cur_pz,"
       "cur_vx,cur_vy,cur_vz,cur_wx,cur_wy,cur_wz,"
       "collision_center_px,collision_center_py,collision_center_pz,"
@@ -3117,21 +3340,24 @@ bool ReachableCartesianImpedanceController::startLogWriters() {
       "tau_cmd_norm,torque_rate_limited,torque_rate_max_ratio,Kx,Ky,Kz,Dx,Dy,Dz,"
       "worst_case_contact_time,worst_case_workspace_distance_at_candidate,"
       "worst_case_cartesian_kinetic_energy_ub,"
+      "worst_case_joint_kinetic_energy_ub,"
       "worst_case_cartesian_potential_energy_ub,"
-      "worst_case_cartesian_control_energy_ub,"
+      "worst_case_total_control_energy_ub,"
       "h_monitored_energy,terminal_energy_ub,h_terminal_energy,"
       "worst_case_pos_error_radius,worst_case_vel_error_radius,"
       "monitor_current_cartesian_energy_valid,"
       "monitor_current_cartesian_kinetic_energy,"
+      "monitor_current_joint_energy_valid,"
+      "monitor_current_joint_kinetic_energy,"
       "monitor_current_cartesian_potential_energy,"
-      "monitor_current_cartesian_control_energy,monitored_steps,"
+      "monitor_current_total_control_energy,monitored_steps,"
       "monitored_intended_steps,"
       "monitored_failsafe_steps,control_loop_sequence,verified_plan_age_sec,"
       "verified_next_intended_exec_index,verified_next_failsafe_exec_index,"
       "cartesian_energy_budget_active,cartesian_effective_time_frozen,"
       "cartesian_energy_lambda_valid,cartesian_energy_scale,"
-      "cartesian_kinetic_energy,cartesian_potential_energy,"
-      "cartesian_control_energy,energy_budget_joule,mujoco_contact_value,"
+      "joint_kinetic_energy,cartesian_potential_energy,"
+      "total_control_energy,energy_budget_joule,mujoco_contact_value,"
       "mujoco_contact_active,mujoco_contact_sample_age_sec";
 
   const std::size_t expected_control_columns =
@@ -3185,22 +3411,33 @@ bool ReachableCartesianImpedanceController::startLogWriters() {
         "monitored_contact_possible,plan_intended_steps,plan_failsafe_steps,"
         "stage,index,is_failsafe_sample,sample_t,dt,actual_collision_px,actual_collision_py,"
         "actual_collision_pz,actual_human_center_px,actual_human_center_py,"
-        "actual_human_center_pz,actual_collision_distance,collision_target_px,"
+        "actual_human_center_pz,actual_collision_distance,"
+        "measured_q1,measured_q2,measured_q3,measured_q4,measured_q5,"
+        "measured_q6,measured_q7,measured_dq1,measured_dq2,measured_dq3,"
+        "measured_dq4,measured_dq5,measured_dq6,measured_dq7,collision_target_px,"
         "collision_target_py,collision_target_pz,pred_start_px,pred_start_py,"
         "pred_start_pz,pred_start_vx,pred_start_vy,pred_start_vz,pred_next_px,"
         "pred_next_py,pred_next_pz,pred_next_vx,pred_next_vy,pred_next_vz,"
-        "pred_ax,pred_ay,pred_az,human_center_end_px,human_center_end_py,"
+        "pred_ax,pred_ay,pred_az,pred_joint_state_valid,pred_joint_sample_t,"
+        "pred_q1,pred_q2,pred_q3,pred_q4,pred_q5,pred_q6,pred_q7,"
+        "pred_dq1,pred_dq2,pred_dq3,pred_dq4,pred_dq5,pred_dq6,pred_dq7,"
+        "human_center_end_px,human_center_end_py,"
         "human_center_end_pz,distance_segment,contact_possible,"
         "Kx,Ky,Kz,Dx,Dy,Dz,"
         "monitor_worst_case_cartesian_kinetic_energy_ub,"
+        "monitor_worst_case_joint_kinetic_energy_ub,"
         "monitor_worst_case_cartesian_potential_energy_ub,"
-        "monitor_worst_case_cartesian_control_energy_ub,"
+        "monitor_worst_case_total_control_energy_ub,"
         "monitor_terminal_energy_ub,monitor_workspace_distance_margin,"
         "monitor_h_monitored_energy,"
         "monitor_current_cartesian_energy_valid,"
         "monitor_current_cartesian_kinetic_energy,"
+        "monitor_current_joint_energy_valid,"
+        "monitor_current_joint_kinetic_energy,"
         "monitor_current_cartesian_potential_energy,"
-        "monitor_current_cartesian_control_energy";
+        "monitor_current_total_control_energy,joint_limit_unsafe,"
+        "joint_limit_index,joint_position_violation,joint_velocity_violation,"
+        "joint_acceleration_violation,joint_torque_violation";
     const std::size_t reserved_plan_steps = std::max<std::size_t>(
         128,
         std::max<std::size_t>(
@@ -3218,6 +3455,8 @@ bool ReachableCartesianImpedanceController::startLogWriters() {
                   output,
                   record.wall_time,
                   record.nominal_guess_time,
+                  record.current_q,
+                  record.current_dq,
                   record.current_position,
                   record.current_orientation,
                   record.ee_twist,
@@ -3227,6 +3466,7 @@ bool ReachableCartesianImpedanceController::startLogWriters() {
                   record.D_runtime,
                   record.human_workspace,
                   record.evaluated_plan,
+                  record.joint_prediction_trace,
                   record.monitor,
                   record.mode,
                   record.candidate_verified,
@@ -3240,6 +3480,7 @@ bool ReachableCartesianImpedanceController::startLogWriters() {
             [reserved_plan_steps](PredictionLogRecord& record) {
               record.evaluated_plan.intended.reserve(reserved_plan_steps);
               record.evaluated_plan.failsafe.reserve(reserved_plan_steps);
+              record.joint_prediction_trace.reserve(4 * reserved_plan_steps + 1);
             })) {
       RCLCPP_ERROR(get_node()->get_logger(),
                    "Failed to start asynchronous prediction logger: %s",
@@ -3313,6 +3554,7 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
     const Vector3d& current_position,
     const Quaterniond& current_orientation,
     const ImpedanceSample& cmd,
+    bool cartesian_energy_budget_active,
     double dt) {
   updateRuntimeGains(cmd.K, cmd.D);
 
@@ -3423,7 +3665,8 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
   }
 
   const Vector7d tau_nullspace_eff =
-      (cmd.failsafe && disable_nullspace_in_failsafe_)
+      cartesian_energy_budget_active ||
+              (cmd.failsafe && disable_nullspace_in_failsafe_)
           ? Vector7d::Zero()
           : tau_nullspace;
 
@@ -3520,25 +3763,72 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       enable_safety_monitor_ && human_workspace_active_ &&
       current_workspace_distance_now <= 0.0;
 
-  // Estimate the scalar rate of the motion that is still physically present
-  // during an energy hold. The tangent was captured from the last command on
-  // the original path before its desired derivatives were zeroed.
-  if (cartesian_effective_time_frozen_ &&
-      cartesian_energy_hold_tangent_valid_) {
+  // Keep nominal trajectory generation independent of the energy governor.
+  // Position remains anchored to the last command, but Ruckig starts from the
+  // scalar path velocity and acceleration measured on the robot.  Project the
+  // measured 6D TCP twist onto the geometric command tangent; during a hold,
+  // reuse the tangent captured before the command derivatives were zeroed.
+  Vector3d measured_path_dp_ds = Vector3d::Zero();
+  Vector3d measured_path_w_ds = Vector3d::Zero();
+  bool measured_path_tangent_valid = false;
+  if (last_commanded_sample_valid_ && commanded_path_rate_ > 1.0e-6) {
+    measured_path_dp_ds =
+        last_commanded_sample_.dp / commanded_path_rate_;
+    measured_path_w_ds =
+        last_commanded_sample_.w / commanded_path_rate_;
+    measured_path_tangent_valid =
+        measured_path_dp_ds.allFinite() &&
+        measured_path_w_ds.allFinite() &&
+        measured_path_dp_ds.squaredNorm() +
+                measured_path_w_ds.squaredNorm() >
+            kSmallPositive;
+  } else if (cartesian_energy_hold_tangent_valid_) {
+    measured_path_dp_ds = cartesian_energy_hold_dp_ds_;
+    measured_path_w_ds = cartesian_energy_hold_w_ds_;
+    measured_path_tangent_valid = true;
+  }
+
+  if (measured_path_tangent_valid) {
     const double tangent_norm_sq =
-        cartesian_energy_hold_dp_ds_.squaredNorm() +
-        cartesian_energy_hold_w_ds_.squaredNorm();
+        measured_path_dp_ds.squaredNorm() +
+        measured_path_w_ds.squaredNorm();
     if (tangent_norm_sq > kSmallPositive) {
       const double measured_path_rate =
-          (ee_twist.head<3>().dot(cartesian_energy_hold_dp_ds_) +
-           ee_twist.tail<3>().dot(cartesian_energy_hold_w_ds_)) /
+          (ee_twist.head<3>().dot(measured_path_dp_ds) +
+           ee_twist.tail<3>().dot(measured_path_w_ds)) /
           tangent_norm_sq;
       if (std::isfinite(measured_path_rate)) {
-        cartesian_energy_resume_path_rate_ = std::clamp(
+        const double clamped_measured_path_rate = std::clamp(
             measured_path_rate,
             path_time_rate_min_,
             path_time_rate_max_);
-        cartesian_energy_resume_path_rate_valid_ = true;
+        if (measured_path_rate_valid_) {
+          const double raw_path_acceleration =
+              (clamped_measured_path_rate -
+               measured_path_rate_) /
+              dt;
+          const double filter_alpha = std::clamp(
+              dt / (kMeasuredPathAccelerationFilterTimeSec + dt),
+              0.0,
+              1.0);
+          const double filtered_path_acceleration =
+              measured_path_acceleration_valid_
+                  ? (1.0 - filter_alpha) *
+                            measured_path_acceleration_ +
+                        filter_alpha * raw_path_acceleration
+                  : raw_path_acceleration;
+          measured_path_acceleration_ = std::clamp(
+              filtered_path_acceleration,
+              -path_time_acc_limit_,
+              path_time_acc_limit_);
+          if (clamped_measured_path_rate <= 1.0e-6 &&
+              measured_path_acceleration_ < 0.0) {
+            measured_path_acceleration_ = 0.0;
+          }
+          measured_path_acceleration_valid_ = true;
+        }
+        measured_path_rate_ = clamped_measured_path_rate;
+        measured_path_rate_valid_ = true;
       }
     }
   }
@@ -3571,12 +3861,15 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       async_input.source_plan_generation = last_verified_plan_generation_;
       async_input.wall_time = wall_time;
       async_input.nominal_guess_time = nominal_guess_time;
+      async_input.q = q;
+      async_input.dq = dq;
       async_input.current_position = current_position;
       async_input.current_orientation = current_orientation;
       async_input.ee_twist = ee_twist;
       async_input.inertia = inertia;
       async_input.Jv = Jv_collision;
       async_input.J_geo = J_collision_geo;
+      async_input.previous_torque_command = tau_cmd_prev_;
       async_input.K_runtime = K_runtime_;
       async_input.D_runtime = D_runtime_;
       async_input.human_workspace = human_workspace_;
@@ -3585,20 +3878,26 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       async_input.last_commanded_sample_valid = last_commanded_sample_valid_;
       async_input.commanded_path_time = commanded_path_time_;
       async_input.commanded_path_rate = commanded_path_rate_;
-      async_input.target_path_rate =
-          isContactEnergyMode(mode_)
-              ? mode2_energy_path_rate_target_
-              : path_time_rate_target_;
+      // The nominal generator always requests the configured path rate. The
+      // 1 kHz energy layer may retime or hold execution, but remaining energy
+      // is never an input to Ruckig.
+      async_input.target_path_rate = path_time_rate_target_;
       async_input.reanchor_path_kinematics =
           cartesian_effective_time_frozen_ &&
-          cartesian_energy_resume_path_rate_valid_ &&
           cartesian_effective_time_hold_sample_valid_ &&
-          cartesian_effective_time_hold_sample_.nominal_path_time_valid;
+          measured_path_rate_valid_ &&
+          last_commanded_sample_valid_ &&
+          last_commanded_sample_.nominal_path_time_valid;
       async_input.reanchor_path_rate =
           async_input.reanchor_path_kinematics
-              ? cartesian_energy_resume_path_rate_
+              ? measured_path_rate_
               : 0.0;
       async_input.reanchor_path_acceleration = 0.0;
+      if (async_input.reanchor_path_kinematics &&
+          measured_path_acceleration_valid_) {
+        async_input.reanchor_path_acceleration =
+            measured_path_acceleration_;
+      }
       async_input.committed_prefix.reserve(async_planning_lead_steps_);
       // While intended commands remain, do not extend a candidate's committed
       // prefix into the fail-safe merely to reach the configured lead length.
@@ -3776,7 +4075,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                 next,
                 current_contact_relevant_for_energy &&
                     cartesian_effective_time_frozen_ &&
-                    cartesian_energy_resume_path_rate_valid_);
+                    measured_path_rate_valid_);
       }
       const bool async_output_usable =
           async_output_matches_source_plan &&
@@ -3797,6 +4096,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         logShieldPredictionTrajectory(
             async_output.input.wall_time,
             async_output.input.nominal_guess_time,
+            async_output.input.q,
+            async_output.input.dq,
             async_output.input.current_position,
             async_output.input.current_orientation,
             async_output.input.ee_twist,
@@ -3806,6 +4107,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             async_output.input.D_runtime,
             async_output.input.human_workspace,
             async_output.decision.evaluated_plan,
+            async_output.decision.joint_prediction_trace,
             async_output.decision.monitor,
             static_cast<int>(mode_),
             async_output.decision.candidate_verified,
@@ -3988,6 +4290,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
     if (do_monitor) {
       shield_dec = computeShieldDecision(wall_time, nominal_guess_time,
+                                         q, dq,
                                          current_position, current_orientation,
                                          ee_twist, inertia, J_collision_geo);
       last_shield_decision_ = shield_dec;
@@ -3996,6 +4299,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         logShieldPredictionTrajectory(
             wall_time,
             nominal_guess_time,
+            q,
+            dq,
             current_position,
             current_orientation,
             ee_twist,
@@ -4005,6 +4310,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             D_runtime_,
             human_workspace_,
             shield_dec.evaluated_plan,
+            shield_dec.joint_prediction_trace,
             shield_dec.monitor,
             static_cast<int>(mode_),
             shield_dec.candidate_verified,
@@ -4074,7 +4380,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
            last_commanded_sample_,
            contact_intended_command,
            cartesian_effective_time_frozen_ &&
-               cartesian_energy_resume_path_rate_valid_))) {
+               measured_path_rate_valid_))) {
     // A contact-verification hold is recoverable as soon as a continuous
     // intended stream exists. A true energy-budget hold sets
     // contact_verification_hold_active_ to false and is therefore untouched.
@@ -4088,7 +4394,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       cartesian_effective_time_freeze_start_wall_time_ = -1.0;
       cartesian_effective_time_hold_sample_valid_ = false;
       cartesian_energy_hold_tangent_valid_ = false;
-      cartesian_energy_resume_path_rate_valid_ = false;
       cartesian_effective_time_hold_monitor_ = MonitorResult{};
       contact_verification_hold_active_ = false;
       contact_verification_hold_reason_ = FallbackReason::kNone;
@@ -4144,8 +4449,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         cartesian_energy_hold_dp_ds_.setZero();
         cartesian_energy_hold_w_ds_.setZero();
         cartesian_energy_hold_tangent_valid_ = false;
-        cartesian_energy_resume_path_rate_ = 0.0;
-        cartesian_energy_resume_path_rate_valid_ = false;
         if (commanded_path_rate_ > 1.0e-6) {
           cartesian_energy_hold_dp_ds_ =
               hold_source.dp / commanded_path_rate_;
@@ -4353,8 +4656,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
   auto compute_contact_energy_terms = [&](const ImpedanceSample& command) {
     ContactEnergyTerms terms;
-    if (!track_cartesian_energy_budget ||
-        !budget_cartesian_task_inertia_valid) {
+    if (!track_cartesian_energy_budget || !inertia.allFinite() ||
+        !dq.allFinite()) {
       return terms;
     }
 
@@ -4363,12 +4666,11 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     // Runtime passivity storage uses the measured current state. The tracking
     // error tube is reserved for predictive rollout, not for the instantaneous
     // stored-energy calculation.
-    // Cartesian specialization of Lachner et al. (12): include both linear
-    // and angular kinetic energy in the same TCP frame in which K and D act.
+    // Lachner et al. Eq. (12): kinetic storage is the complete robot kinetic
+    // energy.  This retains redundancy/nullspace motion that is invisible in
+    // a Cartesian projection Lambda.
     const double kinetic_energy =
-        0.5 * (ee_twist.transpose() *
-               budget_cartesian_task_inertia *
-               ee_twist)(0, 0);
+        0.5 * (dq.transpose() * inertia * dq)(0, 0);
     terms.kinetic_energy =
         std::max(0.0, kinetic_energy);
 
@@ -4393,10 +4695,42 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   };
 
   const ImpedanceSample candidate_budget_command = shield_dec.command;
-  const Vector6d candidate_error =
-      compute_error_for_command(candidate_budget_command);
-  const ContactEnergyTerms candidate_energy_terms =
-      compute_contact_energy_terms(candidate_budget_command);
+  // Once effective time is frozen, Lachner's energy condition must be
+  // evaluated against the frozen reference x_d(t_eff), not against a newly
+  // generated command at a later nominal time.  Testing the advancing
+  // candidate here can keep the controller frozen forever even after the
+  // robot has converged to the held reference.
+  const bool evaluating_frozen_reference =
+      cartesian_effective_time_frozen_ &&
+      cartesian_effective_time_hold_sample_valid_;
+  const ImpedanceSample& energy_budget_command =
+      evaluating_frozen_reference
+          ? cartesian_effective_time_hold_sample_
+          : candidate_budget_command;
+  const Vector6d energy_budget_error =
+      compute_error_for_command(energy_budget_command);
+  const ContactEnergyTerms energy_budget_terms =
+      compute_contact_energy_terms(energy_budget_command);
+  if (track_cartesian_energy_budget) {
+    monitor.current_joint_energy_valid = energy_budget_terms.valid;
+    monitor.current_joint_kinetic_energy =
+        energy_budget_terms.kinetic_energy;
+    monitor.current_cartesian_potential_energy =
+        energy_budget_terms.potential_energy;
+    monitor.current_total_control_energy =
+        energy_budget_terms.kinetic_energy +
+        energy_budget_terms.potential_energy;
+    if (budget_cartesian_task_inertia_valid) {
+      monitor.current_cartesian_kinetic_energy = std::max(
+          0.0,
+          0.5 * (ee_twist.transpose() *
+                 budget_cartesian_task_inertia * ee_twist)(0, 0));
+      monitor.current_cartesian_control_energy =
+          monitor.current_cartesian_kinetic_energy +
+          monitor.current_cartesian_potential_energy;
+      monitor.current_cartesian_energy_valid = true;
+    }
+  }
   double candidate_path_rate = commanded_path_rate_;
   if (candidate_budget_command.nominal_path_time_valid) {
     candidate_path_rate = std::clamp(
@@ -4407,106 +4741,25 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         path_time_rate_max_);
   }
 
-  // In a contact-energy mode (2 or 3), derive the feasible speed of the same
-  // geometric path directly
-  // from the configured energy budget, current model/state, and the velocity
-  // tangent of the command that is actually about to run.  The target is
-  // allowed to rise and fall with the available energy; Ruckig enforces the
-  // path acceleration and jerk limits. Non-contact modes bypass this energy
-  // governor and request the nominal path rate.
-  if (isContactEnergyMode(mode_) &&
-      current_contact_relevant_for_energy &&
-      candidate_energy_terms.valid) {
-    const double planning_budget =
-        std::max(0.0,
-                 energy_budget_joule_ - energy_budget_margin_joule_);
-    const double kinetic_budget = std::max(
-        0.0,
-        planning_budget - candidate_energy_terms.potential_energy);
-    double safe_path_rate = path_time_rate_target_;
-    bool safe_path_rate_observable = false;
-
-    Vector6d cartesian_path_tangent = Vector6d::Zero();
-    bool cartesian_path_tangent_valid = false;
-    if (!candidate_budget_command.failsafe &&
-        candidate_path_rate > 1.0e-6) {
-      cartesian_path_tangent.head<3>() =
-          candidate_budget_command.dp;
-      cartesian_path_tangent.tail<3>() = candidate_budget_command.w;
-      cartesian_path_tangent /= candidate_path_rate;
-      cartesian_path_tangent_valid =
-          cartesian_path_tangent.array().isFinite().all();
-    } else if (cartesian_effective_time_frozen_ &&
-               cartesian_energy_hold_tangent_valid_) {
-      // A held command has zero desired velocity, so deriving the path tangent
-      // from it creates a zero-rate deadlock. Reuse the geometric 6D tangent
-      // captured immediately before effective time was frozen. This is
-      // independent of how the path or trajectory was generated.
-      cartesian_path_tangent.head<3>() =
-          cartesian_energy_hold_dp_ds_;
-      cartesian_path_tangent.tail<3>() = cartesian_energy_hold_w_ds_;
-      cartesian_path_tangent_valid =
-          cartesian_path_tangent.array().isFinite().all();
-    }
-
-    if (cartesian_path_tangent_valid) {
-      const double path_kinetic_energy_at_unit_rate = std::max(
-          0.0,
-          0.5 * (cartesian_path_tangent.transpose() *
-                 budget_cartesian_task_inertia *
-                 cartesian_path_tangent)(0, 0));
-      if (path_kinetic_energy_at_unit_rate > 1.0e-9) {
-        safe_path_rate = std::min(
-            safe_path_rate,
-            std::sqrt(kinetic_budget /
-                      path_kinetic_energy_at_unit_rate));
-        safe_path_rate_observable = true;
-      }
-    }
-
-    // The command-tangent estimate is proactive.  This second bound uses the
-    // measured kinetic energy as a fallback when tracking/model mismatch has
-    // already consumed more of the configured budget than predicted.
-    const double measured_rate_reference = std::max(
-        candidate_path_rate,
-        commanded_path_rate_);
-    if (candidate_energy_terms.kinetic_energy > kinetic_budget + 1.0e-9 &&
-        measured_rate_reference > 1.0e-6) {
-      safe_path_rate = std::min(
-          safe_path_rate,
-          measured_rate_reference *
-              std::sqrt(kinetic_budget /
-                        candidate_energy_terms.kinetic_energy));
-      safe_path_rate_observable = true;
-    }
-
-    if (safe_path_rate_observable) {
-      mode2_energy_path_rate_target_ = std::clamp(
-          safe_path_rate,
-          path_time_rate_min_,
-          path_time_rate_max_);
-    }
-  } else if (!isContactEnergyMode(mode_)) {
-    mode2_energy_path_rate_target_ = path_time_rate_target_;
-  }
-
-  CartesianEnergyBudgetInfo candidate_energy_info;
-  ImpedanceSample candidate_scaled_command = applyCartesianEnergyBudget(
-      candidate_budget_command,
-      candidate_energy_terms.kinetic_energy,
-      candidate_energy_terms.potential_energy,
-      candidate_energy_terms.valid,
+  CartesianEnergyBudgetInfo evaluated_energy_info;
+  ImpedanceSample evaluated_scaled_command = applyCartesianEnergyBudget(
+      energy_budget_command,
+      energy_budget_terms.kinetic_energy,
+      energy_budget_terms.potential_energy,
+      energy_budget_terms.valid,
       use_cartesian_energy_budget,
       budget_cartesian_task_inertia_sqrt,
       budget_cartesian_task_inertia_valid,
-      &candidate_energy_info);
+      &evaluated_energy_info);
+  evaluated_energy_info.lambda_valid =
+      budget_cartesian_task_inertia_valid;
 
-  // Lachner et al. Eq. (14)-(15): when the unscaled controlled
-  // energy exceeds the budget, scale the impedance and hold effective
-  // trajectory time until the energy is back inside the budget.
+  // Following the energy-budget method, freeze effective time whenever the
+  // Cartesian potential has to be scaled. Advancing a time-varying reference
+  // while the energy bound is active can inject new potential energy.
   const bool cartesian_budget_limited =
       use_cartesian_energy_budget &&
-      candidate_energy_info.scale < 1.0 - 1.0e-6;
+      evaluated_energy_info.scale < 1.0 - 1.0e-6;
   const bool contact_intended_resume_ready =
       current_contact_relevant_for_energy &&
       executing_contact_energy_intended;
@@ -4519,11 +4772,12 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       !last_verified_plan_.valid &&
       !contact_intended_resume_ready;
 
-  Vector6d error = candidate_error;
-  cartesian_energy_info = candidate_energy_info;
-  shield_dec.command = candidate_scaled_command;
+  Vector6d error = energy_budget_error;
+  cartesian_energy_info = evaluated_energy_info;
+  shield_dec.command = evaluated_scaled_command;
 
-  if (cartesian_budget_limited || waiting_for_continuous_energy_resume) {
+  if (cartesian_budget_limited ||
+      waiting_for_continuous_energy_resume) {
     if (!cartesian_effective_time_frozen_) {
       contact_verification_hold_active_ = false;
       contact_verification_hold_reason_ = FallbackReason::kNone;
@@ -4545,8 +4799,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       cartesian_energy_hold_dp_ds_.setZero();
       cartesian_energy_hold_w_ds_.setZero();
       cartesian_energy_hold_tangent_valid_ = false;
-      cartesian_energy_resume_path_rate_ = 0.0;
-      cartesian_energy_resume_path_rate_valid_ = false;
       double tangent_source_rate = commanded_path_rate_;
       const ImpedanceSample* tangent_source = &hold_source;
       if (tangent_source_rate <= 1.0e-6 &&
@@ -4594,7 +4846,12 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         budget_cartesian_task_inertia_sqrt,
         budget_cartesian_task_inertia_valid,
         &cartesian_energy_info);
+    cartesian_energy_info.lambda_valid =
+        budget_cartesian_task_inertia_valid;
   } else {
+    // The paper updates effective time only at the end of a control cycle.
+    // Therefore this release cycle still sends the now-unscaled held sample;
+    // the next cycle may consume the next smooth intended command.
     if (cartesian_effective_time_frozen_ &&
         cartesian_effective_time_freeze_start_wall_time_ >= 0.0) {
       paused_nominal_time_sec_ += std::max(
@@ -4606,7 +4863,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     cartesian_effective_time_freeze_start_wall_time_ = -1.0;
     cartesian_effective_time_hold_sample_valid_ = false;
     cartesian_energy_hold_tangent_valid_ = false;
-    cartesian_energy_resume_path_rate_valid_ = false;
     cartesian_effective_time_hold_monitor_ = MonitorResult{};
     contact_verification_hold_active_ = false;
     contact_verification_hold_reason_ = FallbackReason::kNone;
@@ -4642,7 +4898,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   last_cartesian_energy_budget_active_ = cartesian_energy_info.active;
   last_cartesian_energy_budget_lambda_valid_ = cartesian_energy_info.lambda_valid;
   last_cartesian_energy_scale_ = cartesian_energy_info.scale;
-  last_cartesian_kinetic_energy_ = cartesian_energy_info.kinetic_energy;
+  last_joint_kinetic_energy_ = cartesian_energy_info.kinetic_energy;
   last_cartesian_potential_energy_ = cartesian_energy_info.potential_energy;
   last_cartesian_control_energy_ = cartesian_energy_info.total_energy;
 
@@ -4655,7 +4911,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   const Vector7d tau_cmd = computeImpedanceTorque(
       q, dq, inertia, coriolis, J_geo,
       current_position, current_orientation,
-      shield_dec.command, dt);
+      shield_dec.command, use_cartesian_energy_budget, dt);
   const auto toc_torque = SteadyClock::now();
 
   for (int i = 0; i < kNumJoints; ++i) command_interfaces_[i].set_value(tau_cmd(i));
@@ -4696,9 +4952,11 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(shield_dec.command.nominal_path_time);
           add(static_cast<double>(shield_dec.command.nominal_path_time_valid));
           add(commanded_path_rate_);
-          add(mode2_energy_path_rate_target_);
-          add(cartesian_energy_resume_path_rate_);
-          add(static_cast<double>(cartesian_energy_resume_path_rate_valid_));
+          add(path_time_rate_target_);
+          add(measured_path_rate_);
+          add(static_cast<double>(measured_path_rate_valid_));
+          add(measured_path_acceleration_);
+          add(static_cast<double>(measured_path_acceleration_valid_));
           add(static_cast<double>(mode_));
           add(static_cast<double>(execution_stage_));
           add(static_cast<double>(fallback_reason_));
@@ -4711,9 +4969,17 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(static_cast<double>(monitor.contact_relevant_for_energy));
           add(static_cast<double>(monitor.collision_energy_unsafe));
           add(static_cast<double>(monitor.monitored_unsafe));
+          add(static_cast<double>(monitor.joint_limit_unsafe));
+          add(static_cast<double>(monitor.joint_limit_index));
+          add(monitor.joint_position_violation);
+          add(monitor.joint_velocity_violation);
+          add(monitor.joint_acceleration_violation);
+          add(monitor.joint_torque_violation);
           add(monitor.workspace_distance_now);
           add(monitor.workspace_distance_min);
           add(monitor.workspace_distance_margin);
+          for (int i = 0; i < 7; ++i) add(q(i));
+          for (int i = 0; i < 7; ++i) add(dq(i));
           for (int i = 0; i < 3; ++i) add(desired_position_cur(i));
           for (int i = 0; i < 3; ++i) add(current_position(i));
           for (int i = 0; i < 6; ++i) add(ee_twist(i));
@@ -4730,8 +4996,9 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(monitor.worst_case_contact_time);
           add(monitor.worst_case_workspace_distance_at_candidate);
           add(monitor.worst_case_cartesian_kinetic_energy_ub);
+          add(monitor.worst_case_joint_kinetic_energy_ub);
           add(monitor.worst_case_cartesian_potential_energy_ub);
-          add(monitor.worst_case_cartesian_control_energy_ub);
+          add(monitor.worst_case_total_control_energy_ub);
           add(monitor.h_monitored_energy);
           add(monitor.terminal_energy_ub);
           add(monitor.h_terminal_energy);
@@ -4739,8 +5006,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(monitor.worst_case_vel_error_radius);
           add(static_cast<double>(monitor.current_cartesian_energy_valid));
           add(monitor.current_cartesian_kinetic_energy);
+          add(static_cast<double>(monitor.current_joint_energy_valid));
+          add(monitor.current_joint_kinetic_energy);
           add(monitor.current_cartesian_potential_energy);
-          add(monitor.current_cartesian_control_energy);
+          add(monitor.current_total_control_energy);
           add(static_cast<double>(monitored_steps));
           add(static_cast<double>(monitored_intended_steps));
           add(static_cast<double>(monitored_failsafe_steps));
@@ -4752,7 +5021,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(static_cast<double>(cartesian_effective_time_frozen_));
           add(static_cast<double>(last_cartesian_energy_budget_lambda_valid_));
           add(last_cartesian_energy_scale_);
-          add(last_cartesian_kinetic_energy_);
+          add(last_joint_kinetic_energy_);
           add(last_cartesian_potential_energy_);
           add(last_cartesian_control_energy_);
           add(energy_budget_joule_);
@@ -4895,6 +5164,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("ee_collision_radius", 0.04);
     auto_declare<std::vector<double>>(
         "tcp_offset", std::vector<double>{0.0, 0.0, 0.0});
+    auto_declare<std::string>(
+        "monitor_urdf_model_path",
+        "/home/developer/multipanda_ws/src/model_urdf/panda_ng.urdf");
     auto_declare<std::vector<double>>(
         "ee_collision_center_offset", std::vector<double>{0.0, 0.0, 0.0});
     auto_declare<bool>("async_safety_monitor", true);
@@ -4907,6 +5179,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("human_workspace_timeout_sec", 0.5);
 
     auto_declare<double>("tracking_acc_error_bound", 0.2);
+    auto_declare<double>("joint_velocity_error_bound", 0.0);
 
     auto_declare<bool>("use_dynamic_consistent_impedance", true);
 
@@ -5170,6 +5443,17 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
           "tcp_offset must contain 3 values. Using [0, 0, 0].");
       tcp_offset_.setZero();
     }
+    monitor_urdf_model_path_ =
+        get_node()->get_parameter("monitor_urdf_model_path").as_string();
+    if (monitor_urdf_model_path_.empty()) {
+      RCLCPP_ERROR(
+          get_node()->get_logger(),
+          "monitor_urdf_model_path must not be empty when joint-space monitoring is enabled.");
+      return CallbackReturn::ERROR;
+    }
+    monitor_joint_dynamics_provider_ =
+        std::make_unique<PinocchioJointDynamicsProvider>(
+            monitor_urdf_model_path_, tcp_offset_);
     const auto ee_collision_center_offset =
         get_node()->get_parameter("ee_collision_center_offset").as_double_array();
     if (ee_collision_center_offset.size() == 3) {
@@ -5188,6 +5472,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         std::max(0.0, get_node()->get_parameter("async_plan_max_age_sec").as_double());
 
     tracking_acc_error_bound_ = std::max(0.0, get_node()->get_parameter("tracking_acc_error_bound").as_double());
+    joint_velocity_error_bound_ = std::max(
+        0.0,
+        get_node()->get_parameter("joint_velocity_error_bound").as_double());
 
     trajectory_generator_config_path_ =
         cps_trajectory_generators::defaultTrajectoryGeneratorConfigPath();
@@ -5207,8 +5494,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         std::clamp(trajectory_settings.path_time_rate_target,
                    path_time_rate_min_,
                    path_time_rate_max_);
-    mode2_energy_path_rate_target_ = path_time_rate_target_;
-
     local_replan_horizon_steps_ =
         std::max(1, trajectory_settings.local_replan_horizon_steps);
     local_replan_dt_ = std::max(trajectory_settings.local_replan_dt, kMinDt);
@@ -5484,8 +5769,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   }
   commanded_path_rate_ =
       startup_path.empty() ? 0.0 : path_time_rate_target_;
-  mode2_energy_path_rate_target_ = path_time_rate_target_;
-
   mode_ = SafetyMode::kNominal;
   execution_stage_ = ExecutionStage::kNominalVerified;
   fallback_reason_ = FallbackReason::kNone;
@@ -5515,7 +5798,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   last_cartesian_energy_budget_active_ = false;
   last_cartesian_energy_budget_lambda_valid_ = false;
   last_cartesian_energy_scale_ = 1.0;
-  last_cartesian_kinetic_energy_ = 0.0;
+  last_joint_kinetic_energy_ = 0.0;
   last_cartesian_potential_energy_ = 0.0;
   last_cartesian_control_energy_ = 0.0;
   cartesian_energy_task_inertia_cache_.setZero();
@@ -5532,8 +5815,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   cartesian_energy_hold_dp_ds_.setZero();
   cartesian_energy_hold_w_ds_.setZero();
   cartesian_energy_hold_tangent_valid_ = false;
-  cartesian_energy_resume_path_rate_ = 0.0;
-  cartesian_energy_resume_path_rate_valid_ = false;
+  measured_path_rate_ = 0.0;
+  measured_path_rate_valid_ = false;
+  measured_path_acceleration_ = 0.0;
+  measured_path_acceleration_valid_ = false;
   cartesian_effective_time_hold_monitor_ = MonitorResult{};
 
   last_verified_plan_ = VerifiedPlan{};
@@ -5774,8 +6059,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_deactivate(
   cartesian_energy_hold_dp_ds_.setZero();
   cartesian_energy_hold_w_ds_.setZero();
   cartesian_energy_hold_tangent_valid_ = false;
-  cartesian_energy_resume_path_rate_ = 0.0;
-  cartesian_energy_resume_path_rate_valid_ = false;
+  measured_path_rate_ = 0.0;
+  measured_path_rate_valid_ = false;
+  measured_path_acceleration_ = 0.0;
+  measured_path_acceleration_valid_ = false;
   cartesian_effective_time_hold_monitor_ = MonitorResult{};
   contact_intended_plan_ = VerifiedPlan{};
   contact_intended_input_control_sequence_ = 0;
