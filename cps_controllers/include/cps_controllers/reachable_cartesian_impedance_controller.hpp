@@ -271,6 +271,9 @@ class ReachableCartesianImpedanceController
     std::uint64_t sequence{0};
     std::uint64_t control_loop_sequence{0};
     std::uint64_t source_plan_generation{0};
+    std::uint64_t scheduled_control_loop_sequence{0};
+    std::uint64_t publish_lateness_cycles{0};
+    std::int64_t publish_steady_time_ns{0};
     double wall_time{0.0};
     double nominal_guess_time{0.0};
 
@@ -300,12 +303,28 @@ class ReachableCartesianImpedanceController
     std::vector<ImpedanceSample> committed_prefix;
   };
 
+  struct AsyncMonitorTiming {
+    bool valid{false};
+    std::uint64_t input_sequence{0};
+    std::uint64_t input_control_loop_sequence{0};
+    std::uint64_t scheduled_control_loop_sequence{0};
+    std::uint64_t publish_lateness_cycles{0};
+    double worker_queue_wait_ms{0.0};
+    double worker_compute_ms{0.0};
+    double output_handoff_ms{0.0};
+    double end_to_end_ms{0.0};
+  };
+
   struct AsyncMonitorOutput {
     std::uint64_t sequence{0};
     double input_wall_time{0.0};
     bool valid{false};
     AsyncMonitorInput input;
     ShieldDecision decision;
+    std::int64_t worker_start_steady_time_ns{0};
+    std::int64_t worker_finish_steady_time_ns{0};
+    double worker_queue_wait_ms{0.0};
+    double worker_compute_ms{0.0};
   };
 
   ShieldDecision computeShieldDecisionForAsyncInput(
@@ -366,6 +385,7 @@ class ReachableCartesianImpedanceController
       const cps_human_workspace::HumanWorkspace& human_workspace,
       const VerifiedPlan& evaluated_plan,
       const std::vector<JointPredictionSample>& joint_prediction_trace,
+      const AsyncMonitorTiming& async_timing,
       const MonitorResult& monitor,
       int mode,
       bool candidate_verified,
@@ -391,6 +411,7 @@ class ReachableCartesianImpedanceController
     cps_human_workspace::HumanWorkspace human_workspace;
     VerifiedPlan evaluated_plan{};
     std::vector<JointPredictionSample> joint_prediction_trace;
+    AsyncMonitorTiming async_timing{};
     MonitorResult monitor{};
     int mode{0};
     bool candidate_verified{false};
@@ -418,6 +439,7 @@ class ReachableCartesianImpedanceController
       const cps_human_workspace::HumanWorkspace& human_workspace,
       const VerifiedPlan& evaluated_plan,
       const std::vector<JointPredictionSample>& joint_prediction_trace,
+      const AsyncMonitorTiming& async_timing,
       const MonitorResult& monitor,
       int mode,
       bool candidate_verified,
@@ -429,7 +451,7 @@ class ReachableCartesianImpedanceController
       const char* source);
 
   struct ControlLogRecord {
-    static constexpr std::size_t kMaxValues = 128;
+    static constexpr std::size_t kMaxValues = 160;
     std::array<double, kMaxValues> values{};
     std::size_t value_count{0};
   };
@@ -594,6 +616,8 @@ class ReachableCartesianImpedanceController
   Vector3d ee_collision_center_offset_{Vector3d::Zero()};
   int monitor_decimation_{1};
   bool async_safety_monitor_{true};
+  int monitor_worker_cpu_affinity_{-1};
+  int monitor_worker_realtime_priority_{0};
   double async_plan_max_age_sec_{0.02};
   // The lead is the maximum already-verified command prefix executed while
   // the worker runs. In every mode it is truncated at the intended/failsafe
@@ -666,18 +690,28 @@ class ReachableCartesianImpedanceController
   std::atomic<bool> safety_monitor_worker_running_{false};
   std::atomic<std::uint64_t> async_input_sequence_{0};
   std::uint64_t control_update_sequence_{0};
+  std::uint64_t monitor_period_control_cycles_{1};
+  std::uint64_t next_async_monitor_control_sequence_{1};
+  std::uint64_t last_async_input_publish_control_sequence_{0};
+  std::uint64_t async_monitor_schedule_late_cycles_{0};
+  std::uint64_t async_monitor_schedule_skipped_slots_{0};
 
   std::mutex async_input_mutex_;
   std::condition_variable async_input_cv_;
   AsyncMonitorInput latest_async_input_{};
   bool async_input_pending_{false};
+  std::atomic<std::uint64_t> async_monitor_input_publish_count_{0};
+  std::atomic<std::uint64_t> async_monitor_input_overwrite_count_{0};
+  std::atomic<std::uint64_t> async_monitor_worker_processed_count_{0};
 
   std::mutex async_output_mutex_;
   AsyncMonitorOutput latest_async_output_{};
   std::uint64_t last_consumed_async_output_sequence_{0};
   double last_async_output_wall_time_{-1.0};
   bool last_async_output_valid_{false};
-  double last_async_input_publish_wall_time_{-1.0};
+  std::atomic<std::uint64_t> async_monitor_output_overwrite_count_{0};
+  std::atomic<std::uint64_t> async_monitor_output_consumed_count_{0};
+  AsyncMonitorTiming last_async_monitor_timing_{};
   std::size_t async_late_activation_accept_count_{0};
   std::size_t async_activation_deadline_miss_count_{0};
 

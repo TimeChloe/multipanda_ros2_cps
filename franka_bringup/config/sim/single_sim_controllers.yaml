@@ -267,6 +267,12 @@ reachable_cartesian_impedance_controller:
     # Franka semantic model.
     monitor_urdf_model_path: /home/developer/multipanda_ws/src/model_urdf/panda_ng.urdf
     async_safety_monitor: true
+    # Pin the 200 Hz worker away from the main ROS/MuJoCo scheduling traffic on
+    # this 24-core workstation. Affinity failure is non-fatal on other hosts.
+    monitor_worker_cpu_affinity: 22
+    # This is applied only after the dedicated CPU affinity succeeds; otherwise
+    # the worker automatically stays on the default scheduler.
+    monitor_worker_realtime_priority: 20
     async_plan_max_age_sec: 0.02
     # The 200 Hz monitor period consumes five dense 1 ms commands. Keep an
     # eight-step committed prefix for handoff/scheduling margin and four monitor

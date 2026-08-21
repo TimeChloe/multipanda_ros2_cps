@@ -610,7 +610,10 @@ MonitorResult verifyReachablePlanJointSpace(
             config.human_workspace.inflatedCollisionRadius(
                 config.ee_collision_radius, 0.0),
             config.wall_time_sec + t_prev);
-    if (config.nullspace_stiffness > 0.0 && start_distance > 0.0) {
+    const bool nullspace_enabled_for_sample =
+        config.nullspace_stiffness > 0.0 && start_distance > 0.0 &&
+        !(desired.failsafe && config.disable_nullspace_in_failsafe);
+    if (nullspace_enabled_for_sample) {
       const Vector7d tau_nullspace_raw =
           config.nullspace_stiffness *
               (config.nullspace_reference - q_pred) -

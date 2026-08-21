@@ -139,6 +139,56 @@ TEST(ReachableSafetyMonitor, JointEnergyIncludesNullspaceMotion) {
   EXPECT_NEAR(result.current_total_control_energy, 0.5, 1.0e-12);
 }
 
+TEST(ReachableSafetyMonitor, DisablesNullspaceTorqueDuringFailsafeWhenRequested) {
+  IdentityJointDynamicsProvider dynamics;
+
+  SafetyMonitorConfig config;
+  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
+  workspace_parameters.sphere_center = Vector3d(10.0, 0.0, 0.0);
+  workspace_parameters.motion_radius = 0.10;
+  workspace_parameters.hand_radius = 0.0;
+  config.human_workspace.setParameters(workspace_parameters);
+  config.nullspace_reference(6) = 1.0;
+  config.nullspace_stiffness = 100.0;
+  config.disable_nullspace_in_failsafe = true;
+  config.tracking_acc_error_bound = 0.0;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample failsafe = plan.anchor;
+  failsafe.t = 0.01;
+  failsafe.q = Quaterniond::Identity();
+  failsafe.failsafe = true;
+  plan.failsafe.push_back(failsafe);
+
+  std::vector<JointPredictionSample> prediction_trace;
+  const MonitorResult disabled_result = verifyReachablePlanJointSpace(
+      plan,
+      Vector7d::Zero(),
+      Vector7d::Zero(),
+      dynamics,
+      config,
+      &prediction_trace);
+
+  ASSERT_FALSE(prediction_trace.empty());
+  EXPECT_NEAR(prediction_trace.back().dq(6), 0.0, 1.0e-12);
+  EXPECT_FALSE(disabled_result.joint_limit_unsafe);
+
+  config.disable_nullspace_in_failsafe = false;
+  prediction_trace.clear();
+  verifyReachablePlanJointSpace(
+      plan,
+      Vector7d::Zero(),
+      Vector7d::Zero(),
+      dynamics,
+      config,
+      &prediction_trace);
+
+  ASSERT_FALSE(prediction_trace.empty());
+  EXPECT_GT(prediction_trace.back().dq(6), 0.0);
+}
+
 TEST(ReachableSafetyMonitor, JointRolloutDetectsPositionLimit) {
   IdentityJointDynamicsProvider dynamics;
   dynamics.limits_.position_upper(0) = 1.0e-4;

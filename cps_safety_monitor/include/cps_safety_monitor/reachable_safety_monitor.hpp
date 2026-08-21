@@ -170,6 +170,9 @@ struct SafetyMonitorConfig {
   bool use_dynamic_consistent_impedance{true};
   Vector7d nullspace_reference{Vector7d::Zero()};
   double nullspace_stiffness{0.0};
+  // Keep the joint rollout consistent with controllers that remove
+  // nullspace torque while executing their fail-safe trajectory.
+  bool disable_nullspace_in_failsafe{false};
   Vector7d previous_torque_command{Vector7d::Zero()};
   bool previous_torque_command_valid{false};
   double torque_rate_limit{1000.0};

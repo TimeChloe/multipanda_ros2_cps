@@ -14,6 +14,7 @@
 //
 // NOTE:
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -31,6 +32,9 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#include <pthread.h>
+#include <sched.h>
 
 #include <Eigen/Dense>
 
@@ -75,6 +79,16 @@ using Matrix3d = Eigen::Matrix3d;
 using Vector3d = Eigen::Vector3d;
 using Quaterniond = Eigen::Quaterniond;
 using SteadyClock = std::chrono::steady_clock;
+
+std::int64_t steadyNowNanoseconds() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             SteadyClock::now().time_since_epoch())
+      .count();
+}
+
+double nanosecondsToMilliseconds(std::int64_t nanoseconds) {
+  return static_cast<double>(nanoseconds) * 1.0e-6;
+}
 using CartesianViaMotionAction =
     panda_motion_generator_msgs::action::CartesianViaMotion;
 using SimpleActionResult = panda_motion_generator_msgs::msg::SimpleActionResult;
@@ -1836,6 +1850,7 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
   }
   config.nullspace_reference = desired_qn_;
   config.nullspace_stiffness = n_stiffness_;
+  config.disable_nullspace_in_failsafe = disable_nullspace_in_failsafe_;
   config.collision_center_offset = ee_collision_center_offset_;
   config.joint_velocity_error_bound = joint_velocity_error_bound_;
   config.previous_torque_command = previous_torque_command;
@@ -2350,9 +2365,15 @@ bool ReachableCartesianImpedanceController::publishAsyncMonitorInput(
   }
 
   if (async_input_mutex_.try_lock()) {
+    if (async_input_pending_) {
+      async_monitor_input_overwrite_count_.fetch_add(
+          1, std::memory_order_relaxed);
+    }
     latest_async_input_ = std::move(input);
     async_input_pending_ = true;
     async_input_mutex_.unlock();
+    async_monitor_input_publish_count_.fetch_add(
+        1, std::memory_order_relaxed);
     async_input_cv_.notify_one();
     return true;
   }
@@ -2377,6 +2398,8 @@ bool ReachableCartesianImpedanceController::takeAsyncMonitorOutput(
     *output = std::move(latest_async_output_);
     latest_async_output_.valid = false;
     last_consumed_async_output_sequence_ = output->sequence;
+    async_monitor_output_consumed_count_.fetch_add(
+        1, std::memory_order_relaxed);
   }
 
   async_output_mutex_.unlock();
@@ -2568,7 +2591,9 @@ void ReachableCartesianImpedanceController::resetViaPointExecutionState(
   last_shield_decision_valid_ = false;
   last_async_output_valid_ = false;
   last_async_output_wall_time_ = -1.0;
-  last_async_input_publish_wall_time_ = -1.0;
+  // Start a fresh monitor phase immediately for the new trajectory without
+  // depending on ROS/simulation wall time.
+  next_async_monitor_control_sequence_ = control_update_sequence_;
   cartesian_effective_time_frozen_ = false;
   contact_verification_hold_active_ = false;
   contact_verification_hold_reason_ = FallbackReason::kNone;
@@ -2829,6 +2854,66 @@ void ReachableCartesianImpedanceController::handleCartesianViaPointsActionAccept
 }
 
 void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop() {
+  bool worker_affinity_applied = false;
+  if (monitor_worker_cpu_affinity_ >= 0) {
+    cpu_set_t cpu_set;
+    CPU_ZERO(&cpu_set);
+    if (monitor_worker_cpu_affinity_ < CPU_SETSIZE) {
+      CPU_SET(monitor_worker_cpu_affinity_, &cpu_set);
+      const int affinity_result = pthread_setaffinity_np(
+          pthread_self(), sizeof(cpu_set), &cpu_set);
+      if (affinity_result == 0) {
+        worker_affinity_applied = true;
+        RCLCPP_INFO(
+            get_node()->get_logger(),
+            "Safety monitor worker pinned to CPU %d.",
+            monitor_worker_cpu_affinity_);
+      } else {
+        RCLCPP_WARN(
+            get_node()->get_logger(),
+            "Failed to pin safety monitor worker to CPU %d: %s",
+            monitor_worker_cpu_affinity_,
+            std::strerror(affinity_result));
+      }
+    } else {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "monitor_worker_cpu_affinity=%d exceeds CPU_SETSIZE=%d; affinity disabled.",
+          monitor_worker_cpu_affinity_,
+          CPU_SETSIZE);
+    }
+  }
+
+  if (monitor_worker_realtime_priority_ > 0) {
+    if (!worker_affinity_applied) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "Safety monitor SCHED_FIFO priority %d was requested without a "
+          "successfully applied dedicated CPU affinity; keeping the default "
+          "scheduler to protect the controller update thread.",
+          monitor_worker_realtime_priority_);
+    } else {
+      sched_param scheduling_parameters{};
+      scheduling_parameters.sched_priority =
+          monitor_worker_realtime_priority_;
+      const int scheduling_result = pthread_setschedparam(
+          pthread_self(), SCHED_FIFO, &scheduling_parameters);
+      if (scheduling_result == 0) {
+        RCLCPP_INFO(
+            get_node()->get_logger(),
+            "Safety monitor worker uses SCHED_FIFO priority %d on its dedicated CPU.",
+            monitor_worker_realtime_priority_);
+      } else {
+        RCLCPP_WARN(
+            get_node()->get_logger(),
+            "Failed to set safety monitor worker SCHED_FIFO priority %d: %s. "
+            "Continuing with the default scheduler.",
+            monitor_worker_realtime_priority_,
+            std::strerror(scheduling_result));
+      }
+    }
+  }
+
   VerifiedPlan last_verified_plan;
 
   while (safety_monitor_worker_running_.load()) {
@@ -2848,16 +2933,33 @@ void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop() {
       async_input_pending_ = false;
     }
 
+    const std::int64_t worker_start_ns = steadyNowNanoseconds();
     AsyncMonitorOutput output;
     output.sequence = input.sequence;
     output.input_wall_time = input.wall_time;
     output.valid = true;
+    output.worker_start_steady_time_ns = worker_start_ns;
+    output.worker_queue_wait_ms = nanosecondsToMilliseconds(
+        std::max<std::int64_t>(
+            0, worker_start_ns - input.publish_steady_time_ns));
     output.decision =
         computeShieldDecisionForAsyncInput(input, last_verified_plan);
     output.input = std::move(input);
+    output.worker_finish_steady_time_ns = steadyNowNanoseconds();
+    output.worker_compute_ms = nanosecondsToMilliseconds(
+        std::max<std::int64_t>(
+            0,
+            output.worker_finish_steady_time_ns -
+                output.worker_start_steady_time_ns));
+    async_monitor_worker_processed_count_.fetch_add(
+        1, std::memory_order_relaxed);
 
     {
       std::lock_guard<std::mutex> lock(async_output_mutex_);
+      if (latest_async_output_.valid) {
+        async_monitor_output_overwrite_count_.fetch_add(
+            1, std::memory_order_relaxed);
+      }
       latest_async_output_ = std::move(output);
     }
   }
@@ -2874,7 +2976,6 @@ void ReachableCartesianImpedanceController::startSafetyMonitorWorker() {
   last_consumed_async_output_sequence_ = 0;
   last_async_output_wall_time_ = -1.0;
   last_async_output_valid_ = false;
-  last_async_input_publish_wall_time_ = -1.0;
 
   safety_monitor_worker_thread_ =
       std::thread(&ReachableCartesianImpedanceController::safetyMonitorWorkerLoop, this);
@@ -3000,6 +3101,7 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
     const cps_human_workspace::HumanWorkspace& human_workspace,
     const VerifiedPlan& evaluated_plan,
     const std::vector<JointPredictionSample>& joint_prediction_trace,
+    const AsyncMonitorTiming& async_timing,
     const MonitorResult& monitor,
     int mode,
     bool candidate_verified,
@@ -3030,6 +3132,7 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
     record.human_workspace = human_workspace;
     record.evaluated_plan = evaluated_plan;
     record.joint_prediction_trace = joint_prediction_trace;
+    record.async_timing = async_timing;
     record.monitor = monitor;
     record.mode = mode;
     record.candidate_verified = candidate_verified;
@@ -3059,6 +3162,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     const cps_human_workspace::HumanWorkspace& human_workspace,
     const VerifiedPlan& evaluated_plan,
     const std::vector<JointPredictionSample>& joint_prediction_trace,
+    const AsyncMonitorTiming& async_timing,
     const MonitorResult& monitor,
     int mode,
     bool candidate_verified,
@@ -3249,6 +3353,15 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     output
         << wall_time << "," << nominal_guess_time << ","
         << (source == nullptr ? "" : source) << ","
+        << static_cast<int>(async_timing.valid) << ","
+        << async_timing.input_sequence << ","
+        << async_timing.input_control_loop_sequence << ","
+        << async_timing.scheduled_control_loop_sequence << ","
+        << async_timing.publish_lateness_cycles << ","
+        << async_timing.worker_queue_wait_ms << ","
+        << async_timing.worker_compute_ms << ","
+        << async_timing.output_handoff_ms << ","
+        << async_timing.end_to_end_ms << ","
         << monitor_total_ms << ","
         << planner_ms << ","
         << plan_build_ms << ","
@@ -3352,7 +3465,17 @@ bool ReachableCartesianImpedanceController::startLogWriters() {
       "monitor_current_cartesian_potential_energy,"
       "monitor_current_total_control_energy,monitored_steps,"
       "monitored_intended_steps,"
-      "monitored_failsafe_steps,control_loop_sequence,verified_plan_age_sec,"
+      "monitored_failsafe_steps,control_loop_sequence,"
+      "monitor_period_control_cycles,next_async_monitor_control_sequence,"
+      "last_async_input_publish_control_sequence,async_timing_valid,"
+      "async_monitor_input_sequence,async_monitor_input_control_sequence,"
+      "async_monitor_scheduled_control_sequence,async_monitor_publish_lateness_cycles,"
+      "async_monitor_worker_queue_wait_ms,async_monitor_worker_compute_ms,"
+      "async_monitor_output_handoff_ms,async_monitor_end_to_end_ms,"
+      "async_monitor_inputs_published,async_monitor_inputs_overwritten,"
+      "async_monitor_worker_processed,async_monitor_outputs_overwritten,"
+      "async_monitor_outputs_consumed,async_monitor_schedule_late_cycles,"
+      "async_monitor_schedule_skipped_slots,verified_plan_age_sec,"
       "verified_next_intended_exec_index,verified_next_failsafe_exec_index,"
       "cartesian_energy_budget_active,cartesian_effective_time_frozen,"
       "cartesian_energy_lambda_valid,cartesian_energy_scale,"
@@ -3405,7 +3528,11 @@ bool ReachableCartesianImpedanceController::startLogWriters() {
 
   if (enable_prediction_logging_) {
     const std::string prediction_header =
-        "wall_time_sec,nominal_time_sec,source,monitor_total_ms,planner_ms,"
+        "wall_time_sec,nominal_time_sec,source,async_timing_valid,"
+        "monitor_input_sequence,monitor_input_control_loop_sequence,"
+        "monitor_scheduled_control_loop_sequence,monitor_publish_lateness_cycles,"
+        "worker_queue_wait_ms,worker_compute_ms,output_handoff_ms,"
+        "monitor_end_to_end_ms,monitor_total_ms,planner_ms,"
         "plan_build_ms,monitor_eval_ms,mode,candidate_verified,"
         "executing_last_verified_monitored,predicted_trigger,"
         "monitored_contact_possible,plan_intended_steps,plan_failsafe_steps,"
@@ -3467,6 +3594,7 @@ bool ReachableCartesianImpedanceController::startLogWriters() {
                   record.human_workspace,
                   record.evaluated_plan,
                   record.joint_prediction_trace,
+                  record.async_timing,
                   record.monitor,
                   record.mode,
                   record.candidate_verified,
@@ -3511,18 +3639,34 @@ void ReachableCartesianImpedanceController::stopLogWriters() {
       prediction_log_writer_.droppedCount();
   const std::size_t schema_mismatches =
       control_log_column_mismatch_count_.load(std::memory_order_relaxed);
+  const std::uint64_t monitor_inputs_published =
+      async_monitor_input_publish_count_.load(std::memory_order_relaxed);
+  const std::uint64_t monitor_inputs_overwritten =
+      async_monitor_input_overwrite_count_.load(std::memory_order_relaxed);
+  const std::uint64_t monitor_worker_processed =
+      async_monitor_worker_processed_count_.load(std::memory_order_relaxed);
+  const std::uint64_t monitor_outputs_overwritten =
+      async_monitor_output_overwrite_count_.load(std::memory_order_relaxed);
+  const std::uint64_t monitor_outputs_consumed =
+      async_monitor_output_consumed_count_.load(std::memory_order_relaxed);
 
   RCLCPP_INFO(
       get_node()->get_logger(),
       "Asynchronous logs drained: control=%zu/%zu dropped=%zu, "
-      "prediction=%zu/%zu dropped=%zu, schema_mismatch=%zu",
+      "prediction=%zu/%zu dropped=%zu, schema_mismatch=%zu, "
+      "monitor published/processed/consumed=%lu/%lu/%lu, input/output overwrite=%lu/%lu",
       control_written,
       control_enqueued,
       control_dropped,
       prediction_written,
       prediction_enqueued,
       prediction_dropped,
-      schema_mismatches);
+      schema_mismatches,
+      static_cast<unsigned long>(monitor_inputs_published),
+      static_cast<unsigned long>(monitor_worker_processed),
+      static_cast<unsigned long>(monitor_outputs_consumed),
+      static_cast<unsigned long>(monitor_inputs_overwritten),
+      static_cast<unsigned long>(monitor_outputs_overwritten));
 
   if (!error_log_run_dir_.empty()) {
     const std::filesystem::path run_info_path =
@@ -3537,7 +3681,21 @@ void ReachableCartesianImpedanceController::stopLogWriters() {
           << "prediction_log_enqueued: " << prediction_enqueued << "\n"
           << "prediction_log_written: " << prediction_written << "\n"
           << "prediction_log_dropped: " << prediction_dropped << "\n"
-          << "control_log_schema_mismatch: " << schema_mismatches << "\n";
+          << "control_log_schema_mismatch: " << schema_mismatches << "\n"
+          << "async_monitor_inputs_published: "
+          << monitor_inputs_published << "\n"
+          << "async_monitor_inputs_overwritten: "
+          << monitor_inputs_overwritten << "\n"
+          << "async_monitor_worker_processed: "
+          << monitor_worker_processed << "\n"
+          << "async_monitor_outputs_overwritten: "
+          << monitor_outputs_overwritten << "\n"
+          << "async_monitor_outputs_consumed: "
+          << monitor_outputs_consumed << "\n"
+          << "async_monitor_schedule_late_cycles: "
+          << async_monitor_schedule_late_cycles_ << "\n"
+          << "async_monitor_schedule_skipped_slots: "
+          << async_monitor_schedule_skipped_slots_ << "\n";
     }
   }
 }
@@ -3850,15 +4008,17 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
   if (async_safety_monitor_) {
     const bool publish_monitor_input =
-        last_async_input_publish_wall_time_ < 0.0 ||
-        (wall_time - last_async_input_publish_wall_time_) >=
-            std::max(monitor_update_period_sec_, kMinDt);
+        control_loop_sequence >= next_async_monitor_control_sequence_;
 
     if (publish_monitor_input) {
       AsyncMonitorInput async_input;
       async_input.sequence = async_input_sequence_.fetch_add(1) + 1;
       async_input.control_loop_sequence = control_loop_sequence;
       async_input.source_plan_generation = last_verified_plan_generation_;
+      async_input.scheduled_control_loop_sequence =
+          next_async_monitor_control_sequence_;
+      async_input.publish_lateness_cycles =
+          control_loop_sequence - next_async_monitor_control_sequence_;
       async_input.wall_time = wall_time;
       async_input.nominal_guess_time = nominal_guess_time;
       async_input.q = q;
@@ -4021,15 +4181,52 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         }
       }
       // A transient mutex collision must not silently consume this 200 Hz
-      // monitor slot. Leave the timestamp unchanged so the 1 kHz loop retries
-      // with a newer state snapshot on its next cycle.
+      // monitor slot. Leave the absolute sequence deadline unchanged so the
+      // 1 kHz loop retries with a newer state snapshot on its next cycle.
+      async_input.publish_steady_time_ns = steadyNowNanoseconds();
       if (publishAsyncMonitorInput(std::move(async_input))) {
-        last_async_input_publish_wall_time_ = wall_time;
+        last_async_input_publish_control_sequence_ = control_loop_sequence;
+        async_monitor_schedule_late_cycles_ +=
+            control_loop_sequence - next_async_monitor_control_sequence_;
+        const std::uint64_t period_cycles =
+            std::max<std::uint64_t>(1, monitor_period_control_cycles_);
+        next_async_monitor_control_sequence_ += period_cycles;
+        while (next_async_monitor_control_sequence_ <=
+               control_loop_sequence) {
+          next_async_monitor_control_sequence_ += period_cycles;
+          ++async_monitor_schedule_skipped_slots_;
+        }
       }
     }
 
     AsyncMonitorOutput async_output;
     if (takeAsyncMonitorOutput(&async_output)) {
+      const std::int64_t output_take_steady_time_ns =
+          steadyNowNanoseconds();
+      AsyncMonitorTiming async_timing;
+      async_timing.valid = true;
+      async_timing.input_sequence = async_output.input.sequence;
+      async_timing.input_control_loop_sequence =
+          async_output.input.control_loop_sequence;
+      async_timing.scheduled_control_loop_sequence =
+          async_output.input.scheduled_control_loop_sequence;
+      async_timing.publish_lateness_cycles =
+          async_output.input.publish_lateness_cycles;
+      async_timing.worker_queue_wait_ms =
+          async_output.worker_queue_wait_ms;
+      async_timing.worker_compute_ms =
+          async_output.worker_compute_ms;
+      async_timing.output_handoff_ms = nanosecondsToMilliseconds(
+          std::max<std::int64_t>(
+              0,
+              output_take_steady_time_ns -
+                  async_output.worker_finish_steady_time_ns));
+      async_timing.end_to_end_ms = nanosecondsToMilliseconds(
+          std::max<std::int64_t>(
+              0,
+              output_take_steady_time_ns -
+                  async_output.input.publish_steady_time_ns));
+      last_async_monitor_timing_ = async_timing;
       const std::size_t async_plan_elapsed_steps =
           control_loop_sequence >= async_output.input.control_loop_sequence
               ? static_cast<std::size_t>(
@@ -4108,6 +4305,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             async_output.input.human_workspace,
             async_output.decision.evaluated_plan,
             async_output.decision.joint_prediction_trace,
+            async_timing,
             async_output.decision.monitor,
             static_cast<int>(mode_),
             async_output.decision.candidate_verified,
@@ -4296,6 +4494,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       last_shield_decision_ = shield_dec;
       last_shield_decision_valid_ = true;
       if (shield_dec.has_evaluated_plan) {
+        const AsyncMonitorTiming sync_timing;
         logShieldPredictionTrajectory(
             wall_time,
             nominal_guess_time,
@@ -4311,6 +4510,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             human_workspace_,
             shield_dec.evaluated_plan,
             shield_dec.joint_prediction_trace,
+            sync_timing,
             shield_dec.monitor,
             static_cast<int>(mode_),
             shield_dec.candidate_verified,
@@ -5014,6 +5214,35 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(static_cast<double>(monitored_intended_steps));
           add(static_cast<double>(monitored_failsafe_steps));
           add(static_cast<double>(control_loop_sequence));
+          add(static_cast<double>(monitor_period_control_cycles_));
+          add(static_cast<double>(next_async_monitor_control_sequence_));
+          add(static_cast<double>(
+              last_async_input_publish_control_sequence_));
+          add(static_cast<double>(last_async_monitor_timing_.valid));
+          add(static_cast<double>(
+              last_async_monitor_timing_.input_sequence));
+          add(static_cast<double>(
+              last_async_monitor_timing_.input_control_loop_sequence));
+          add(static_cast<double>(
+              last_async_monitor_timing_.scheduled_control_loop_sequence));
+          add(static_cast<double>(
+              last_async_monitor_timing_.publish_lateness_cycles));
+          add(last_async_monitor_timing_.worker_queue_wait_ms);
+          add(last_async_monitor_timing_.worker_compute_ms);
+          add(last_async_monitor_timing_.output_handoff_ms);
+          add(last_async_monitor_timing_.end_to_end_ms);
+          add(static_cast<double>(async_monitor_input_publish_count_.load(
+              std::memory_order_relaxed)));
+          add(static_cast<double>(async_monitor_input_overwrite_count_.load(
+              std::memory_order_relaxed)));
+          add(static_cast<double>(async_monitor_worker_processed_count_.load(
+              std::memory_order_relaxed)));
+          add(static_cast<double>(async_monitor_output_overwrite_count_.load(
+              std::memory_order_relaxed)));
+          add(static_cast<double>(async_monitor_output_consumed_count_.load(
+              std::memory_order_relaxed)));
+          add(static_cast<double>(async_monitor_schedule_late_cycles_));
+          add(static_cast<double>(async_monitor_schedule_skipped_slots_));
           add(verified_plan_age_sec);
           add(static_cast<double>(last_verified_plan_.intended_exec_index));
           add(static_cast<double>(last_verified_plan_.failsafe_exec_index));
@@ -5060,6 +5289,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                 "[reachable_impedance] mode=%d stage=%d avg=%.3f ms min=%.3f ms max=%.3f ms overruns>1ms=%zu >2ms=%zu "
                 "model_avg/max=%.3f/%.3f shield_avg/max=%.3f/%.3f torque_avg/max=%.3f/%.3f io_avg/max=%.3f/%.3f "
                 "plan_valid=%d late_accept=%zu deadline_miss=%zu "
+                "monitor_pub/proc/cons=%lu/%lu/%lu overwrite_in/out=%lu/%lu "
+                "monitor_wait/compute/handoff/e2e=%.3f/%.3f/%.3f/%.3f ms "
                 "log_q=%zu pred_q=%zu log_drop=%zu pred_drop=%zu log_schema_mismatch=%zu",
                 static_cast<int>(mode_),
                 static_cast<int>(execution_stage_),
@@ -5072,6 +5303,25 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                 static_cast<int>(last_verified_plan_.valid),
                 async_late_activation_accept_count_,
                 async_activation_deadline_miss_count_,
+                static_cast<unsigned long>(
+                    async_monitor_input_publish_count_.load(
+                        std::memory_order_relaxed)),
+                static_cast<unsigned long>(
+                    async_monitor_worker_processed_count_.load(
+                        std::memory_order_relaxed)),
+                static_cast<unsigned long>(
+                    async_monitor_output_consumed_count_.load(
+                        std::memory_order_relaxed)),
+                static_cast<unsigned long>(
+                    async_monitor_input_overwrite_count_.load(
+                        std::memory_order_relaxed)),
+                static_cast<unsigned long>(
+                    async_monitor_output_overwrite_count_.load(
+                        std::memory_order_relaxed)),
+                last_async_monitor_timing_.worker_queue_wait_ms,
+                last_async_monitor_timing_.worker_compute_ms,
+                last_async_monitor_timing_.output_handoff_ms,
+                last_async_monitor_timing_.end_to_end_ms,
                 control_log_writer_.queueDepth(),
                 prediction_log_writer_.queueDepth(),
                 control_log_writer_.droppedCount(),
@@ -5170,6 +5420,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<std::vector<double>>(
         "ee_collision_center_offset", std::vector<double>{0.0, 0.0, 0.0});
     auto_declare<bool>("async_safety_monitor", true);
+    auto_declare<int>("monitor_worker_cpu_affinity", -1);
+    auto_declare<int>("monitor_worker_realtime_priority", 0);
     auto_declare<double>("async_plan_max_age_sec", 0.02);
     auto_declare<int>("async_planning_lead_steps", 8);
     auto_declare<int>("async_verified_horizon_steps", 20);
@@ -5468,6 +5720,23 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
       ee_collision_center_offset_.setZero();
     }
     async_safety_monitor_ = get_node()->get_parameter("async_safety_monitor").as_bool();
+    monitor_worker_cpu_affinity_ = static_cast<int>(
+        get_node()->get_parameter("monitor_worker_cpu_affinity").as_int());
+    if (monitor_worker_cpu_affinity_ < -1) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "monitor_worker_cpu_affinity must be -1 or a non-negative CPU index. Disabling affinity.");
+      monitor_worker_cpu_affinity_ = -1;
+    }
+    const int max_realtime_priority =
+        std::max(0, sched_get_priority_max(SCHED_FIFO));
+    monitor_worker_realtime_priority_ = std::clamp(
+        static_cast<int>(get_node()
+                             ->get_parameter(
+                                 "monitor_worker_realtime_priority")
+                             .as_int()),
+        0,
+        max_realtime_priority);
     async_plan_max_age_sec_ =
         std::max(0.0, get_node()->get_parameter("async_plan_max_age_sec").as_double());
 
@@ -5503,6 +5772,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
             std::llround(std::max(monitor_update_period_sec_, local_replan_dt_) /
                          local_replan_dt_)));
     monitor_decimation_ = shield_intended_steps_;
+    monitor_period_control_cycles_ = static_cast<std::uint64_t>(
+        std::max(1, monitor_decimation_));
     async_planning_lead_steps_ = static_cast<std::size_t>(
         std::max<int64_t>(
             1,
@@ -5790,6 +6061,16 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   command_recording_active_ = false;
   control_log_column_mismatch_count_.store(0, std::memory_order_relaxed);
   control_update_sequence_ = 0;
+  next_async_monitor_control_sequence_ = 1;
+  last_async_input_publish_control_sequence_ = 0;
+  async_monitor_schedule_late_cycles_ = 0;
+  async_monitor_schedule_skipped_slots_ = 0;
+  async_monitor_input_publish_count_.store(0, std::memory_order_relaxed);
+  async_monitor_input_overwrite_count_.store(0, std::memory_order_relaxed);
+  async_monitor_worker_processed_count_.store(0, std::memory_order_relaxed);
+  async_monitor_output_overwrite_count_.store(0, std::memory_order_relaxed);
+  async_monitor_output_consumed_count_.store(0, std::memory_order_relaxed);
+  last_async_monitor_timing_ = AsyncMonitorTiming{};
   latest_mujoco_contact_value_.store(0.0);
   latest_mujoco_contact_msg_time_.store(-1.0);
   latest_mujoco_contact_active_.store(false);
@@ -5937,6 +6218,13 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "\n"
                     << "enable_safety_monitor: " << static_cast<int>(enable_safety_monitor_) << "\n"
                     << "async_safety_monitor: " << static_cast<int>(async_safety_monitor_) << "\n"
+                    << "monitor_schedule_source: control_loop_sequence\n"
+                    << "monitor_period_control_cycles: "
+                    << monitor_period_control_cycles_ << "\n"
+                    << "monitor_worker_cpu_affinity: "
+                    << monitor_worker_cpu_affinity_ << "\n"
+                    << "monitor_worker_realtime_priority: "
+                    << monitor_worker_realtime_priority_ << "\n"
                     << "async_plan_max_age_sec: " << async_plan_max_age_sec_ << "\n"
                     << "async_planning_lead_steps: "
                     << async_planning_lead_steps_ << "\n"
