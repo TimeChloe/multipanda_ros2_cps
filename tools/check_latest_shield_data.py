@@ -20,7 +20,14 @@ from statistics import mean
 VALIDATION_CSV = "reachable_cartesian_impedance_validation.csv"
 PREDICTION_CSV = "shield_prediction_trajectory.csv"
 
-FALLBACK_REASON_NAMES = {
+FALLBACK_REASON_NAMES_V3 = {
+    0: "none",
+    1: "no_verified_plan_available",
+    2: "candidate_prediction_rejected",
+    3: "async_output_unavailable",
+}
+
+FALLBACK_REASON_NAMES_LEGACY = {
     0: "none",
     1: "bootstrap_no_verified_plan",
     2: "candidate_predicted_unsafe",
@@ -112,6 +119,16 @@ def newest_complete_run(data_root: Path) -> Path:
             f"and {PREDICTION_CSV}."
         )
     return sorted(candidates)[-1]
+
+
+def state_log_schema(run_dir: Path) -> str:
+    run_info = run_dir / "run_info.txt"
+    if not run_info.is_file():
+        return "legacy"
+    for line in run_info.read_text().splitlines():
+        if line.startswith("state_log_schema:"):
+            return line.split(":", 1)[1].strip()
+    return "legacy"
 
 
 def to_float(row: dict[str, str], key: str, default: float = math.nan) -> float:
@@ -527,11 +544,16 @@ def summarize(
     stage: str,
     index: int,
 ) -> str:
+    schema = state_log_schema(run_dir)
+    fallback_reason_names = (
+        FALLBACK_REASON_NAMES_V3
+        if schema in {"orthogonal_execution_v3", "orthogonal_execution_v4"}
+        else FALLBACK_REASON_NAMES_LEGACY
+    )
     first_contact = first_time(validation_rows, "monitored_contact_possible")
     first_trigger = first_time(validation_rows, "predicted_trigger")
     first_failsafe = first_execution_stage_time(validation_rows, 2)
-    first_contact_verification_hold = first_execution_stage_time(validation_rows, 4)
-    first_contact_energy_intended = first_execution_stage_time(validation_rows, 5)
+    first_hold = first_execution_stage_time(validation_rows, 3)
     first_mujoco_contact = first_time(validation_rows, "mujoco_contact_active")
 
     errors_mm = finite_values([1000.0 * row["pred_error_pz"] for row in comparison])
@@ -546,6 +568,7 @@ def summarize(
 
     lines = [
         f"run_dir: {run_dir}",
+        f"state_log_schema: {schema}",
         f"validation_rows: {len(validation_rows)}",
         f"prediction_rows: {len(prediction_rows)}",
         f"comparison_stage: {stage}",
@@ -554,10 +577,7 @@ def summarize(
         f"first_monitored_contact_possible_sec: {first_contact}",
         f"first_predicted_trigger_sec: {first_trigger}",
         f"first_execution_stage_2_failsafe_sec: {first_failsafe}",
-        "first_execution_stage_4_contact_verification_hold_sec: "
-        f"{first_contact_verification_hold}",
-        "first_execution_stage_5_contact_energy_intended_sec: "
-        f"{first_contact_energy_intended}",
+        f"first_execution_stage_3_hold_sec: {first_hold}",
         f"first_mujoco_contact_active_sec: {first_mujoco_contact}",
         "max_monitored_cartesian_control_energy_ub_joule: "
         f"{max(monitored_energy_values) if monitored_energy_values else None}",
@@ -570,7 +590,7 @@ def summarize(
             if to_int(row, "fallback_reason") != 0
         )
         for reason, count in sorted(fallback_counts.items()):
-            reason_name = FALLBACK_REASON_NAMES.get(reason, f"unknown_{reason}")
+            reason_name = fallback_reason_names.get(reason, f"unknown_{reason}")
             lines.append(f"fallback_reason_{reason}_{reason_name}_rows: {count}")
 
     if validation_rows and "plan_failure_reason" in validation_rows[0]:
@@ -584,6 +604,9 @@ def summarize(
             lines.append(f"plan_failure_reason_{reason}_{reason_name}_rows: {count}")
 
     if validation_rows:
+        mode_counts = Counter(to_int(row, "mode") for row in validation_rows)
+        for mode_value, count in sorted(mode_counts.items()):
+            lines.append(f"mode_{mode_value}_rows: {count}")
         execution_stage_counts = Counter(
             execution_stage(row) for row in validation_rows
         )

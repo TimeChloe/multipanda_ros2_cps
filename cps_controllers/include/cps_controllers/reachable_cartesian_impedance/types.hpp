@@ -24,8 +24,11 @@ using Quaterniond = Eigen::Quaterniond;
 
 enum class SafetyMode
 {
-  // Orthogonal state encoded for compact logging:
-  //   contact-energy constraint inactive/active x nominal/fallback execution.
+  // Internal orthogonal state used to retain the last collision prediction:
+  //   predicted collision clear/possible x nominal/fallback execution.
+  // The external `mode` log deliberately collapses this to current-verified
+  // execution (0) versus fallback execution (1); collision possibility is
+  // logged separately.
   kNominal = 0,
   kLastVerifiedMonitored = 1,
   kNominalContactPossible = 2,
@@ -34,37 +37,31 @@ enum class SafetyMode
 
 enum class ExecutionStage
 {
-  // Actual command source. This is deliberately independent of SafetyMode.
-  kNominalVerified = 0,
+  // Actual command source. This is deliberately independent of SafetyMode and
+  // of every failure-reason field.
+  kCurrentVerified = 0,
   kLastVerifiedIntended = 1,
-  kFailsafe = 2,
-  kEnergyHold = 3,
-  kContactVerificationHold = 4,
-  // The latest path-consistent intended stream is deliberately executable
-  // inside the current workspace even when its predictive monitor result is
-  // rejected. The 1 kHz energy governor is the safety mechanism there.
-  kContactEnergyIntended = 5
+  kLastVerifiedFailsafe = 2,
+  kHold = 3
 };
 
 enum class FallbackReason
 {
-  // Why the current command stream could not remain nominal. This is kept
-  // separate from ExecutionStage: a single cause can first consume the
-  // last-verified intended prefix and only later reach its fail-safe tail.
+  // Mutually exclusive non-planning cause of fallback execution. Command
+  // source and intended/failsafe phase belong exclusively to ExecutionStage;
+  // candidate-generation failures belong exclusively to PlanFailureReason.
+  // kNone is valid for either a natural verified-failsafe transition or a
+  // nonzero PlanFailureReason.
   kNone = 0,
-  kBootstrapNoVerifiedPlan = 1,
-  kCandidatePredictedUnsafe = 2,
-  kPlannerOrPlanBuildFailure = 3,
-  kAsyncOutputStale = 4,
-  kSourcePlanGenerationMismatch = 5,
-  kActivationDeadlineMissed = 6,
-  kVerifiedIntendedExhausted = 7,
-  kEmergencyStopNoCommand = 8
+  kNoVerifiedPlanAvailable = 1,
+  kCandidatePredictionRejected = 2,
+  kAsyncOutputUnavailable = 3
 };
 
 enum class PlanFailureReason
 {
-  // Detailed reason behind FallbackReason::kPlannerOrPlanBuildFailure.
+  // Standalone, mutually exclusive reason that candidate generation failed.
+  // When this is nonzero, FallbackReason must be kNone.
   kNone = 0,
   kNoActivePath = 1,
   kMissingNominalPathState = 2,
@@ -85,7 +82,7 @@ inline bool isNominalSafetyMode(SafetyMode mode)
          mode == SafetyMode::kNominalContactPossible;
 }
 
-inline bool isContactEnergyMode(SafetyMode mode)
+inline bool isCollisionPossibleMode(SafetyMode mode)
 {
   return mode == SafetyMode::kNominalContactPossible ||
          mode == SafetyMode::kLastVerifiedContactPossible;
@@ -108,7 +105,6 @@ struct ShieldDecision
   bool candidate_verified{false};
   bool executing_last_verified_monitored{false};
   bool has_evaluated_plan{false};
-  bool has_contact_intended_plan{false};
   FallbackReason fallback_reason{FallbackReason::kNone};
   PlanFailureReason plan_failure_reason{PlanFailureReason::kNone};
 
@@ -118,10 +114,6 @@ struct ShieldDecision
   // Filled only when prediction logging is enabled. It is produced by the
   // same joint rollout that made the monitor decision.
   std::vector<JointPredictionSample> joint_prediction_trace;
-  // A path-consistent intended stream may still be valid when construction of
-  // the separate fail-safe reserve fails. It is executable only in measured
-  // contact, under the 1 kHz Cartesian energy governor.
-  VerifiedPlan contact_intended_plan;
   double monitor_total_ms{0.0};
   double planner_ms{0.0};
   double plan_build_ms{0.0};

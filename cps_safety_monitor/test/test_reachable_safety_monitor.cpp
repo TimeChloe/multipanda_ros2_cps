@@ -74,6 +74,8 @@ TEST(ReachableSafetyMonitor, RejectsTangentialAndRotationalCartesianEnergy) {
       config);
 
   EXPECT_TRUE(result.monitored_contact_possible);
+  EXPECT_GT(result.workspace_distance_now, 0.0);
+  EXPECT_FALSE(result.contact_relevant_for_energy);
   EXPECT_GT(result.worst_case_cartesian_kinetic_energy_ub,
             config.energy_budget_joule);
   EXPECT_GT(result.worst_case_cartesian_potential_energy_ub, 0.1);
@@ -82,6 +84,170 @@ TEST(ReachableSafetyMonitor, RejectsTangentialAndRotationalCartesianEnergy) {
                   result.worst_case_cartesian_potential_energy_ub,
               1.0e-9);
   EXPECT_TRUE(result.predicted_trigger);
+}
+
+TEST(ReachableSafetyMonitor,
+     CollisionPossibleWithinCartesianBudgetDoesNotTrigger) {
+  SafetyMonitorConfig config;
+  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
+  workspace_parameters.sphere_center = Vector3d::Zero();
+  workspace_parameters.motion_radius = 0.10;
+  workspace_parameters.hand_radius = 0.0;
+  config.human_workspace.setParameters(workspace_parameters);
+  config.ee_collision_radius = 0.04;
+  config.energy_budget_joule = 0.01;
+  config.energy_budget_margin_joule = 0.0;
+  config.tracking_acc_error_bound = 0.0;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.p = Vector3d(0.141, 0.0, 0.0);
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.t = 0.2;
+  plan.intended.push_back(sample);
+
+  Vector6d twist = Vector6d::Zero();
+  twist.x() = -0.01;
+  Matrix67d jacobian = Matrix67d::Zero();
+  jacobian.leftCols<6>() = Matrix6d::Identity();
+
+  const MonitorResult result = verifyReachablePlan(
+      plan,
+      plan.anchor.p,
+      plan.anchor.q,
+      twist,
+      Matrix7d::Identity(),
+      jacobian,
+      config);
+
+  EXPECT_GT(result.workspace_distance_now, 0.0);
+  EXPECT_TRUE(result.monitored_contact_possible);
+  EXPECT_FALSE(result.contact_relevant_for_energy);
+  EXPECT_GT(result.worst_case_cartesian_control_energy_ub, 0.0);
+  EXPECT_LT(result.worst_case_cartesian_control_energy_ub,
+            config.energy_budget_joule);
+  EXPECT_FALSE(result.collision_energy_unsafe);
+  EXPECT_FALSE(result.predicted_trigger);
+  EXPECT_FALSE(result.monitored_unsafe);
+}
+
+TEST(ReachableSafetyMonitor,
+     CurrentWorkspaceMembershipDoesNotBypassCartesianPrediction) {
+  SafetyMonitorConfig config;
+  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
+  workspace_parameters.sphere_center = Vector3d::Zero();
+  workspace_parameters.motion_radius = 0.10;
+  workspace_parameters.hand_radius = 0.0;
+  config.human_workspace.setParameters(workspace_parameters);
+  config.ee_collision_radius = 0.04;
+  config.energy_budget_joule = 0.01;
+  config.energy_budget_margin_joule = 0.0;
+  config.tracking_acc_error_bound = 0.0;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.p = Vector3d(0.13, 0.0, 0.0);
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.t = 0.01;
+  plan.intended.push_back(sample);
+
+  Vector6d twist = Vector6d::Zero();
+  twist.x() = 1.0;
+  Matrix67d jacobian = Matrix67d::Zero();
+  jacobian.leftCols<6>() = Matrix6d::Identity();
+
+  const MonitorResult result = verifyReachablePlan(
+      plan,
+      plan.anchor.p,
+      plan.anchor.q,
+      twist,
+      Matrix7d::Identity(),
+      jacobian,
+      config);
+
+  EXPECT_TRUE(result.contact_relevant_for_energy);
+  EXPECT_LT(result.workspace_distance_now, 0.0);
+  EXPECT_TRUE(result.monitored_contact_possible);
+  EXPECT_GT(result.worst_case_cartesian_control_energy_ub,
+            config.energy_budget_joule);
+  EXPECT_TRUE(result.predicted_trigger);
+}
+
+TEST(ReachableSafetyMonitor,
+     CurrentWorkspaceMembershipDoesNotBypassJointPrediction) {
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
+  workspace_parameters.sphere_center = Vector3d::Zero();
+  workspace_parameters.motion_radius = 0.10;
+  workspace_parameters.hand_radius = 0.0;
+  config.human_workspace.setParameters(workspace_parameters);
+  config.ee_collision_radius = 0.04;
+  config.energy_budget_joule = 0.01;
+  config.energy_budget_margin_joule = 0.0;
+  config.tracking_acc_error_bound = 0.0;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.t = 0.01;
+  plan.intended.push_back(sample);
+
+  Vector7d dq = Vector7d::Zero();
+  dq(0) = 1.0;
+  const MonitorResult result = verifyReachablePlanJointSpace(
+      plan,
+      Vector7d::Zero(),
+      dq,
+      dynamics,
+      config);
+
+  EXPECT_TRUE(result.contact_relevant_for_energy);
+  EXPECT_LT(result.workspace_distance_now, 0.0);
+  EXPECT_TRUE(result.monitored_contact_possible);
+  EXPECT_GT(result.worst_case_total_control_energy_ub,
+            config.energy_budget_joule);
+  EXPECT_TRUE(result.predicted_trigger);
+}
+
+TEST(ReachableSafetyMonitor,
+     CollisionPossibleWithinJointEnergyBudgetDoesNotTrigger) {
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
+  workspace_parameters.sphere_center = Vector3d::Zero();
+  workspace_parameters.motion_radius = 0.10;
+  workspace_parameters.hand_radius = 0.0;
+  config.human_workspace.setParameters(workspace_parameters);
+  config.ee_collision_radius = 0.04;
+  config.energy_budget_joule = 0.01;
+  config.energy_budget_margin_joule = 0.0;
+  config.tracking_acc_error_bound = 0.0;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.t = 0.01;
+  plan.intended.push_back(sample);
+
+  const MonitorResult result = verifyReachablePlanJointSpace(
+      plan,
+      Vector7d::Zero(),
+      Vector7d::Zero(),
+      dynamics,
+      config);
+
+  EXPECT_TRUE(result.monitored_contact_possible);
+  EXPECT_LE(result.worst_case_total_control_energy_ub,
+            config.energy_budget_joule);
+  EXPECT_FALSE(result.collision_energy_unsafe);
+  EXPECT_FALSE(result.joint_limit_unsafe);
+  EXPECT_FALSE(result.predicted_trigger);
+  EXPECT_FALSE(result.monitored_unsafe);
 }
 
 TEST(ReachableSafetyMonitor, UsesExecutedCommandForCurrentPotentialEnergy) {

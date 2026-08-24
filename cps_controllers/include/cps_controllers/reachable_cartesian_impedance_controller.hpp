@@ -377,11 +377,6 @@ class ReachableCartesianImpedanceController
       std::size_t offset,
       ImpedanceSample* command) const;
 
-  bool getContactIntendedCommandAtOffset(
-      std::uint64_t control_loop_sequence,
-      std::size_t offset,
-      ImpedanceSample* command) const;
-
   bool isOneStepCommandTransitionContinuous(
       const ImpedanceSample& previous,
       const ImpedanceSample& next,
@@ -391,16 +386,13 @@ class ReachableCartesianImpedanceController
       VerifiedPlan* plan,
       std::size_t elapsed_control_steps) const;
 
-  Matrix6d computeDampingFromStiffness(
-      const Matrix6d& K,
-      double pos_damping_scale,
-      double rot_damping_scale) const;
-
   struct CartesianEnergyBudgetInfo {
     bool active{false};
     bool lambda_valid{false};
     double scale{1.0};
     double kinetic_energy{0.0};
+    double potential_energy_before_scaling{0.0};
+    double total_energy_before_scaling{0.0};
     double potential_energy{0.0};
     double total_energy{0.0};
   };
@@ -416,8 +408,6 @@ class ReachableCartesianImpedanceController
                           const Matrix67d& J_geo,
                           Matrix6d* lambda) const;
 
-  ImpedanceSample makeEffectiveTimeHoldSample(
-      const ImpedanceSample& command) const;
   double cartesianEnergyScaleFloor(const Matrix6d& K_reference) const;
 
   ImpedanceSample applyCartesianEnergyBudget(
@@ -492,17 +482,17 @@ class ReachableCartesianImpedanceController
   bool nullspace_home_pose_valid_{false};
 
   SafetyMode mode_{SafetyMode::kNominal};
-  ExecutionStage execution_stage_{ExecutionStage::kNominalVerified};
+  ExecutionStage execution_stage_{ExecutionStage::kCurrentVerified};
   FallbackReason fallback_reason_{FallbackReason::kNone};
   PlanFailureReason plan_failure_reason_{PlanFailureReason::kNone};
   double failsafe_start_time_sec_{-1.0};
   double failsafe_enter_wall_time_sec_{-1.0};
   double paused_nominal_time_sec_{0.0};
 
-  Matrix6d K_nominal_{Matrix6d::Zero()};
-  Matrix6d D_nominal_{Matrix6d::Zero()};
-  Matrix6d K_f_target_{Matrix6d::Zero()};
-  Matrix6d D_f_target_{Matrix6d::Zero()};
+  // The single configured Cartesian gain set before optional runtime
+  // energy-budget scaling.
+  Matrix6d K_base_{Matrix6d::Zero()};
+  Matrix6d D_base_{Matrix6d::Zero()};
   Matrix6d K_runtime_{Matrix6d::Zero()};
   Matrix6d D_runtime_{Matrix6d::Zero()};
 
@@ -626,14 +616,6 @@ class ReachableCartesianImpedanceController
   int last_verified_command_stage_{0};
   std::size_t last_verified_command_index_{0};
 
-  // Latest path-consistent intended trajectory produced by the async worker.
-  // It is separate from last_verified_plan_: an energy-unsafe prediction may
-  // be executed only while the measured EE is currently inside the workspace,
-  // whereas last_verified_plan_ remains the safe reserve for leaving it.
-  VerifiedPlan contact_intended_plan_{};
-  std::uint64_t contact_intended_input_control_sequence_{0};
-  double contact_intended_input_wall_time_{-1.0};
-
   // Last command actually sent to impedance controller.
   // Used as replanning start position to avoid discontinuous replans
   // from noisy or lagged measured EE position.
@@ -682,38 +664,10 @@ class ReachableCartesianImpedanceController
   bool last_cartesian_energy_budget_lambda_valid_{false};
   double last_cartesian_energy_scale_{1.0};
   double last_joint_kinetic_energy_{0.0};
+  double last_cartesian_potential_energy_before_scaling_{0.0};
+  double last_cartesian_control_energy_before_scaling_{0.0};
   double last_cartesian_potential_energy_{0.0};
   double last_cartesian_control_energy_{0.0};
-  bool cartesian_effective_time_frozen_{false};
-  bool contact_verification_hold_active_{false};
-  FallbackReason contact_verification_hold_reason_{FallbackReason::kNone};
-  PlanFailureReason contact_verification_hold_plan_failure_reason_{
-      PlanFailureReason::kNone};
-  double cartesian_effective_time_freeze_start_wall_time_{-1.0};
-  ImpedanceSample cartesian_effective_time_hold_sample_{};
-  bool cartesian_effective_time_hold_sample_valid_{false};
-  // Fixed-size state used by the 1 kHz loop to project the measured TCP twist
-  // onto the original path tangent while an energy hold is active. No path
-  // search, allocation, or mutex is needed in the real-time loop.
-  Vector3d cartesian_energy_hold_dp_ds_{Vector3d::Zero()};
-  Vector3d cartesian_energy_hold_w_ds_{Vector3d::Zero()};
-  bool cartesian_energy_hold_tangent_valid_{false};
-  // The nominal replanner is anchored at the last command position, while its
-  // scalar path velocity and acceleration come from the measured TCP motion.
-  // These states deliberately contain no energy-budget information.
-  double measured_path_rate_{0.0};
-  bool measured_path_rate_valid_{false};
-  double measured_path_acceleration_{0.0};
-  bool measured_path_acceleration_valid_{false};
-  // Preserve the monitor state that caused the Lachner energy hold. The
-  // controller remains in mode 2 until a newly verified candidate explicitly
-  // proves that the robot has left the human workspace.
-  MonitorResult cartesian_effective_time_hold_monitor_{};
-  double contact_activation_margin_{0.0};
-  double failsafe_min_pos_stiffness_{5.0};
-
-  double failsafe_pos_damping_scale_{2.5};
-  double failsafe_rot_damping_scale_{2.5};
 };
 
 }  // namespace cps_controllers

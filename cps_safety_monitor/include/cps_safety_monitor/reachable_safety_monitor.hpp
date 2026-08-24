@@ -68,9 +68,14 @@ class JointDynamicsProvider {
 
 struct MonitorResult {
   bool monitored_contact_possible{false};
+  // Current measured collision geometry overlaps the human workspace. This is
+  // the runtime Cartesian energy-budget gate; predicted contact remains a
+  // separate candidate-verification input in monitored_contact_possible.
   bool contact_relevant_for_energy{false};
   bool monitored_unsafe{false};
-  // Current monitored trajectory failed future-contact verification.
+  // Predicted collision energy exceeds the configured budget, or a predicted
+  // joint-limit violation was found. A collision possibility that remains
+  // within the energy budget does not trigger candidate rejection.
   bool predicted_trigger{false};
 
   double workspace_distance_now{0.0};
@@ -89,7 +94,6 @@ struct MonitorResult {
   double worst_case_total_control_energy_ub{0.0};
 
   double workspace_distance_margin{0.0};
-  double h_monitored_energy{0.0};
 
   double current_cartesian_kinetic_energy{0.0};
   double current_cartesian_potential_energy{0.0};
@@ -111,7 +115,6 @@ struct MonitorResult {
   double joint_torque_violation{0.0};
 
   double terminal_energy_ub{0.0};
-  double h_terminal_energy{std::numeric_limits<double>::infinity()};
 };
 
 struct ImpedanceSample {
@@ -177,7 +180,6 @@ struct SafetyMonitorConfig {
   double energy_budget_joule{0.05};
   double energy_budget_margin_joule{0.005};
   double ee_collision_radius{0.04};
-  double contact_activation_margin{0.0};
   double tracking_acc_error_bound{0.2};
   double joint_velocity_error_bound{0.0};
   bool use_dynamic_consistent_impedance{true};

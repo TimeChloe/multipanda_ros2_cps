@@ -219,14 +219,9 @@ reachable_cartesian_impedance_controller:
     # type of an empty YAML sequence here.
     # cartesian_via_points: []
 
-    nominal_pos_stiffness: 1500.0
-    nominal_rot_stiffness: 500.0
-
-    # Failsafe 建议比 nominal 更软，但阻尼更大，用于安全吸收动能。
-    failsafe_pos_stiffness: 1500.0
-    failsafe_rot_stiffness: 500.0
-    failsafe_pos_damping_scale: 0.8
-    failsafe_rot_damping_scale: 0.8
+    # The single Cartesian gain set before runtime energy-budget scaling.
+    pos_stiffness: 1500.0
+    rot_stiffness: 500.0
 
     n_stiffness: 20.0
     # Panda home/ready joint pose used as the nullspace reference when
@@ -243,15 +238,13 @@ reachable_cartesian_impedance_controller:
 
     enable_safety_monitor: true
 
-    energy_budget_joule: 0.05
+    energy_budget_joule: 0.12
     energy_budget_margin_joule: 0.000
     cartesian_energy_min_pos_stiffness: 0.0
     cartesian_energy_lambda_update_period_sec: 0.001
     # Lachner Eq. (9a): modal Cartesian damping ratio used with the current
     # task inertia and the energy-scaled 6D stiffness matrix.
     cartesian_energy_damping_ratio: 0.8
-    contact_activation_margin: 0.00
-
 
     # Collision model for the safety monitor:
     # center = metal ball center = panda_link8 + [0, 0, 0.03].

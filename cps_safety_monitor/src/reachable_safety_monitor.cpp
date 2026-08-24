@@ -360,12 +360,12 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
       std::max(0.0, config.energy_budget_joule -
                         config.energy_budget_margin_joule);
 
-  // SARA/PFL-style split: future predicted interaction is verified on the
-  // monitored trajectory; actual current interaction is handled by the Cartesian
-  // energy budget instead of rejecting the trajectory here.
+  // Keep runtime energy adaptation orthogonal to candidate verification:
+  // current geometry gates the runtime stiffness budget, while any predicted
+  // contact in the complete monitored trajectory is still energy-verified.
   out.contact_relevant_for_energy = out.workspace_distance_now <= 0.0;
   const bool predicted_contact_requires_verification =
-      out.monitored_contact_possible && !out.contact_relevant_for_energy;
+      out.monitored_contact_possible;
 
   const bool current_collision_energy_unsafe =
       out.contact_relevant_for_energy &&
@@ -376,16 +376,6 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
       out.worst_case_cartesian_control_energy_ub > energy_budget_eff;
 
   out.predicted_trigger = predicted_contact_energy_unsafe;
-
-  const double monitored_contact_energy_ub =
-      std::max(out.worst_case_cartesian_control_energy_ub,
-               out.contact_relevant_for_energy
-                       && out.current_cartesian_energy_valid
-                   ? out.current_cartesian_control_energy
-                   : 0.0);
-
-  out.h_monitored_energy = energy_budget_eff - monitored_contact_energy_ub;
-  out.h_terminal_energy = energy_budget_eff - out.terminal_energy_ub;
 
   out.collision_energy_unsafe =
       current_collision_energy_unsafe || predicted_contact_energy_unsafe;
@@ -825,13 +815,16 @@ MonitorResult verifyReachablePlanJointSpace(
   out.workspace_distance_margin = out.workspace_distance_min;
   out.terminal_energy_ub =
       terminal_sample_found ? terminal_total_energy : 0.0;
+  // Keep runtime energy adaptation orthogonal to candidate verification:
+  // current geometry gates the runtime stiffness budget, while any predicted
+  // contact in the complete monitored trajectory is still energy-verified.
   out.contact_relevant_for_energy = out.workspace_distance_now <= 0.0;
 
   const double energy_budget_eff = std::max(
       0.0,
       config.energy_budget_joule - config.energy_budget_margin_joule);
   const bool predicted_contact_requires_verification =
-      out.monitored_contact_possible && !out.contact_relevant_for_energy;
+      out.monitored_contact_possible;
   const bool current_collision_energy_unsafe =
       out.contact_relevant_for_energy &&
       out.current_joint_energy_valid &&
@@ -842,14 +835,6 @@ MonitorResult verifyReachablePlanJointSpace(
 
   out.predicted_trigger =
       predicted_contact_energy_unsafe || out.joint_limit_unsafe;
-  const double monitored_contact_energy_ub = std::max(
-      total_contact_energy_max,
-      out.contact_relevant_for_energy && out.current_joint_energy_valid
-          ? out.current_total_control_energy
-          : 0.0);
-  out.h_monitored_energy =
-      energy_budget_eff - monitored_contact_energy_ub;
-  out.h_terminal_energy = energy_budget_eff - out.terminal_energy_ub;
   out.collision_energy_unsafe =
       current_collision_energy_unsafe || predicted_contact_energy_unsafe;
   out.monitored_unsafe =

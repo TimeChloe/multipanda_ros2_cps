@@ -249,29 +249,12 @@ void ReachableCartesianImpedanceController::resetViaPointExecutionState(
   ++last_verified_plan_generation_;
   last_verified_command_stage_ = 0;
   last_verified_command_index_ = 0;
-  contact_intended_plan_ = VerifiedPlan{};
-  contact_intended_input_control_sequence_ = 0;
-  contact_intended_input_wall_time_ = -1.0;
   last_shield_decision_valid_ = false;
   last_async_output_valid_ = false;
   last_async_output_wall_time_ = -1.0;
   // Start a fresh monitor phase immediately for the new trajectory without
   // depending on ROS/simulation wall time.
   next_async_monitor_control_sequence_ = control_update_sequence_;
-  cartesian_effective_time_frozen_ = false;
-  contact_verification_hold_active_ = false;
-  contact_verification_hold_reason_ = FallbackReason::kNone;
-  cartesian_effective_time_freeze_start_wall_time_ = -1.0;
-  cartesian_effective_time_hold_sample_valid_ = false;
-  cartesian_energy_hold_dp_ds_.setZero();
-  cartesian_energy_hold_w_ds_.setZero();
-  cartesian_energy_hold_tangent_valid_ = false;
-  measured_path_rate_ = 0.0;
-  measured_path_rate_valid_ = false;
-  measured_path_acceleration_ = 0.0;
-  measured_path_acceleration_valid_ = false;
-  cartesian_effective_time_hold_monitor_ = MonitorResult{};
-
   {
     std::lock_guard<std::mutex> input_lock(async_input_mutex_);
     async_input_pending_ = false;
@@ -286,8 +269,8 @@ void ReachableCartesianImpedanceController::resetViaPointExecutionState(
   last_commanded_sample_.q = normalizedQuaternionOrIdentity(current_orientation);
   last_commanded_sample_.w.setZero();
   last_commanded_sample_.dw.setZero();
-  last_commanded_sample_.K = K_nominal_;
-  last_commanded_sample_.D = D_nominal_;
+  last_commanded_sample_.K = K_base_;
+  last_commanded_sample_.D = D_base_;
   last_commanded_sample_.failsafe = false;
   last_commanded_sample_valid_ = true;
   bool active_path_available = false;
@@ -383,8 +366,7 @@ void ReachableCartesianImpedanceController::updateCartesianViaPointsActionStatus
 
   const bool path_finished =
     commanded_path_time_ >= path_duration - kMinDt &&
-    isNominalSafetyMode(mode_) &&
-    !cartesian_effective_time_frozen_;
+    isNominalSafetyMode(mode_);
   if (!path_finished) {
     return;
   }
