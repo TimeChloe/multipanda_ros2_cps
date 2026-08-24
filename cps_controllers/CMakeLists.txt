@@ -46,7 +46,9 @@ pluginlib_export_plugin_description_file(
 add_library(${PROJECT_NAME} SHARED
   src/joint_impedance_energybudget_controller.cpp
   src/nonlinear_impedance_controller.cpp
+  src/reachable_cartesian_impedance/async.cpp
   src/reachable_cartesian_impedance_controller.cpp
+  src/reachable_cartesian_impedance/logging.cpp
   src/free_motion_external_wrench_controller.cpp
 )
 
@@ -120,10 +122,16 @@ ament_export_dependencies(
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  ament_add_gtest(test_latest_value_mailbox
+    test/test_latest_value_mailbox.cpp
+  )
+  target_include_directories(test_latest_value_mailbox PRIVATE include)
 endif()
 
 ament_package()

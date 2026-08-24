@@ -187,6 +187,61 @@ class FrankaRobotModel
     return robot_model->zeroJacobian(frame, *robot_state);
   }
 
+  /** Return true when arbitrary predicted q/dq can be evaluated by this backend. */
+  bool supportsStateDependentEvaluation() {
+    if (!initialized) {
+      initialize();
+    }
+    return robot_model != nullptr &&
+           robot_model->supportsStateDependentEvaluation();
+  }
+
+  /** Model quantities at an explicit predicted state, with the live robot load calibration. */
+  std::array<double, 16> getPoseMatrix(
+      const franka::Frame& frame,
+      const std::array<double, 7>& q,
+      const std::array<double, 16>& F_T_EE,
+      const std::array<double, 16>& EE_T_K) {
+    if (!initialized) {
+      initialize();
+    }
+    return robot_model->pose(frame, q, F_T_EE, EE_T_K);
+  }
+
+  std::array<double, 42> getZeroJacobian(
+      const franka::Frame& frame,
+      const std::array<double, 7>& q,
+      const std::array<double, 16>& F_T_EE,
+      const std::array<double, 16>& EE_T_K) {
+    if (!initialized) {
+      initialize();
+    }
+    return robot_model->zeroJacobian(frame, q, F_T_EE, EE_T_K);
+  }
+
+  std::array<double, 49> getMassMatrix(
+      const std::array<double, 7>& q,
+      const std::array<double, 9>& I_total,
+      double m_total,
+      const std::array<double, 3>& F_x_Ctotal) {
+    if (!initialized) {
+      initialize();
+    }
+    return robot_model->mass(q, I_total, m_total, F_x_Ctotal);
+  }
+
+  std::array<double, 7> getCoriolisForceVector(
+      const std::array<double, 7>& q,
+      const std::array<double, 7>& dq,
+      const std::array<double, 9>& I_total,
+      double m_total,
+      const std::array<double, 3>& F_x_Ctotal) {
+    if (!initialized) {
+      initialize();
+    }
+    return robot_model->coriolis(q, dq, I_total, m_total, F_x_Ctotal);
+  }
+
   franka::RobotState* getRobotState(){
     // try combining state into this too
     if (!initialized){

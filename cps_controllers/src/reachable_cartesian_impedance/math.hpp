@@ -1,3 +1,4 @@
+// Private math helpers for the reachable Cartesian impedance implementation.
 #pragma once
 
 #include <array>
@@ -36,6 +37,16 @@ inline Vector3d computeOrientationError(const Quaterniond& current,
   const Quaterniond q_err(q_curr * q_des.inverse());
   Eigen::AngleAxisd aa(q_err);
   return aa.axis() * aa.angle();
+}
+
+inline Quaterniond normalizedQuaternionOrIdentity(const Quaterniond& input) {
+  Quaterniond normalized = input;
+  const double norm = normalized.norm();
+  if (!std::isfinite(norm) || norm < 1.0e-12) {
+    return Quaterniond::Identity();
+  }
+  normalized.coeffs() /= norm;
+  return normalized;
 }
 
 inline Matrix7d arrayToMatrix7d(const std::array<double, 49>& data) {

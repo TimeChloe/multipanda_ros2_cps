@@ -2,7 +2,7 @@
 <!-- =================================================================================== -->
 <!-- |    This file is based on panda_arm_sim.urdf.xacro and augmented with inertial     | -->
 <!-- |    parameters converted from panda_ng.xml (MuJoCo MJCF) for panda_link0-7.        | -->
-<!-- |    panda_link8 is kept as a massless flange, matching the provided panda_ng.xml.  | -->
+<!-- |    panda_link8 is a massless flange. End-effectors are attached from tool.yaml.   | -->
 <!-- =================================================================================== -->
 <robot name="panda">
   <!-- initial joint positions of the robot -->

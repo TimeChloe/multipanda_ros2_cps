@@ -12,6 +12,7 @@ class IdentityJointDynamicsProvider final : public JointDynamicsProvider {
   bool evaluate(const Vector7d& q,
                 const Vector7d& dq,
                 JointDynamicsSample* sample) const override {
+    ++evaluate_count_;
     (void)q;
     (void)dq;
     if (sample == nullptr) {
@@ -31,6 +32,7 @@ class IdentityJointDynamicsProvider final : public JointDynamicsProvider {
   JointDynamicsLimits limits() const override { return limits_; }
 
   JointDynamicsLimits limits_;
+  mutable int evaluate_count_{0};
 };
 
 TEST(ReachableSafetyMonitor, RejectsTangentialAndRotationalCartesianEnergy) {
@@ -137,6 +139,31 @@ TEST(ReachableSafetyMonitor, JointEnergyIncludesNullspaceMotion) {
   EXPECT_NEAR(result.current_joint_kinetic_energy, 0.5, 1.0e-12);
   EXPECT_NEAR(result.current_cartesian_kinetic_energy, 0.0, 1.0e-12);
   EXPECT_NEAR(result.current_total_control_energy, 0.5, 1.0e-12);
+}
+
+TEST(ReachableSafetyMonitor, UsesLiveDynamicsForInitialJointState) {
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  config.current_joint_dynamics_valid = true;
+  config.current_joint_dynamics.valid = true;
+  config.current_joint_dynamics.control_orientation =
+      Quaterniond::Identity();
+  config.current_joint_dynamics.control_jacobian.setZero();
+  config.current_joint_dynamics.control_jacobian.leftCols<6>() =
+      Matrix6d::Identity();
+  config.current_joint_dynamics.inertia = 2.0 * Matrix7d::Identity();
+  config.current_energy_reference_valid = true;
+  config.current_energy_reference.q = Quaterniond::Identity();
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  const Vector7d dq = Vector7d::Ones();
+  const MonitorResult result = verifyReachablePlanJointSpace(
+      plan, Vector7d::Zero(), dq, dynamics, config);
+
+  EXPECT_EQ(dynamics.evaluate_count_, 0);
+  EXPECT_TRUE(result.current_joint_energy_valid);
+  EXPECT_NEAR(result.current_joint_kinetic_energy, 7.0, 1.0e-12);
 }
 
 TEST(ReachableSafetyMonitor, DisablesNullspaceTorqueDuringFailsafeWhenRequested) {

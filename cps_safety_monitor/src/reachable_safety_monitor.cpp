@@ -472,8 +472,12 @@ MonitorResult verifyReachablePlanJointSpace(
   Vector7d q_pred = current_q;
   Vector7d dq_pred = current_dq;
   JointDynamicsSample state;
-  if (!q_pred.allFinite() || !dq_pred.allFinite() ||
-      !dynamics.evaluate(q_pred, dq_pred, &state) || !state.valid) {
+  if (config.current_joint_dynamics_valid) {
+    state = config.current_joint_dynamics;
+  } else if (!dynamics.evaluate(q_pred, dq_pred, &state)) {
+    state.valid = false;
+  }
+  if (!q_pred.allFinite() || !dq_pred.allFinite() || !state.valid) {
     out.monitored_unsafe = true;
     out.joint_limit_unsafe = true;
     return out;
@@ -758,6 +762,17 @@ MonitorResult verifyReachablePlanJointSpace(
         u * end.nominal_path_time;
     sample.nominal_path_time_valid =
         start.nominal_path_time_valid && end.nominal_path_time_valid;
+    sample.nominal_path_kinematics_valid =
+        start.nominal_path_kinematics_valid &&
+        end.nominal_path_kinematics_valid;
+    if (sample.nominal_path_kinematics_valid) {
+      sample.nominal_path_rate =
+          (1.0 - u) * start.nominal_path_rate +
+          u * end.nominal_path_rate;
+      sample.nominal_path_acceleration =
+          (1.0 - u) * start.nominal_path_acceleration +
+          u * end.nominal_path_acceleration;
+    }
     sample.p = (1.0 - u) * start.p + u * end.p;
     sample.dp = (1.0 - u) * start.dp + u * end.dp;
     sample.ddp = (1.0 - u) * start.ddp + u * end.ddp;

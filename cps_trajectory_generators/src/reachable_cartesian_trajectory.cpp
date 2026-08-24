@@ -105,14 +105,263 @@ Eigen::Vector3d rotationVectorBetween(
   return quaternionToRotationVector(q_to * q_from.conjugate());
 }
 
-Eigen::Vector3d clampVectorComponents(
-    const Eigen::Vector3d& v,
+struct So3LeftJacobianCoefficients {
+  double a{0.5};
+  double b{1.0 / 6.0};
+  double da_dx{-1.0 / 24.0};
+  double db_dx{-1.0 / 120.0};
+  double d2a_dx2{1.0 / 360.0};
+  double d2b_dx2{1.0 / 2520.0};
+};
+
+So3LeftJacobianCoefficients so3LeftJacobianCoefficients(
+    double angle_squared) {
+  const double x = std::max(angle_squared, 0.0);
+  So3LeftJacobianCoefficients out;
+
+  // Express the coefficients as functions of x = |r|^2.  This avoids the
+  // undefined derivatives of |r| at r = 0 and gives a stable series for the
+  // small-angle region where the closed forms suffer cancellation.
+  if (x < 1.0e-4) {
+    const double x2 = x * x;
+    const double x3 = x2 * x;
+    const double x4 = x3 * x;
+    out.a =
+        0.5 - x / 24.0 + x2 / 720.0 - x3 / 40320.0 + x4 / 3628800.0;
+    out.b =
+        1.0 / 6.0 - x / 120.0 + x2 / 5040.0 - x3 / 362880.0 +
+        x4 / 39916800.0;
+    out.da_dx =
+        -1.0 / 24.0 + x / 360.0 - x2 / 13440.0 + x3 / 907200.0;
+    out.db_dx =
+        -1.0 / 120.0 + x / 2520.0 - x2 / 120960.0 +
+        x3 / 9979200.0;
+    out.d2a_dx2 =
+        1.0 / 360.0 - x / 6720.0 + x2 / 302400.0;
+    out.d2b_dx2 =
+        1.0 / 2520.0 - x / 60480.0 + x2 / 3326400.0;
+    return out;
+  }
+
+  const double angle = std::sqrt(x);
+  const double sine = std::sin(angle);
+  const double cosine = std::cos(angle);
+  const double angle2 = x;
+  const double angle3 = angle2 * angle;
+  const double angle4 = angle2 * angle2;
+  const double angle5 = angle4 * angle;
+
+  out.a = (1.0 - cosine) / angle2;
+  out.b = (angle - sine) / angle3;
+
+  const double da_dangle =
+      (angle * sine - 2.0 * (1.0 - cosine)) / angle3;
+  const double db_dangle =
+      (3.0 * sine - 2.0 * angle - angle * cosine) / angle4;
+  const double d2a_dangle2 =
+      (angle2 * cosine - 4.0 * angle * sine +
+       6.0 * (1.0 - cosine)) /
+      angle4;
+  const double d2b_dangle2 =
+      (angle2 * sine - 12.0 * sine +
+       6.0 * angle * (1.0 + cosine)) /
+      angle5;
+
+  out.da_dx = da_dangle / (2.0 * angle);
+  out.db_dx = db_dangle / (2.0 * angle);
+  out.d2a_dx2 =
+      d2a_dangle2 / (4.0 * angle2) -
+      da_dangle / (4.0 * angle3);
+  out.d2b_dx2 =
+      d2b_dangle2 / (4.0 * angle2) -
+      db_dangle / (4.0 * angle3);
+  return out;
+}
+
+Eigen::Matrix3d so3LeftJacobian(const Eigen::Vector3d& rotation_vector) {
+  const So3LeftJacobianCoefficients coefficients =
+      so3LeftJacobianCoefficients(rotation_vector.squaredNorm());
+  Eigen::Matrix3d cross_matrix;
+  cross_matrix <<
+      0.0, -rotation_vector.z(), rotation_vector.y(),
+      rotation_vector.z(), 0.0, -rotation_vector.x(),
+      -rotation_vector.y(), rotation_vector.x(), 0.0;
+  return Eigen::Matrix3d::Identity() +
+         coefficients.a * cross_matrix +
+         coefficients.b * cross_matrix * cross_matrix;
+}
+
+struct So3AngularPathDerivatives {
+  // For R(s) = Exp(r(s)) R_ref in world coordinates:
+  //   omega = omega_ds * s_dot
+  //   alpha = domega_ds2 * s_dot^2 + omega_ds * s_ddot
+  //   jerk  = d2omega_ds3 * s_dot^3
+  //          + 3 domega_ds2 * s_dot * s_ddot + omega_ds * s_jerk.
+  Eigen::Vector3d omega_ds{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d domega_ds2{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d d2omega_ds3{Eigen::Vector3d::Zero()};
+};
+
+So3AngularPathDerivatives rotationVectorToWorldAngularPathDerivatives(
+    const Eigen::Vector3d& rotation_vector,
+    const Eigen::Vector3d& dr_ds,
+    const Eigen::Vector3d& d2r_ds2,
+    const Eigen::Vector3d& d3r_ds3) {
+  const double x = rotation_vector.squaredNorm();
+  const So3LeftJacobianCoefficients coefficients =
+      so3LeftJacobianCoefficients(x);
+  const double dx_ds = 2.0 * rotation_vector.dot(dr_ds);
+  const double d2x_ds2 =
+      2.0 * (dr_ds.squaredNorm() + rotation_vector.dot(d2r_ds2));
+  const double da_ds = coefficients.da_dx * dx_ds;
+  const double db_ds = coefficients.db_dx * dx_ds;
+  const double d2a_ds2 =
+      coefficients.d2a_dx2 * dx_ds * dx_ds +
+      coefficients.da_dx * d2x_ds2;
+  const double d2b_ds2 =
+      coefficients.d2b_dx2 * dx_ds * dx_ds +
+      coefficients.db_dx * d2x_ds2;
+
+  const Eigen::Vector3d cross_1 = rotation_vector.cross(dr_ds);
+  const Eigen::Vector3d dcross_1_ds =
+      rotation_vector.cross(d2r_ds2);
+  const Eigen::Vector3d d2cross_1_ds2 =
+      dr_ds.cross(d2r_ds2) +
+      rotation_vector.cross(d3r_ds3);
+
+  const Eigen::Vector3d cross_2 = rotation_vector.cross(cross_1);
+  const Eigen::Vector3d dcross_2_ds =
+      dr_ds.cross(cross_1) +
+      rotation_vector.cross(dcross_1_ds);
+  const Eigen::Vector3d d2cross_2_ds2 =
+      d2r_ds2.cross(cross_1) +
+      2.0 * dr_ds.cross(dcross_1_ds) +
+      rotation_vector.cross(d2cross_1_ds2);
+
+  So3AngularPathDerivatives out;
+  out.omega_ds =
+      dr_ds + coefficients.a * cross_1 + coefficients.b * cross_2;
+  out.domega_ds2 =
+      d2r_ds2 + da_ds * cross_1 +
+      coefficients.a * dcross_1_ds + db_ds * cross_2 +
+      coefficients.b * dcross_2_ds;
+  out.d2omega_ds3 =
+      d3r_ds3 + d2a_ds2 * cross_1 +
+      2.0 * da_ds * dcross_1_ds +
+      coefficients.a * d2cross_1_ds2 + d2b_ds2 * cross_2 +
+      2.0 * db_ds * dcross_2_ds +
+      coefficients.b * d2cross_2_ds2;
+  return out;
+}
+
+bool worldAngularAccelerationToRotationVectorAcceleration(
+    const Eigen::Vector3d& rotation_vector,
+    const Eigen::Vector3d& rotation_vector_velocity,
+    const Eigen::Vector3d& angular_acceleration,
+    Eigen::Vector3d* rotation_vector_acceleration) {
+  if (rotation_vector_acceleration == nullptr ||
+      !rotation_vector.allFinite() ||
+      !rotation_vector_velocity.allFinite() ||
+      !angular_acceleration.allFinite()) {
+    return false;
+  }
+
+  const Eigen::Matrix3d left_jacobian = so3LeftJacobian(rotation_vector);
+  const Eigen::FullPivLU<Eigen::Matrix3d> solver(left_jacobian);
+  if (!solver.isInvertible()) {
+    return false;
+  }
+  const So3AngularPathDerivatives zero_coordinate_acceleration =
+      rotationVectorToWorldAngularPathDerivatives(
+          rotation_vector,
+          rotation_vector_velocity,
+          Eigen::Vector3d::Zero(),
+          Eigen::Vector3d::Zero());
+  *rotation_vector_acceleration = solver.solve(
+      angular_acceleration -
+      zero_coordinate_acceleration.domega_ds2);
+  return rotation_vector_acceleration->allFinite();
+}
+
+bool worldAngularToRotationVectorDerivatives(
+    const Eigen::Vector3d& rotation_vector,
+    const Eigen::Vector3d& angular_velocity,
+    const Eigen::Vector3d& angular_acceleration,
+    Eigen::Vector3d* rotation_vector_velocity,
+    Eigen::Vector3d* rotation_vector_acceleration) {
+  if (rotation_vector_velocity == nullptr ||
+      rotation_vector_acceleration == nullptr ||
+      !rotation_vector.allFinite() || !angular_velocity.allFinite() ||
+      !angular_acceleration.allFinite()) {
+    return false;
+  }
+
+  const Eigen::Matrix3d left_jacobian = so3LeftJacobian(rotation_vector);
+  const Eigen::FullPivLU<Eigen::Matrix3d> solver(left_jacobian);
+  if (!solver.isInvertible()) {
+    return false;
+  }
+  *rotation_vector_velocity = solver.solve(angular_velocity);
+  return rotation_vector_velocity->allFinite() &&
+         worldAngularAccelerationToRotationVectorAcceleration(
+             rotation_vector,
+             *rotation_vector_velocity,
+             angular_acceleration,
+             rotation_vector_acceleration);
+}
+
+Eigen::Vector3d clampVectorNorm(
+    const Eigen::Vector3d& vector,
     double limit) {
   const double clamped_limit = std::max(limit, 0.0);
-  return Eigen::Vector3d(
-      std::clamp(v.x(), -clamped_limit, clamped_limit),
-      std::clamp(v.y(), -clamped_limit, clamped_limit),
-      std::clamp(v.z(), -clamped_limit, clamped_limit));
+  const double norm = vector.norm();
+  if (!std::isfinite(norm)) {
+    return Eigen::Vector3d::Zero();
+  }
+  if (norm <= clamped_limit || norm < kSmallPositive) {
+    return vector;
+  }
+  return vector * (clamped_limit / norm);
+}
+
+bool makeAxisAlignedLimitsForVectorNorm(
+    double norm_limit,
+    const Eigen::Vector3d& current,
+    const Eigen::Vector3d& requested_target,
+    const Eigen::Vector3d& preferred_components,
+    Eigen::Vector3d* component_limits) {
+  if (component_limits == nullptr || !current.allFinite() ||
+      !requested_target.allFinite() || !preferred_components.allFinite()) {
+    return false;
+  }
+
+  const double limit = std::max(norm_limit, 1e-4);
+  if (current.norm() > limit + 1e-9) {
+    return false;
+  }
+
+  Eigen::Vector3d required =
+      current.cwiseAbs().cwiseMax(requested_target.cwiseAbs());
+  if (required.norm() > limit) {
+    // A single axis-aligned box cannot always contain two vectors pointing in
+    // different directions while remaining inside one norm ball. Preserve the
+    // measured start exactly; the target derivative is clamped below.
+    required = current.cwiseAbs();
+  }
+
+  Eigen::Vector3d weights = preferred_components.cwiseAbs();
+  weights.array() += 1e-9;
+  weights.normalize();
+  const double remaining_squared =
+      std::max(0.0, limit * limit - required.squaredNorm());
+  for (Eigen::Index i = 0; i < 3; ++i) {
+    (*component_limits)(i) = std::max(
+        std::sqrt(
+            required(i) * required(i) +
+            remaining_squared * weights(i) * weights(i)),
+        1e-12);
+  }
+  return true;
 }
 
 double makeNonreversingInitialPathAcceleration(
@@ -195,6 +444,12 @@ TrajectoryGeneratorSettings loadTrajectoryGeneratorSettings(
     } else if (key == "local_path_lookahead_sec" &&
                parseDouble(value_text, &double_value)) {
       settings.local_path_lookahead_sec = double_value;
+    } else if (key == "waypoint_merge_position_tolerance" &&
+               parseDouble(value_text, &double_value)) {
+      settings.waypoint_merge_position_tolerance = double_value;
+    } else if (key == "waypoint_merge_orientation_tolerance" &&
+               parseDouble(value_text, &double_value)) {
+      settings.waypoint_merge_orientation_tolerance = double_value;
     } else if (key == "local_replan_max_velocity" &&
                parseDouble(value_text, &double_value)) {
       settings.local_replan_max_velocity = double_value;
@@ -240,9 +495,18 @@ TrajectoryGeneratorSettings loadTrajectoryGeneratorSettings(
     } else if (key == "path_time_acc_limit" &&
                parseDouble(value_text, &double_value)) {
       settings.path_time_acc_limit = double_value;
+    } else if (key == "path_time_jerk_limit" &&
+               parseDouble(value_text, &double_value)) {
+      settings.path_time_jerk_limit = double_value;
     } else if (key == "path_time_rate_target" &&
                parseDouble(value_text, &double_value)) {
       settings.path_time_rate_target = double_value;
+    } else if (key == "failsafe_path_time_acc_limit" &&
+               parseDouble(value_text, &double_value)) {
+      settings.failsafe_path_time_acc_limit = double_value;
+    } else if (key == "failsafe_path_time_jerk_limit" &&
+               parseDouble(value_text, &double_value)) {
+      settings.failsafe_path_time_jerk_limit = double_value;
     }
   }
 
@@ -298,6 +562,10 @@ CartesianTrajectorySample retimeTimedPathSample(
     double path_accel) {
   CartesianTrajectorySample out = sampleTimedPathAt(path, path_time);
   out.t = path_time;
+  out.path_rate = path_rate;
+  out.path_acceleration = path_accel;
+  out.path_kinematics_valid =
+      std::isfinite(path_rate) && std::isfinite(path_accel);
   const Eigen::Vector3d dp_ds = out.dp;
   const Eigen::Vector3d d2p_ds2 = out.ddp;
   const Eigen::Vector3d w_ds = out.w;
@@ -414,6 +682,7 @@ struct SmoothPathSample {
   Eigen::Vector3d p{Eigen::Vector3d::Zero()};
   Eigen::Vector3d dp_ds{Eigen::Vector3d::Zero()};
   Eigen::Vector3d d2p_ds2{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d d3p_ds3{Eigen::Vector3d::Zero()};
 };
 
 SmoothPathSample sampleSepticHermitePath(
@@ -482,6 +751,15 @@ SmoothPathSample sampleSepticHermitePath(
   const double d2h11 =
       -180.0 * x2 + 780.0 * x3 - 1020.0 * x4 + 420.0 * x5;
 
+  const double d3h00 =
+      -840.0 * x + 5040.0 * x2 - 8400.0 * x3 + 4200.0 * x4;
+  const double d3h10 =
+      -480.0 * x + 2700.0 * x2 - 4320.0 * x3 + 2100.0 * x4;
+  const double d3h01 =
+      840.0 * x - 5040.0 * x2 + 8400.0 * x3 - 4200.0 * x4;
+  const double d3h11 =
+      -360.0 * x + 2340.0 * x2 - 4080.0 * x3 + 2100.0 * x4;
+
   const Eigen::Vector3d& p0 = points[i0];
   const Eigen::Vector3d& p1 = points[i1];
   const Eigen::Vector3d& m0 = tangents[i0];
@@ -493,6 +771,9 @@ SmoothPathSample sampleSepticHermitePath(
   out.d2p_ds2 =
       (d2h00 * p0 + d2h10 * h * m0 + d2h01 * p1 + d2h11 * h * m1) /
       (h * h);
+  out.d3p_ds3 =
+      (d3h00 * p0 + d3h10 * h * m0 + d3h01 * p1 + d3h11 * h * m1) /
+      (h * h * h);
   return out;
 }
 
@@ -574,6 +855,10 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
       std::max(config.max_angular_velocity, 1e-4);
   const double max_acceleration = std::max(config.max_acceleration, 1e-4);
   const double max_jerk = std::max(config.max_jerk, 1e-4);
+  const double max_angular_acceleration =
+      std::max(config.max_angular_acceleration, 1e-4);
+  const double max_angular_jerk =
+      std::max(config.max_angular_jerk, 1e-4);
   const double orientation_metric_scale = max_velocity / max_angular_velocity;
 
   const Eigen::Quaterniond fallback_orientation =
@@ -585,6 +870,10 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
   std::vector<Eigen::Quaterniond> orientations;
   points.reserve(waypoints.size());
   orientations.reserve(waypoints.size());
+  const double merge_position_tolerance =
+      std::max(config.waypoint_merge_position_tolerance, 0.0);
+  const double merge_orientation_tolerance =
+      std::max(config.waypoint_merge_orientation_tolerance, 0.0);
   for (std::size_t i = 0; i < waypoints.size(); ++i) {
     Eigen::Quaterniond q =
         i < waypoint_orientations.size()
@@ -594,11 +883,34 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
       q = shortestEquivalent(orientations.back(), q);
     }
 
-    if (points.empty() ||
-        (waypoints[i] - points.back()).norm() > 1e-9 ||
-        rotationVectorBetween(orientations.back(), q).norm() > 1e-9) {
+    if (points.empty()) {
       points.push_back(waypoints[i]);
       orientations.push_back(q);
+      continue;
+    }
+
+    const double position_distance = (waypoints[i] - points.back()).norm();
+    const double orientation_distance =
+        rotationVectorBetween(orientations.back(), q).norm();
+    const bool near_previous =
+        position_distance <= merge_position_tolerance &&
+        orientation_distance <= merge_orientation_tolerance;
+    const bool is_final_target = i + 1 == waypoints.size();
+    if (!near_previous) {
+      points.push_back(waypoints[i]);
+      orientations.push_back(q);
+    } else if (is_final_target) {
+      // Preserve an intentional tiny final motion. If there is an earlier
+      // intermediate point, replace that redundant point with the exact final
+      // target instead of creating a near-zero terminal segment.
+      if (points.size() == 1 &&
+          (position_distance > 1e-12 || orientation_distance > 1e-12)) {
+        points.push_back(waypoints[i]);
+        orientations.push_back(q);
+      } else {
+        points.back() = waypoints[i];
+        orientations.back() = q;
+      }
     }
   }
 
@@ -623,8 +935,6 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
         position_step, orientation_metric_scale * angular_step);
     u[i] = u[i - 1] + std::max(full_state_step, kMinDt);
   }
-  const double path_length = std::max(u.back(), kMinDt);
-
   std::vector<Eigen::Vector3d> tangents(points.size(), Eigen::Vector3d::Zero());
   tangents.front() = (points[1] - points[0]) / std::max(u[1] - u[0], kMinDt);
   tangents.back() =
@@ -658,14 +968,54 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
         std::max(u[i + 1] - u[i - 1], kMinDt);
   }
 
-  // The scalar Ruckig limit is converted through the geometric derivative.
-  // A curved high-order segment can have |dp/ds| > 1 even when s is based on
-  // chord length, so using max_velocity directly can exceed a Cartesian-axis
-  // limit.  Bound the scalar derivatives from the whole geometric route.
-  double max_linear_axis_derivative = 0.0;
-  double max_angular_axis_derivative = 0.0;
-  constexpr int kDerivativeSamplesPerSegment = 64;
+  // A waypoint that reverses the combined translational/orientational path
+  // direction is a real cusp. A cross-waypoint central tangent would make the
+  // spline overshoot that waypoint before returning. Force the geometric
+  // derivative to zero only at these cusps; ordinary via points retain their
+  // shared nonzero derivative and can be crossed without stopping.
+  std::vector<bool> direction_reversals(points.size(), false);
+  for (std::size_t i = 1; i + 1 < points.size(); ++i) {
+    const Eigen::Vector3d linear_before = points[i] - points[i - 1];
+    const Eigen::Vector3d linear_after = points[i + 1] - points[i];
+    const Eigen::Vector3d angular_before =
+        rotation_vectors[i] - rotation_vectors[i - 1];
+    const Eigen::Vector3d angular_after =
+        rotation_vectors[i + 1] - rotation_vectors[i];
+    const double direction_dot =
+        linear_before.dot(linear_after) +
+        orientation_metric_scale * orientation_metric_scale *
+            angular_before.dot(angular_after);
+    if (direction_dot < 0.0) {
+      direction_reversals[i] = true;
+      tangents[i].setZero();
+      rotation_tangents[i].setZero();
+    }
+  }
+
+  // Convert the configured 3D Euclidean-norm limits to conservative scalar
+  // Ruckig limits independently for every geometric waypoint segment:
+  //   p_dot   = p_s s_dot
+  //   p_ddot  = p_ss s_dot^2 + p_s s_ddot
+  //   p_jerk  = p_sss s_dot^3 + 3 p_ss s_dot s_ddot + p_s s_jerk.
+  // A pathological short segment therefore only slows itself and the speed
+  // needed to enter/leave it; a following straight segment can accelerate
+  // back to the configured Cartesian norm limit.
+  struct ScalarSegmentLimits {
+    double max_velocity{0.0};
+    double max_acceleration{0.0};
+    double max_jerk{0.0};
+  };
+
+  std::vector<ScalarSegmentLimits> segment_limits(points.size() - 1);
+  constexpr int kDerivativeSamplesPerSegment = 128;
+  constexpr double kPathLimitSamplingMargin = 0.995;
   for (std::size_t segment = 0; segment + 1 < u.size(); ++segment) {
+    double max_linear_d1 = 0.0;
+    double max_linear_d2 = 0.0;
+    double max_linear_d3 = 0.0;
+    double max_angular_d1 = 0.0;
+    double max_angular_d2 = 0.0;
+    double max_angular_d3 = 0.0;
     for (int j = 0; j <= kDerivativeSamplesPerSegment; ++j) {
       const double alpha =
           static_cast<double>(j) /
@@ -677,59 +1027,179 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
       const SmoothPathSample angular_sample =
           sampleSepticHermitePath(
               rotation_vectors, u, rotation_tangents, path_s);
-      max_linear_axis_derivative = std::max(
-          max_linear_axis_derivative,
-          linear_sample.dp_ds.cwiseAbs().maxCoeff());
-      max_angular_axis_derivative = std::max(
-          max_angular_axis_derivative,
-          angular_sample.dp_ds.cwiseAbs().maxCoeff());
+      const So3AngularPathDerivatives angular_derivatives =
+          rotationVectorToWorldAngularPathDerivatives(
+              angular_sample.p,
+              angular_sample.dp_ds,
+              angular_sample.d2p_ds2,
+              angular_sample.d3p_ds3);
+      max_linear_d1 = std::max(max_linear_d1, linear_sample.dp_ds.norm());
+      max_linear_d2 = std::max(max_linear_d2, linear_sample.d2p_ds2.norm());
+      max_linear_d3 = std::max(max_linear_d3, linear_sample.d3p_ds3.norm());
+      max_angular_d1 =
+          std::max(max_angular_d1, angular_derivatives.omega_ds.norm());
+      max_angular_d2 =
+          std::max(max_angular_d2, angular_derivatives.domega_ds2.norm());
+      max_angular_d3 =
+          std::max(max_angular_d3, angular_derivatives.d2omega_ds3.norm());
+    }
+
+    double scalar_max_velocity = max_velocity;
+    if (max_linear_d1 > kSmallPositive) {
+      scalar_max_velocity = std::min(
+          scalar_max_velocity, max_velocity / max_linear_d1);
+    }
+    if (max_angular_d1 > kSmallPositive) {
+      scalar_max_velocity = std::min(
+          scalar_max_velocity, max_angular_velocity / max_angular_d1);
+    }
+    scalar_max_velocity = std::max(scalar_max_velocity, 1e-4);
+
+    auto scalarAccelerationLimit = [&](double scalar_velocity) {
+      double limit = max_acceleration;
+      if (max_linear_d1 > kSmallPositive) {
+        limit = std::min(
+            limit,
+            (max_acceleration -
+             max_linear_d2 * scalar_velocity * scalar_velocity) /
+                max_linear_d1);
+      }
+      if (max_angular_d1 > kSmallPositive) {
+        limit = std::min(
+            limit,
+            (max_angular_acceleration -
+             max_angular_d2 * scalar_velocity * scalar_velocity) /
+                max_angular_d1);
+      }
+      return limit;
+    };
+    auto scalarJerkLimit = [&](double scalar_velocity,
+                               double scalar_acceleration) {
+      double limit = max_jerk;
+      if (max_linear_d1 > kSmallPositive) {
+        const double used =
+            max_linear_d3 * scalar_velocity * scalar_velocity *
+                scalar_velocity +
+            3.0 * max_linear_d2 * scalar_velocity * scalar_acceleration;
+        limit = std::min(limit, (max_jerk - used) / max_linear_d1);
+      }
+      if (max_angular_d1 > kSmallPositive) {
+        const double used =
+            max_angular_d3 * scalar_velocity * scalar_velocity *
+                scalar_velocity +
+            3.0 * max_angular_d2 * scalar_velocity * scalar_acceleration;
+        limit = std::min(
+            limit, (max_angular_jerk - used) / max_angular_d1);
+      }
+      return limit;
+    };
+
+    double scalar_max_acceleration = 0.0;
+    double scalar_max_jerk = 0.0;
+    bool scalar_limits_found = false;
+    for (int iteration = 0; iteration < 32; ++iteration) {
+      scalar_max_acceleration =
+          scalarAccelerationLimit(scalar_max_velocity);
+      if (scalar_max_acceleration > 1e-4) {
+        scalar_max_jerk = scalarJerkLimit(
+            scalar_max_velocity, scalar_max_acceleration);
+        if (scalar_max_jerk > 1e-4) {
+          scalar_limits_found = true;
+          break;
+        }
+      }
+      scalar_max_velocity *= 0.8;
+    }
+    if (!scalar_limits_found) {
+      return {};
+    }
+
+    segment_limits[segment].max_velocity = std::max(
+        kPathLimitSamplingMargin * scalar_max_velocity, 1e-4);
+    segment_limits[segment].max_acceleration = std::max(
+        kPathLimitSamplingMargin *
+            std::min(scalar_max_acceleration, max_acceleration),
+        1e-4);
+    segment_limits[segment].max_jerk = std::max(
+        kPathLimitSamplingMargin * std::min(scalar_max_jerk, max_jerk),
+        1e-4);
+  }
+
+  // Share a nonzero scalar velocity between adjacent C3 path segments. A
+  // forward/backward pass makes each boundary rate acceleration-reachable.
+  // At a true geometric reversal the exact waypoint is a cusp, so it must be
+  // crossed at zero rate unless the caller supplies a blended route.
+  std::vector<double> boundary_rates(points.size(), 0.0);
+  for (std::size_t i = 1; i + 1 < points.size(); ++i) {
+    boundary_rates[i] = std::min(
+        segment_limits[i - 1].max_velocity,
+        segment_limits[i].max_velocity);
+
+    if (direction_reversals[i]) {
+      boundary_rates[i] = 0.0;
     }
   }
-
-  double scalar_max_velocity = max_velocity;
-  if (max_linear_axis_derivative > kSmallPositive) {
-    scalar_max_velocity = std::min(
-        scalar_max_velocity,
-        max_velocity / max_linear_axis_derivative);
+  for (std::size_t i = 0; i + 1 < boundary_rates.size(); ++i) {
+    const double segment_length = u[i + 1] - u[i];
+    const double reachable_rate = std::sqrt(
+        boundary_rates[i] * boundary_rates[i] +
+        2.0 * segment_limits[i].max_acceleration * segment_length);
+    boundary_rates[i + 1] =
+        std::min(boundary_rates[i + 1], reachable_rate);
   }
-  if (max_angular_axis_derivative > kSmallPositive) {
-    scalar_max_velocity = std::min(
-        scalar_max_velocity,
-        max_angular_velocity / max_angular_axis_derivative);
+  for (std::size_t i = boundary_rates.size() - 1; i > 0; --i) {
+    const std::size_t segment = i - 1;
+    const double segment_length = u[i] - u[segment];
+    const double reachable_rate = std::sqrt(
+        boundary_rates[i] * boundary_rates[i] +
+        2.0 * segment_limits[segment].max_acceleration * segment_length);
+    boundary_rates[segment] =
+        std::min(boundary_rates[segment], reachable_rate);
   }
-  scalar_max_velocity = std::max(scalar_max_velocity, 1e-4);
-  const double derivative_scale = std::clamp(
-      scalar_max_velocity / max_velocity, 1e-3, 1.0);
-  const double scalar_max_acceleration =
-      std::max(max_acceleration * derivative_scale * derivative_scale, 1e-4);
-  const double scalar_max_jerk =
-      std::max(max_jerk * derivative_scale * derivative_scale *
-                   derivative_scale,
-               1e-4);
 
-  ruckig::Ruckig<1> otg;
-  ruckig::InputParameter<1> input;
-  ruckig::Trajectory<1> trajectory;
+  auto makeSegmentTrajectory = [&segment_limits, &boundary_rates, &u](
+                                   std::size_t segment,
+                                   ruckig::Trajectory<1>* trajectory) {
+    if (trajectory == nullptr) {
+      return false;
+    }
+    ruckig::Ruckig<1> otg;
+    ruckig::InputParameter<1> input;
+    input.current_position = {0.0};
+    input.current_velocity = {boundary_rates[segment]};
+    input.current_acceleration = {0.0};
+    input.target_position = {u[segment + 1] - u[segment]};
+    input.target_velocity = {boundary_rates[segment + 1]};
+    input.target_acceleration = {0.0};
+    input.max_velocity = {segment_limits[segment].max_velocity};
+    input.max_acceleration = {segment_limits[segment].max_acceleration};
+    input.max_jerk = {segment_limits[segment].max_jerk};
+    return otg.calculate(input, *trajectory) >= ruckig::Result::Working;
+  };
 
-  input.current_position = {0.0};
-  input.current_velocity = {0.0};
-  input.current_acceleration = {0.0};
-  input.target_position = {path_length};
-  input.target_velocity = {0.0};
-  input.target_acceleration = {0.0};
-  input.max_velocity = {scalar_max_velocity};
-  input.max_acceleration = {scalar_max_acceleration};
-  input.max_jerk = {scalar_max_jerk};
-
-  const auto result = otg.calculate(input, trajectory);
-  if (result < ruckig::Result::Working) {
+  // Jerk can make an acceleration-reachable boundary pair infeasible over a
+  // short section. Reduce only through-waypoint rates until all local Ruckig
+  // problems are feasible. Rest-to-rest remains the deterministic fallback.
+  bool all_segments_feasible = false;
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    all_segments_feasible = true;
+    for (std::size_t segment = 0; segment < segment_limits.size(); ++segment) {
+      ruckig::Trajectory<1> trajectory;
+      if (!makeSegmentTrajectory(segment, &trajectory)) {
+        all_segments_feasible = false;
+        break;
+      }
+    }
+    if (all_segments_feasible) {
+      break;
+    }
+    for (std::size_t i = 1; i + 1 < boundary_rates.size(); ++i) {
+      boundary_rates[i] *= 0.8;
+    }
+  }
+  if (!all_segments_feasible) {
     return {};
   }
-
-  const double duration = std::max(trajectory.get_duration(), dt);
-  const int n_steps =
-      std::max(1, static_cast<int>(std::ceil(duration / dt)));
-  samples.reserve(static_cast<std::size_t>(n_steps) + 1);
 
   CartesianTrajectorySample first;
   first.t = 0.0;
@@ -737,44 +1207,62 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
   first.q = orientations.front();
   samples.push_back(first);
 
-  double previous_path_s = 0.0;
-  for (int i = 0; i < n_steps; ++i) {
-    const double tau = std::min(static_cast<double>(i + 1) * dt, duration);
-    std::array<double, 1> s_arr{}, ds_arr{}, dds_arr{};
-    trajectory.at_time(tau, s_arr, ds_arr, dds_arr);
-
-    const double s_path = std::clamp(s_arr[0], previous_path_s, path_length);
-    const double ds_path = std::max(0.0, ds_arr[0]);
-    previous_path_s = s_path;
-    const SmoothPathSample path_sample =
-        sampleSepticHermitePath(points, u, tangents, s_path);
-    const SmoothPathSample orientation_sample =
-        sampleSepticHermitePath(
-            rotation_vectors, u, rotation_tangents, s_path);
-
-    CartesianTrajectorySample sample;
-    sample.t = tau;
-    sample.p = path_sample.p;
-    sample.dp = path_sample.dp_ds * ds_path;
-    sample.ddp =
-        path_sample.d2p_ds2 * ds_path * ds_path +
-        path_sample.dp_ds * dds_arr[0];
-    sample.q = rotationVectorToQuaternion(orientation_sample.p) * q_ref;
-    sample.q.normalize();
-    sample.w = orientation_sample.dp_ds * ds_path;
-    sample.dw =
-        orientation_sample.d2p_ds2 * ds_path * ds_path +
-        orientation_sample.dp_ds * dds_arr[0];
-    if (i + 1 == n_steps) {
-      sample.p = points.back();
-      sample.dp.setZero();
-      sample.ddp.setZero();
-      sample.q = orientations.back();
-      sample.q.normalize();
-      sample.w.setZero();
-      sample.dw.setZero();
+  double elapsed_time = 0.0;
+  for (std::size_t segment = 0; segment < segment_limits.size(); ++segment) {
+    ruckig::Trajectory<1> trajectory;
+    if (!makeSegmentTrajectory(segment, &trajectory)) {
+      return {};
     }
-    samples.push_back(sample);
+    const double duration = std::max(trajectory.get_duration(), dt);
+    const int n_steps =
+        std::max(1, static_cast<int>(std::ceil(duration / dt)));
+    for (int i = 0; i < n_steps; ++i) {
+      const double tau = std::min(static_cast<double>(i + 1) * dt, duration);
+      std::array<double, 1> local_s{}, ds_arr{}, dds_arr{};
+      trajectory.at_time(tau, local_s, ds_arr, dds_arr);
+
+      const double s_path = std::clamp(
+          u[segment] + local_s[0], u[segment], u[segment + 1]);
+      const double ds_path = std::max(0.0, ds_arr[0]);
+      const SmoothPathSample path_sample =
+          sampleSepticHermitePath(points, u, tangents, s_path);
+      const SmoothPathSample orientation_sample =
+          sampleSepticHermitePath(
+              rotation_vectors, u, rotation_tangents, s_path);
+      const So3AngularPathDerivatives angular_derivatives =
+          rotationVectorToWorldAngularPathDerivatives(
+              orientation_sample.p,
+              orientation_sample.dp_ds,
+              orientation_sample.d2p_ds2,
+              orientation_sample.d3p_ds3);
+
+      CartesianTrajectorySample sample;
+      sample.t = elapsed_time + tau;
+      sample.p = path_sample.p;
+      sample.dp = path_sample.dp_ds * ds_path;
+      sample.ddp =
+          path_sample.d2p_ds2 * ds_path * ds_path +
+          path_sample.dp_ds * dds_arr[0];
+      sample.q = rotationVectorToQuaternion(orientation_sample.p) * q_ref;
+      sample.q.normalize();
+      sample.w = angular_derivatives.omega_ds * ds_path;
+      sample.dw =
+          angular_derivatives.domega_ds2 * ds_path * ds_path +
+          angular_derivatives.omega_ds * dds_arr[0];
+      const bool final_sample =
+          segment + 1 == segment_limits.size() && i + 1 == n_steps;
+      if (final_sample) {
+        sample.p = points.back();
+        sample.dp.setZero();
+        sample.ddp.setZero();
+        sample.q = orientations.back();
+        sample.q.normalize();
+        sample.w.setZero();
+        sample.dw.setZero();
+      }
+      samples.push_back(sample);
+    }
+    elapsed_time += duration;
   }
 
   return samples;
@@ -802,7 +1290,6 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
       std::max(config.max_angular_acceleration, 1e-4);
   const double max_angular_jerk =
       std::max(config.max_angular_jerk, 1e-4);
-
   const double lower_time = std::clamp(
       min_path_time,
       timed_path.front().t,
@@ -880,6 +1367,81 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
   const Eigen::Vector3d target_rotation =
       rotationVectorBetween(planning_start_orientation, target.q);
 
+  const Eigen::Vector3d requested_target_dp =
+      clampVectorNorm(target.dp, max_velocity);
+  const Eigen::Vector3d requested_target_ddp =
+      clampVectorNorm(target.ddp, max_acceleration);
+  const Eigen::Vector3d requested_target_w =
+      clampVectorNorm(target.w, max_angular_velocity);
+  const Eigen::Vector3d requested_target_dw =
+      clampVectorNorm(target.dw, max_angular_acceleration);
+  Eigen::Vector3d requested_target_rotation_rate;
+  Eigen::Vector3d requested_target_rotation_acceleration;
+  if (!worldAngularToRotationVectorDerivatives(
+          target_rotation,
+          requested_target_w,
+          requested_target_dw,
+          &requested_target_rotation_rate,
+          &requested_target_rotation_acceleration)) {
+    return {};
+  }
+  // Ruckig operates on the Euclidean rotation-vector coordinates. Keeping
+  // their derivative norms inside the physical limits is conservative for
+  // angular velocity because ||J_l(r)||_2 <= 1 on the principal log branch.
+  requested_target_rotation_rate = clampVectorNorm(
+      requested_target_rotation_rate, max_angular_velocity);
+  if (!worldAngularAccelerationToRotationVectorAcceleration(
+          target_rotation,
+          requested_target_rotation_rate,
+          requested_target_dw,
+          &requested_target_rotation_acceleration)) {
+    return {};
+  }
+  requested_target_rotation_acceleration = clampVectorNorm(
+      requested_target_rotation_acceleration, max_angular_acceleration);
+  const Eigen::Vector3d linear_preference =
+      (target.p - planning_start.p).cwiseAbs() +
+      planning_start.dp.cwiseAbs() + requested_target_dp.cwiseAbs() +
+      planning_start.ddp.cwiseAbs() + requested_target_ddp.cwiseAbs();
+  const Eigen::Vector3d angular_preference =
+      target_rotation.cwiseAbs() + planning_start.w.cwiseAbs() +
+      requested_target_rotation_rate.cwiseAbs() +
+      planning_start.dw.cwiseAbs() +
+      requested_target_rotation_acceleration.cwiseAbs();
+
+  // Ruckig<6> accepts independent per-axis boxes. Allocate those boxes in the
+  // current motion direction so their 3D norm is exactly the YAML norm limit.
+  // This permits full axis-aligned as well as full diagonal motion without
+  // allowing sqrt(3) times the configured Cartesian limit.
+  Eigen::Vector3d velocity_limits;
+  Eigen::Vector3d acceleration_limits;
+  Eigen::Vector3d jerk_limits;
+  Eigen::Vector3d angular_velocity_limits;
+  Eigen::Vector3d angular_acceleration_limits;
+  Eigen::Vector3d angular_jerk_limits;
+  if (!makeAxisAlignedLimitsForVectorNorm(
+          max_velocity, planning_start.dp, requested_target_dp,
+          linear_preference, &velocity_limits) ||
+      !makeAxisAlignedLimitsForVectorNorm(
+          max_acceleration, planning_start.ddp, requested_target_ddp,
+          linear_preference, &acceleration_limits) ||
+      !makeAxisAlignedLimitsForVectorNorm(
+          max_jerk, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+          linear_preference, &jerk_limits) ||
+      !makeAxisAlignedLimitsForVectorNorm(
+          max_angular_velocity, planning_start.w,
+          requested_target_rotation_rate,
+          angular_preference, &angular_velocity_limits) ||
+      !makeAxisAlignedLimitsForVectorNorm(
+          max_angular_acceleration, planning_start.dw,
+          requested_target_rotation_acceleration,
+          angular_preference, &angular_acceleration_limits) ||
+      !makeAxisAlignedLimitsForVectorNorm(
+          max_angular_jerk, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+          angular_preference, &angular_jerk_limits)) {
+    return {};
+  }
+
   ruckig::Ruckig<6> otg;
   ruckig::InputParameter<6> input;
   ruckig::Trajectory<6> trajectory;
@@ -913,35 +1475,43 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
       target_rotation.x(),
       target_rotation.y(),
       target_rotation.z()};
-  const Eigen::Vector3d target_w =
-      clampVectorComponents(target.w, max_angular_velocity);
-  const Eigen::Vector3d target_dw =
-      clampVectorComponents(target.dw, max_angular_acceleration);
+  const Eigen::Vector3d target_dp = requested_target_dp.cwiseMax(
+      -velocity_limits).cwiseMin(velocity_limits);
+  const Eigen::Vector3d target_ddp = requested_target_ddp.cwiseMax(
+      -acceleration_limits).cwiseMin(acceleration_limits);
+  const Eigen::Vector3d target_rotation_rate =
+      requested_target_rotation_rate.cwiseMax(
+      -angular_velocity_limits).cwiseMin(angular_velocity_limits);
+  const Eigen::Vector3d target_rotation_acceleration =
+      requested_target_rotation_acceleration.cwiseMax(
+      -angular_acceleration_limits).cwiseMin(angular_acceleration_limits);
   input.target_velocity = {
-      std::clamp(target.dp.x(), -max_velocity, max_velocity),
-      std::clamp(target.dp.y(), -max_velocity, max_velocity),
-      std::clamp(target.dp.z(), -max_velocity, max_velocity),
-      target_w.x(),
-      target_w.y(),
-      target_w.z()};
+      target_dp.x(),
+      target_dp.y(),
+      target_dp.z(),
+      target_rotation_rate.x(),
+      target_rotation_rate.y(),
+      target_rotation_rate.z()};
   input.target_acceleration = {
-      std::clamp(target.ddp.x(), -max_acceleration, max_acceleration),
-      std::clamp(target.ddp.y(), -max_acceleration, max_acceleration),
-      std::clamp(target.ddp.z(), -max_acceleration, max_acceleration),
-      target_dw.x(),
-      target_dw.y(),
-      target_dw.z()};
+      target_ddp.x(),
+      target_ddp.y(),
+      target_ddp.z(),
+      target_rotation_acceleration.x(),
+      target_rotation_acceleration.y(),
+      target_rotation_acceleration.z()};
 
   input.max_velocity = {
-      max_velocity, max_velocity, max_velocity,
-      max_angular_velocity, max_angular_velocity, max_angular_velocity};
+      velocity_limits.x(), velocity_limits.y(), velocity_limits.z(),
+      angular_velocity_limits.x(), angular_velocity_limits.y(),
+      angular_velocity_limits.z()};
   input.max_acceleration = {
-      max_acceleration, max_acceleration, max_acceleration,
-      max_angular_acceleration, max_angular_acceleration,
-      max_angular_acceleration};
+      acceleration_limits.x(), acceleration_limits.y(),
+      acceleration_limits.z(), angular_acceleration_limits.x(),
+      angular_acceleration_limits.y(), angular_acceleration_limits.z()};
   input.max_jerk = {
-      max_jerk, max_jerk, max_jerk,
-      max_angular_jerk, max_angular_jerk, max_angular_jerk};
+      jerk_limits.x(), jerk_limits.y(), jerk_limits.z(),
+      angular_jerk_limits.x(), angular_jerk_limits.y(),
+      angular_jerk_limits.z()};
 
   auto result = otg.calculate(input, trajectory);
   if (result < ruckig::Result::Working) {
@@ -1003,17 +1573,23 @@ std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
         planning_start.p,
         target.p);
     s.ddp = Eigen::Vector3d(a[0], a[1], a[2]);
-    s.q =
-        rotationVectorToQuaternion(Eigen::Vector3d(p[3], p[4], p[5])) *
-        planning_start_orientation;
+    const Eigen::Vector3d rotation_vector(p[3], p[4], p[5]);
+    const Eigen::Vector3d rotation_vector_velocity(v[3], v[4], v[5]);
+    const Eigen::Vector3d rotation_vector_acceleration(a[3], a[4], a[5]);
+    const So3AngularPathDerivatives angular_derivatives =
+        rotationVectorToWorldAngularPathDerivatives(
+            rotation_vector,
+            rotation_vector_velocity,
+            rotation_vector_acceleration,
+            Eigen::Vector3d::Zero());
+    s.q = rotationVectorToQuaternion(rotation_vector) *
+          planning_start_orientation;
     s.q.normalize();
-    s.w = Eigen::Vector3d(v[3], v[4], v[5]);
-    s.dw = Eigen::Vector3d(a[3], a[4], a[5]);
+    s.w = angular_derivatives.omega_ds;
+    s.dw = angular_derivatives.domega_ds2;
     if (tau >= duration - kMinDt) {
       s.q = target.q;
       s.q.normalize();
-      s.w = target.w;
-      s.dw = target.dw;
     }
     samples.push_back(s);
   }
@@ -1264,13 +1840,23 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathBrake(
       std::clamp(path_time, timed_path.front().t, timed_path.back().t);
   const CartesianTrajectorySample path_start =
       sampleTimedPathAt(timed_path, start_path_time);
-  const double start_rate =
+  const double estimated_start_rate =
       estimatePathRateAtSample(brake_start, path_start, max_rate);
+  const double start_rate =
+      config.initial_path_rate >= 0.0
+          ? std::clamp(config.initial_path_rate, 0.0, max_rate)
+          : estimated_start_rate;
+  const double estimated_start_acceleration =
+      estimatePathAccelerationAtSample(
+          brake_start, path_start, start_rate, max_accel);
+  const double requested_start_acceleration =
+      std::isfinite(config.initial_path_acceleration)
+          ? config.initial_path_acceleration
+          : estimated_start_acceleration;
   const double start_acceleration =
       makeNonreversingInitialPathAcceleration(
           start_rate,
-          estimatePathAccelerationAtSample(
-              brake_start, path_start, start_rate, max_accel),
+          requested_start_acceleration,
           max_accel,
           max_jerk);
 
@@ -1339,6 +1925,36 @@ std::vector<CartesianTrajectorySample> makeCartesianBrakeTrajectory(
       std::max(config.max_angular_acceleration, 1e-4);
   const double max_angular_jerk =
       std::max(config.max_angular_jerk, 1e-4);
+  const Eigen::Vector3d linear_preference =
+      brake_start.dp.cwiseAbs() + brake_start.ddp.cwiseAbs();
+  const Eigen::Vector3d angular_preference =
+      brake_start.w.cwiseAbs() + brake_start.dw.cwiseAbs();
+  Eigen::Vector3d velocity_limits;
+  Eigen::Vector3d acceleration_limits;
+  Eigen::Vector3d jerk_limits;
+  Eigen::Vector3d angular_velocity_limits;
+  Eigen::Vector3d angular_acceleration_limits;
+  Eigen::Vector3d angular_jerk_limits;
+  if (!makeAxisAlignedLimitsForVectorNorm(
+          max_velocity, brake_start.dp, Eigen::Vector3d::Zero(),
+          linear_preference, &velocity_limits) ||
+      !makeAxisAlignedLimitsForVectorNorm(
+          max_acceleration, brake_start.ddp, Eigen::Vector3d::Zero(),
+          linear_preference, &acceleration_limits) ||
+      !makeAxisAlignedLimitsForVectorNorm(
+          max_jerk, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+          linear_preference, &jerk_limits) ||
+      !makeAxisAlignedLimitsForVectorNorm(
+          max_angular_velocity, brake_start.w, Eigen::Vector3d::Zero(),
+          angular_preference, &angular_velocity_limits) ||
+      !makeAxisAlignedLimitsForVectorNorm(
+          max_angular_acceleration, brake_start.dw, Eigen::Vector3d::Zero(),
+          angular_preference, &angular_acceleration_limits) ||
+      !makeAxisAlignedLimitsForVectorNorm(
+          max_angular_jerk, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+          angular_preference, &angular_jerk_limits)) {
+    return {};
+  }
 
   const Eigen::Quaterniond brake_start_orientation =
       normalizedOrIdentity(brake_start.q);
@@ -1377,15 +1993,17 @@ std::vector<CartesianTrajectorySample> makeCartesianBrakeTrajectory(
   input.target_acceleration = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 
   input.max_velocity = {
-      max_velocity, max_velocity, max_velocity,
-      max_angular_velocity, max_angular_velocity, max_angular_velocity};
+      velocity_limits.x(), velocity_limits.y(), velocity_limits.z(),
+      angular_velocity_limits.x(), angular_velocity_limits.y(),
+      angular_velocity_limits.z()};
   input.max_acceleration = {
-      max_acceleration, max_acceleration, max_acceleration,
-      max_angular_acceleration, max_angular_acceleration,
-      max_angular_acceleration};
+      acceleration_limits.x(), acceleration_limits.y(),
+      acceleration_limits.z(), angular_acceleration_limits.x(),
+      angular_acceleration_limits.y(), angular_acceleration_limits.z()};
   input.max_jerk = {
-      max_jerk, max_jerk, max_jerk,
-      max_angular_jerk, max_angular_jerk, max_angular_jerk};
+      jerk_limits.x(), jerk_limits.y(), jerk_limits.z(),
+      angular_jerk_limits.x(), angular_jerk_limits.y(),
+      angular_jerk_limits.z()};
 
   const auto result = otg.calculate(input, trajectory);
   if (result < ruckig::Result::Working) {
@@ -1409,12 +2027,20 @@ std::vector<CartesianTrajectorySample> makeCartesianBrakeTrajectory(
     s.p = Eigen::Vector3d(p[0], p[1], p[2]);
     s.dp = Eigen::Vector3d(v[0], v[1], v[2]);
     s.ddp = Eigen::Vector3d(a[0], a[1], a[2]);
-    s.q =
-        rotationVectorToQuaternion(Eigen::Vector3d(p[3], p[4], p[5])) *
-        brake_start_orientation;
+    const Eigen::Vector3d rotation_vector(p[3], p[4], p[5]);
+    const Eigen::Vector3d rotation_vector_velocity(v[3], v[4], v[5]);
+    const Eigen::Vector3d rotation_vector_acceleration(a[3], a[4], a[5]);
+    const So3AngularPathDerivatives angular_derivatives =
+        rotationVectorToWorldAngularPathDerivatives(
+            rotation_vector,
+            rotation_vector_velocity,
+            rotation_vector_acceleration,
+            Eigen::Vector3d::Zero());
+    s.q = rotationVectorToQuaternion(rotation_vector) *
+          brake_start_orientation;
     s.q.normalize();
-    s.w = Eigen::Vector3d(v[3], v[4], v[5]);
-    s.dw = Eigen::Vector3d(a[3], a[4], a[5]);
+    s.w = angular_derivatives.omega_ds;
+    s.dw = angular_derivatives.domega_ds2;
     if (i + 1 == n_steps) {
       s.dp.setZero();
       s.ddp.setZero();

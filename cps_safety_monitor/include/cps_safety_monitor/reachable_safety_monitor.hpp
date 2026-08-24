@@ -24,7 +24,8 @@ using Quaterniond = Eigen::Quaterniond;
 
 // Robot-model quantities evaluated at one predicted joint state.  The safety
 // monitor deliberately depends on this small interface instead of a concrete
-// rigid-body library, so a controller can own a thread-local Pinocchio model.
+// rigid-body library, so a controller can use either its hardware model or a
+// thread-local simulation model.
 struct JointDynamicsSample {
   bool valid{false};
   Vector3d control_position{Vector3d::Zero()};
@@ -119,6 +120,11 @@ struct ImpedanceSample {
   // because t is retimed to the monitored/execution horizon.
   double nominal_path_time{0.0};
   bool nominal_path_time_valid{false};
+  // Explicit scalar path kinematics. Cartesian dp/ddp cannot recover these
+  // at a legitimate direction-reversal cusp because the path tangent is zero.
+  double nominal_path_rate{0.0};
+  double nominal_path_acceleration{0.0};
+  bool nominal_path_kinematics_valid{false};
 
   Vector3d p{Vector3d::Zero()};
   Vector3d dp{Vector3d::Zero()};
@@ -159,6 +165,13 @@ struct SafetyMonitorConfig {
   // Cartesian point as current_position and J_geo.
   ImpedanceSample current_energy_reference;
   bool current_energy_reference_valid{false};
+
+  // Live quantities captured from the hardware interface at the same instant
+  // as current_q/current_dq.  Supplying them avoids recomputing the initial
+  // rollout state with a separate model; the provider is still required for
+  // future predicted q/dq samples.
+  JointDynamicsSample current_joint_dynamics;
+  bool current_joint_dynamics_valid{false};
 
   double wall_time_sec{0.0};
   double energy_budget_joule{0.05};

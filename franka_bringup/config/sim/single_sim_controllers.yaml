@@ -262,9 +262,11 @@ reachable_cartesian_impedance_controller:
     ee_collision_radius: 0.03
     tcp_offset: [0.0, 0.0, 0.06]
     ee_collision_center_offset: [0.0, 0.0, -0.03]
-    # The 200 Hz monitor rolls q,dq and recomputes M,J,Jdot*dq with this
-    # independent model. The 1 kHz controller still reads dynamics from the
-    # Franka semantic model.
+    # auto uses the real libfranka model for arbitrary predicted q,dq on the
+    # robot. ModelSim currently exposes only the live MuJoCo state, so auto
+    # safely falls back to the URDF/Pinocchio rollout in simulation. In both
+    # cases the rollout's initial state uses the live Franka interface values.
+    monitor_joint_dynamics_source: auto
     monitor_urdf_model_path: /home/developer/multipanda_ws/src/model_urdf/panda_ng.urdf
     async_safety_monitor: true
     # Pin the 200 Hz worker away from the main ROS/MuJoCo scheduling traffic on

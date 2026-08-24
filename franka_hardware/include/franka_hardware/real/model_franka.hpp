@@ -28,6 +28,9 @@ class ModelFranka : public virtual ModelBase{  // NOLINT(cppcoreguidelines-pro-t
                // cppcoreguidelines-special-member-functions)
  public:
   ModelFranka(franka::Model* model) : model_(model) {}
+  [[nodiscard]] bool supportsStateDependentEvaluation() const noexcept override {
+    return true;
+  }
  private:
   franka::Model* model_;
   /**

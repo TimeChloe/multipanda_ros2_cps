@@ -36,6 +36,15 @@ class ModelBase {  // NOLINT(cppcoreguidelines-pro-type-member-init,
   virtual ~ModelBase() = default;
 
   /**
+   * Whether this backend evaluates the explicit q/dq arguments passed to the
+   * model functions.  The real libfranka backend does; the current MuJoCo
+   * backend exposes only quantities at the live simulator state.
+   */
+  [[nodiscard]] virtual bool supportsStateDependentEvaluation() const noexcept {
+    return false;
+  }
+
+  /**
    * Gets the 4x4 pose matrix for the given frame in base frame.
    *
    * The pose is represented as a 4x4 matrix in column-major format.

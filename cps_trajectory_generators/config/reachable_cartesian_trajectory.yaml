@@ -7,30 +7,44 @@
 
 # Sparse interval used by shield prediction/verification.
 # Dense command and failsafe trajectories still use local_replan_dt.
-shield_plan_dt: 0.004
+shield_plan_dt: 0.001
 monitor_frequency_hz: 200.0
 
 local_replan_horizon_steps: 64
 local_replan_dt: 0.001
 local_path_lookahead_sec: 0.50
-local_replan_max_velocity: 0.50
-local_replan_max_acceleration: 10.0
-local_replan_max_jerk: 100.0
-local_replan_max_angular_velocity: 0.8
-local_replan_max_angular_acceleration: 4.0
-local_replan_max_angular_jerk: 40.0
 
-# High but still Franka-conscious Cartesian brake limits.
-# These are intentionally close to common Franka Cartesian rate limits
-# while leaving margin for impedance tracking and torque-rate limiting.
-failsafe_brake_max_velocity: 1.5
-failsafe_brake_max_acceleration: 10.0
-failsafe_brake_max_jerk: 5000.0
-failsafe_brake_max_angular_velocity: 1.5
-failsafe_brake_max_angular_acceleration: 10.0
-failsafe_brake_max_angular_jerk: 500.0
+# Merge only redundant intermediate waypoints. The final action target is
+# always retained, even when it requests a sub-millimetre motion.
+waypoint_merge_position_tolerance: 0.001
+waypoint_merge_orientation_tolerance: 0.005
+
+# Cartesian limits are 3D Euclidean-norm limits, not per-axis limits.
+# Values below are 20% of the documented Franka Panda Cartesian limits.
+local_replan_max_velocity: 0.34
+local_replan_max_acceleration: 5
+local_replan_max_jerk: 2000.0
+local_replan_max_angular_velocity: 0.5
+local_replan_max_angular_acceleration: 5.0
+local_replan_max_angular_jerk: 2500.0
+
+# These are also 3D Euclidean-norm limits, not per-axis limits.
+# Values below are 50% of the documented Franka Panda Cartesian limits.
+failsafe_brake_max_velocity: 0.85
+failsafe_brake_max_acceleration: 6.5
+failsafe_brake_max_jerk: 3250.0
+failsafe_brake_max_angular_velocity: 1.25
+failsafe_brake_max_angular_acceleration: 12.5
+failsafe_brake_max_angular_jerk: 6250.0
 
 path_time_rate_min: 0.0
 path_time_rate_max: 1.0
 path_time_acc_limit: 0.5
+path_time_jerk_limit: 5.0
 path_time_rate_target: 1.0
+
+# Scalar braking limits for progress along the already timed path. Their units
+# are path-rate derivatives and are intentionally separate from Cartesian
+# acceleration and jerk limits.
+failsafe_path_time_acc_limit: 10.0
+failsafe_path_time_jerk_limit: 5000.0

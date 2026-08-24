@@ -1,0 +1,46 @@
+schema_version: 1
+name: metal_ball
+parent_frame: panda_link8
+
+# Tool-link pose relative to panda_link8.
+mount:
+  xyz: [0.0, 0.0, 0.03]
+  rpy: [0.0, 0.0, 0.0]
+
+# Cartesian controller TCP pose relative to panda_link8. Schema version 1
+# supports a translated TCP with the same orientation as panda_link8.
+tcp:
+  xyz: [0.0, 0.0, 0.06]
+  rpy: [0.0, 0.0, 0.0]
+
+inertial:
+  mass: 0.2
+  com: [0.0, 0.0, 0.0]
+  inertia:
+    ixx: 0.000072
+    ixy: 0.0
+    ixz: 0.0
+    iyy: 0.000072
+    iyz: 0.0
+    izz: 0.000072
+
+visual:
+  type: sphere
+  radius: 0.03
+  rgba: [0.72, 0.74, 0.76, 1.0]
+
+collision:
+  type: sphere
+  radius: 0.03
+
+# The reachable monitor currently uses one conservative sphere. Its center is
+# expressed in the tool-link frame and converted to the controller TCP frame.
+safety:
+  bounding_sphere:
+    center: [0.0, 0.0, 0.0]
+    radius: 0.03
+
+mujoco:
+  gravity_compensation: true
+  friction: [1.0, 0.005, 0.0001]
+  touch_sensor: true

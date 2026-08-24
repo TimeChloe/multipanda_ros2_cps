@@ -26,6 +26,8 @@
 #include "cps_human_workspace/human_workspace.hpp"
 #include "cps_human_workspace/msg/human_workspace.hpp"
 #include "cps_controllers/bounded_async_file_writer.hpp"
+#include "cps_controllers/latest_value_mailbox.hpp"
+#include "cps_controllers/reachable_cartesian_impedance/types.hpp"
 #include "cps_safety_monitor/reachable_safety_monitor.hpp"
 #include "cps_trajectory_generators/reachable_cartesian_trajectory.hpp"
 #include "cps_controllers/panda_control_limits.hpp"
@@ -35,116 +37,6 @@ using CallbackReturn =
     rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
 namespace cps_controllers {
-
-using Matrix3d = Eigen::Matrix3d;
-using Matrix4d = Eigen::Matrix<double, 4, 4>;
-using Matrix6d = Eigen::Matrix<double, 6, 6>;
-using Matrix7d = Eigen::Matrix<double, 7, 7>;
-using Matrix67d = Eigen::Matrix<double, 6, 7>;
-using Matrix37d = Eigen::Matrix<double, 3, 7>;
-
-using Vector3d = Eigen::Matrix<double, 3, 1>;
-using Vector6d = Eigen::Matrix<double, 6, 1>;
-using Vector7d = Eigen::Matrix<double, 7, 1>;
-using Quaterniond = Eigen::Quaterniond;
-
-enum class SafetyMode {
-  // Orthogonal state encoded for compact logging:
-  //   contact-energy constraint inactive/active x nominal/fallback execution.
-  kNominal = 0,
-  kLastVerifiedMonitored = 1,
-  kNominalContactPossible = 2,
-  kLastVerifiedContactPossible = 3
-};
-
-enum class ExecutionStage {
-  // Actual command source. This is deliberately independent of SafetyMode.
-  kNominalVerified = 0,
-  kLastVerifiedIntended = 1,
-  kFailsafe = 2,
-  kEnergyHold = 3,
-  kContactVerificationHold = 4,
-  // The latest path-consistent intended stream is deliberately executable
-  // inside the current workspace even when its predictive monitor result is
-  // rejected. The 1 kHz energy governor is the safety mechanism there.
-  kContactEnergyIntended = 5
-};
-
-enum class FallbackReason {
-  // Why the current command stream could not remain nominal. This is kept
-  // separate from ExecutionStage: a single cause can first consume the
-  // last-verified intended prefix and only later reach its fail-safe tail.
-  kNone = 0,
-  kBootstrapNoVerifiedPlan = 1,
-  kCandidatePredictedUnsafe = 2,
-  kPlannerOrPlanBuildFailure = 3,
-  kAsyncOutputStale = 4,
-  kSourcePlanGenerationMismatch = 5,
-  kActivationDeadlineMissed = 6,
-  kVerifiedIntendedExhausted = 7,
-  kEmergencyStopNoCommand = 8
-};
-
-enum class PlanFailureReason {
-  // Detailed reason behind FallbackReason::kPlannerOrPlanBuildFailure.
-  kNone = 0,
-  kNoActivePath = 1,
-  kMissingNominalPathState = 2,
-  kIntendedGenerationEmpty = 3,
-  kIntendedSeamInvalid = 4,
-  kFailsafeGenerationEmpty = 5,
-  kFailsafeSeamInvalid = 6,
-  kIntendedSampleInvalid = 7,
-  kIntendedTransitionInvalid = 8,
-  kFailsafeSampleInvalid = 9,
-  kFailsafeTransitionInvalid = 10,
-  kCandidateInvalidUnknown = 11
-};
-
-inline bool isNominalSafetyMode(SafetyMode mode) {
-  return mode == SafetyMode::kNominal ||
-         mode == SafetyMode::kNominalContactPossible;
-}
-
-inline bool isContactEnergyMode(SafetyMode mode) {
-  return mode == SafetyMode::kNominalContactPossible ||
-         mode == SafetyMode::kLastVerifiedContactPossible;
-}
-
-inline bool isLastVerifiedSafetyMode(SafetyMode mode) {
-  return mode == SafetyMode::kLastVerifiedMonitored ||
-         mode == SafetyMode::kLastVerifiedContactPossible;
-}
-
-using MonitorResult = cps_safety_monitor::MonitorResult;
-using ImpedanceSample = cps_safety_monitor::ImpedanceSample;
-using VerifiedPlan = cps_safety_monitor::VerifiedPlan;
-using SafetyMonitorConfig = cps_safety_monitor::SafetyMonitorConfig;
-using JointPredictionSample = cps_safety_monitor::JointPredictionSample;
-
-struct ShieldDecision {
-  bool candidate_verified{false};
-  bool executing_last_verified_monitored{false};
-  bool has_evaluated_plan{false};
-  bool has_contact_intended_plan{false};
-  FallbackReason fallback_reason{FallbackReason::kNone};
-  PlanFailureReason plan_failure_reason{PlanFailureReason::kNone};
-
-  ImpedanceSample command;
-  MonitorResult monitor;
-  VerifiedPlan evaluated_plan;
-  // Filled only when prediction logging is enabled.  It is produced by the
-  // same joint rollout that made the monitor decision.
-  std::vector<JointPredictionSample> joint_prediction_trace;
-  // A path-consistent intended stream may still be valid when construction of
-  // the separate fail-safe reserve fails. It is executable only in measured
-  // contact, under the 1 kHz Cartesian energy governor.
-  VerifiedPlan contact_intended_plan;
-  double monitor_total_ms{0.0};
-  double planner_ms{0.0};
-  double plan_build_ms{0.0};
-  double monitor_eval_ms{0.0};
-};
 
 class ReachableCartesianImpedanceController
     : public controller_interface::ControllerInterface {
@@ -226,6 +118,8 @@ class ReachableCartesianImpedanceController
                                       const Vector6d& ee_twist,
                                       const Matrix7d& inertia,
                                       const Matrix67d& J_geo,
+                                      const Vector7d& coriolis,
+                                      const Vector6d& control_jdot_dq,
                                       const Vector7d& previous_torque_command,
                                       const Matrix6d& K_runtime,
                                       const Matrix6d& D_runtime,
@@ -259,7 +153,9 @@ class ReachableCartesianImpedanceController
                                        const Quaterniond& current_orientation,
                                        const Vector6d& ee_twist,
                                        const Matrix7d& inertia,
-                                       const Matrix67d& J_geo);
+                                       const Matrix67d& J_geo,
+                                       const Vector7d& coriolis,
+                                       const Vector6d& control_jdot_dq);
 
   SafetyMonitorConfig makeSafetyMonitorConfig(
       const cps_human_workspace::HumanWorkspace& human_workspace,
@@ -283,6 +179,8 @@ class ReachableCartesianImpedanceController
     Quaterniond current_orientation{Quaterniond::Identity()};
     Vector6d ee_twist{Vector6d::Zero()};
     Matrix7d inertia{Matrix7d::Zero()};
+    Vector7d coriolis{Vector7d::Zero()};
+    Vector6d control_jdot_dq{Vector6d::Zero()};
     Matrix37d Jv{Matrix37d::Zero()};
     Matrix67d J_geo{Matrix67d::Zero()};
     Vector7d previous_torque_command{Vector7d::Zero()};
@@ -578,8 +476,11 @@ class ReachableCartesianImpedanceController
 
   std::unique_ptr<franka_semantic_components::FrankaRobotModel> franka_robot_model_;
   class PinocchioJointDynamicsProvider;
-  std::unique_ptr<PinocchioJointDynamicsProvider>
+  class FrankaInterfaceJointDynamicsProvider;
+  std::unique_ptr<cps_safety_monitor::JointDynamicsProvider>
       monitor_joint_dynamics_provider_;
+  std::string monitor_joint_dynamics_source_{"auto"};
+  std::string active_monitor_joint_dynamics_source_;
   std::string monitor_urdf_model_path_;
 
   rclcpp::Time start_time_;
@@ -651,23 +552,28 @@ class ReachableCartesianImpedanceController
   double path_time_rate_min_{0.0};
   double path_time_rate_max_{1.5};
   double path_time_acc_limit_{3.0};
+  double path_time_jerk_limit_{5.0};
   double path_time_rate_target_{1.0};
+  double failsafe_path_time_acc_limit_{10.0};
+  double failsafe_path_time_jerk_limit_{5000.0};
 
   int local_replan_horizon_steps_{64};
   double local_replan_dt_{0.001};
   double local_path_lookahead_sec_{0.08};
+  double waypoint_merge_position_tolerance_{0.001};
+  double waypoint_merge_orientation_tolerance_{0.005};
   double local_replan_max_velocity_{0.08};
   double local_replan_max_acceleration_{0.4};
   double local_replan_max_jerk_{2.0};
   double local_replan_max_angular_velocity_{0.8};
   double local_replan_max_angular_acceleration_{4.0};
   double local_replan_max_angular_jerk_{40.0};
-  double failsafe_brake_max_velocity_{1.0};
-  double failsafe_brake_max_acceleration_{4.0};
-  double failsafe_brake_max_jerk_{80.0};
-  double failsafe_brake_max_angular_velocity_{1.5};
-  double failsafe_brake_max_angular_acceleration_{10.0};
-  double failsafe_brake_max_angular_jerk_{500.0};
+  double failsafe_brake_max_velocity_{0.85};
+  double failsafe_brake_max_acceleration_{6.5};
+  double failsafe_brake_max_jerk_{3250.0};
+  double failsafe_brake_max_angular_velocity_{1.25};
+  double failsafe_brake_max_angular_acceleration_{12.5};
+  double failsafe_brake_max_angular_jerk_{6250.0};
   std::string trajectory_generator_config_path_;
 
   bool use_dynamic_consistent_impedance_{true};
@@ -704,9 +610,9 @@ class ReachableCartesianImpedanceController
   std::atomic<std::uint64_t> async_monitor_input_overwrite_count_{0};
   std::atomic<std::uint64_t> async_monitor_worker_processed_count_{0};
 
-  std::mutex async_output_mutex_;
-  AsyncMonitorOutput latest_async_output_{};
-  std::uint64_t last_consumed_async_output_sequence_{0};
+  // The worker publishes into fixed lock-free slots. The real-time loop takes
+  // the newest completed result without contending on a mutex.
+  LatestValueMailbox<AsyncMonitorOutput, 3> async_output_mailbox_;
   double last_async_output_wall_time_{-1.0};
   bool last_async_output_valid_{false};
   std::atomic<std::uint64_t> async_monitor_output_overwrite_count_{0};

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <cstdint>
@@ -55,8 +56,10 @@
 #include <geometry_msgs/msg/pose_array.hpp>
 
 #include <cps_controllers/reachable_cartesian_impedance_controller.hpp>
-#include <cps_controllers/reachable_cartesian_math.hpp>
 #include <cps_trajectory_generators/reachable_cartesian_trajectory.hpp>
+
+#include "reachable_cartesian_impedance/math.hpp"
+#include "reachable_cartesian_impedance/timing.hpp"
 
 namespace {
 
@@ -78,29 +81,16 @@ using Matrix4d = Eigen::Matrix<double, 4, 4>;
 using Matrix3d = Eigen::Matrix3d;
 using Vector3d = Eigen::Vector3d;
 using Quaterniond = Eigen::Quaterniond;
-using SteadyClock = std::chrono::steady_clock;
-
-std::int64_t steadyNowNanoseconds() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             SteadyClock::now().time_since_epoch())
-      .count();
-}
-
-double nanosecondsToMilliseconds(std::int64_t nanoseconds) {
-  return static_cast<double>(nanoseconds) * 1.0e-6;
-}
-using CartesianViaMotionAction =
-    panda_motion_generator_msgs::action::CartesianViaMotion;
-using SimpleActionResult = panda_motion_generator_msgs::msg::SimpleActionResult;
+using cps_controllers::detail::nanosecondsToMilliseconds;
+using cps_controllers::detail::steadyNowNanoseconds;
+using cps_controllers::detail::SteadyClock;
 using CartesianTrajectorySample = cps_trajectory_generators::CartesianTrajectorySample;
-using LocalCartesianReplanConfig = cps_trajectory_generators::LocalCartesianReplanConfig;
 using PathConsistentTimedPathConfig =
     cps_trajectory_generators::PathConsistentTimedPathConfig;
 using cps_trajectory_generators::loadTrajectoryGeneratorSettings;
 using cps_trajectory_generators::makePathConsistentTimedPathBrake;
 using cps_trajectory_generators::makePathConsistentTimedPathIntendedPrefix;
 using cps_trajectory_generators::makeRetimedPathState;
-using cps_trajectory_generators::makeSmoothViaPointCartesianTrajectory;
 
 std::vector<double> defaultNullspaceHomePoseParameter() {
   return {
@@ -229,24 +219,6 @@ inline Vector3d clampVectorNorm(const Vector3d& v, double max_norm) {
   return v * (limit / norm);
 }
 
-inline Quaterniond normalizedQuaternionOrIdentity(const Quaterniond& q_in) {
-  Quaterniond q = q_in;
-  const double norm = q.norm();
-  if (!std::isfinite(norm) || norm < 1.0e-12) {
-    return Quaterniond::Identity();
-  }
-  q.coeffs() /= norm;
-  return q;
-}
-
-inline std::shared_ptr<CartesianViaMotionAction::Result>
-makeCartesianViaMotionActionResult(int32_t state, const std::string& message) {
-  auto result = std::make_shared<CartesianViaMotionAction::Result>();
-  result->result.state = state;
-  result->result.error = message;
-  return result;
-}
-
 inline double clamp01(double value) {
   return std::clamp(value, 0.0, 1.0);
 }
@@ -278,6 +250,15 @@ inline cps_safety_monitor::ImpedanceSample interpolateImpedanceSample(
     out.nominal_path_time =
         (1.0 - u) * a.nominal_path_time + u * b.nominal_path_time;
   }
+  out.nominal_path_kinematics_valid =
+      a.nominal_path_kinematics_valid && b.nominal_path_kinematics_valid;
+  if (out.nominal_path_kinematics_valid) {
+    out.nominal_path_rate =
+        (1.0 - u) * a.nominal_path_rate + u * b.nominal_path_rate;
+    out.nominal_path_acceleration =
+        (1.0 - u) * a.nominal_path_acceleration +
+        u * b.nominal_path_acceleration;
+  }
   out.p = h00 * a.p + h10 * span * a.dp +
           h01 * b.p + h11 * span * b.dp;
   out.dp = dh00 * a.p + dh10 * a.dp +
@@ -291,54 +272,6 @@ inline cps_safety_monitor::ImpedanceSample interpolateImpedanceSample(
   out.D = (1.0 - u) * a.D + u * b.D;
   out.failsafe = a.failsafe || b.failsafe;
   return out;
-}
-
-Matrix3d positiveSemidefinitePart(const Matrix3d& matrix) {
-  const Matrix3d symmetric = 0.5 * (matrix + matrix.transpose());
-  const Eigen::SelfAdjointEigenSolver<Matrix3d> eig(symmetric);
-  if (eig.info() != Eigen::Success) {
-    return symmetric;
-  }
-  Matrix3d psd =
-      eig.eigenvectors() *
-      eig.eigenvalues().cwiseMax(0.0).asDiagonal() *
-      eig.eigenvectors().transpose();
-  return 0.5 * (psd + psd.transpose());
-}
-
-double maxTrackingBlockRadius(const Matrix6d& tube, int block_start) {
-  const Matrix3d block =
-      0.5 * (tube.block<3, 3>(block_start, block_start) +
-             tube.block<3, 3>(block_start, block_start).transpose());
-  const Eigen::SelfAdjointEigenSolver<Matrix3d> eig(block);
-  if (eig.info() != Eigen::Success) {
-    return std::sqrt(std::max(0.0, block.norm()));
-  }
-  return std::sqrt(std::max(0.0, eig.eigenvalues().maxCoeff()));
-}
-
-Matrix6d propagateTrackingTube(
-    const Matrix6d& tube,
-    const Matrix3d& task_inertia_inv,
-    const Matrix3d& Kp,
-    const Matrix3d& Dp,
-    double dt,
-    double acc_error_bound) {
-  const double h = std::max(dt, kMinDt);
-  Matrix6d A = Matrix6d::Identity();
-  A.topRightCorner<3, 3>() = h * Matrix3d::Identity();
-  A.bottomLeftCorner<3, 3>() = -h * task_inertia_inv * Kp;
-  A.bottomRightCorner<3, 3>() =
-      Matrix3d::Identity() - h * task_inertia_inv * Dp;
-
-  Eigen::Matrix<double, 6, 3> B = Eigen::Matrix<double, 6, 3>::Zero();
-  B.topRows<3>() = 0.5 * h * h * Matrix3d::Identity();
-  B.bottomRows<3>() = h * Matrix3d::Identity();
-
-  const double acc_bound = std::max(0.0, acc_error_bound);
-  const Matrix6d propagated =
-      A * tube * A.transpose() + acc_bound * acc_bound * B * B.transpose();
-  return 0.5 * (propagated + propagated.transpose());
 }
 
 bool symmetricPositiveSemidefiniteSquareRoot(
@@ -474,6 +407,139 @@ class ReachableCartesianImpedanceController::PinocchioJointDynamicsProvider
   pinocchio::Model model_;
   mutable std::unique_ptr<pinocchio::Data> data_;
   pinocchio::FrameIndex frame_id_{0};
+  Vector3d tcp_offset_{Vector3d::Zero()};
+  cps_safety_monitor::JointDynamicsLimits limits_;
+};
+
+class ReachableCartesianImpedanceController::FrankaInterfaceJointDynamicsProvider
+    final : public cps_safety_monitor::JointDynamicsProvider {
+ public:
+  FrankaInterfaceJointDynamicsProvider(
+      franka_semantic_components::FrankaRobotModel* robot_model,
+      const franka::RobotState& robot_state,
+      const Vector3d& tcp_offset)
+      : robot_model_(robot_model),
+        F_T_EE_(robot_state.F_T_EE),
+        EE_T_K_(robot_state.EE_T_K),
+        I_total_(robot_state.I_total),
+        m_total_(robot_state.m_total),
+        F_x_Ctotal_(robot_state.F_x_Ctotal),
+        tcp_offset_(tcp_offset) {
+    if (robot_model_ == nullptr ||
+        !robot_model_->supportsStateDependentEvaluation()) {
+      throw std::runtime_error(
+          "Franka model backend cannot evaluate arbitrary predicted q/dq");
+    }
+    for (int i = 0; i < 7; ++i) {
+      limits_.position_lower(i) = panda_limits::kPositionLower[i];
+      limits_.position_upper(i) = panda_limits::kPositionUpper[i];
+      limits_.velocity(i) = panda_limits::kVelocity[i];
+      limits_.acceleration(i) = panda_limits::kAcceleration[i];
+      limits_.torque(i) = panda_limits::kTorque[i];
+    }
+  }
+
+  bool evaluate(
+      const Vector7d& q,
+      const Vector7d& dq,
+      cps_safety_monitor::JointDynamicsSample* sample) const override {
+    if (sample == nullptr || robot_model_ == nullptr ||
+        !q.allFinite() || !dq.allFinite()) {
+      return false;
+    }
+
+    try {
+      std::array<double, 7> q_array{};
+      std::array<double, 7> dq_array{};
+      std::copy_n(q.data(), 7, q_array.begin());
+      std::copy_n(dq.data(), 7, dq_array.begin());
+
+      const auto pose_array = robot_model_->getPoseMatrix(
+          franka::Frame::kEndEffector, q_array, F_T_EE_, EE_T_K_);
+      const Eigen::Map<const Matrix4d> pose(pose_array.data());
+      const Matrix3d rotation = pose.block<3, 3>(0, 0);
+      const Vector3d offset_world = rotation * tcp_offset_;
+
+      const auto jacobian_array = robot_model_->getZeroJacobian(
+          franka::Frame::kEndEffector, q_array, F_T_EE_, EE_T_K_);
+      Matrix67d control_jacobian =
+          Eigen::Map<const Matrix67d>(jacobian_array.data());
+      control_jacobian.topRows<3>() -=
+          skewSymmetric(offset_world) * control_jacobian.bottomRows<3>();
+
+      // libfranka does not expose Jdot*dq. Estimate it by differentiating the
+      // same libfranka Jacobian model along dq, so no Pinocchio quantity is
+      // mixed into the real-robot rollout.
+      constexpr double kJacobianDifferenceTime = 1.0e-4;
+      std::array<double, 7> q_plus = q_array;
+      std::array<double, 7> q_minus = q_array;
+      for (std::size_t i = 0; i < q_plus.size(); ++i) {
+        q_plus[i] += kJacobianDifferenceTime * dq_array[i];
+        q_minus[i] -= kJacobianDifferenceTime * dq_array[i];
+      }
+      const auto jacobian_plus_array = robot_model_->getZeroJacobian(
+          franka::Frame::kEndEffector, q_plus, F_T_EE_, EE_T_K_);
+      const auto jacobian_minus_array = robot_model_->getZeroJacobian(
+          franka::Frame::kEndEffector, q_minus, F_T_EE_, EE_T_K_);
+      Matrix67d jacobian_plus =
+          Eigen::Map<const Matrix67d>(jacobian_plus_array.data());
+      Matrix67d jacobian_minus =
+          Eigen::Map<const Matrix67d>(jacobian_minus_array.data());
+
+      const auto pose_plus_array = robot_model_->getPoseMatrix(
+          franka::Frame::kEndEffector, q_plus, F_T_EE_, EE_T_K_);
+      const auto pose_minus_array = robot_model_->getPoseMatrix(
+          franka::Frame::kEndEffector, q_minus, F_T_EE_, EE_T_K_);
+      const Eigen::Map<const Matrix4d> pose_plus(pose_plus_array.data());
+      const Eigen::Map<const Matrix4d> pose_minus(pose_minus_array.data());
+      const Vector3d offset_plus =
+          pose_plus.block<3, 3>(0, 0) * tcp_offset_;
+      const Vector3d offset_minus =
+          pose_minus.block<3, 3>(0, 0) * tcp_offset_;
+      jacobian_plus.topRows<3>() -=
+          skewSymmetric(offset_plus) * jacobian_plus.bottomRows<3>();
+      jacobian_minus.topRows<3>() -=
+          skewSymmetric(offset_minus) * jacobian_minus.bottomRows<3>();
+
+      const auto inertia_array = robot_model_->getMassMatrix(
+          q_array, I_total_, m_total_, F_x_Ctotal_);
+      const auto coriolis_array = robot_model_->getCoriolisForceVector(
+          q_array, dq_array, I_total_, m_total_, F_x_Ctotal_);
+
+      sample->control_position = pose.block<3, 1>(0, 3) + offset_world;
+      sample->control_orientation = Quaterniond(rotation).normalized();
+      sample->control_jacobian = control_jacobian;
+      sample->control_jdot_dq =
+          ((jacobian_plus - jacobian_minus) /
+           (2.0 * kJacobianDifferenceTime)) * dq;
+      sample->inertia = Eigen::Map<const Matrix7d>(inertia_array.data());
+      sample->inertia =
+          0.5 * (sample->inertia + sample->inertia.transpose());
+      sample->coriolis = Eigen::Map<const Vector7d>(coriolis_array.data());
+      sample->valid = sample->control_position.allFinite() &&
+                      sample->control_orientation.coeffs().allFinite() &&
+                      sample->control_jacobian.allFinite() &&
+                      sample->control_jdot_dq.allFinite() &&
+                      sample->inertia.allFinite() &&
+                      sample->coriolis.allFinite();
+      return sample->valid;
+    } catch (const std::exception&) {
+      sample->valid = false;
+      return false;
+    }
+  }
+
+  cps_safety_monitor::JointDynamicsLimits limits() const override {
+    return limits_;
+  }
+
+ private:
+  franka_semantic_components::FrankaRobotModel* robot_model_{nullptr};
+  std::array<double, 16> F_T_EE_{};
+  std::array<double, 16> EE_T_K_{};
+  std::array<double, 9> I_total_{};
+  double m_total_{0.0};
+  std::array<double, 3> F_x_Ctotal_{};
   Vector3d tcp_offset_{Vector3d::Zero()};
   cps_safety_monitor::JointDynamicsLimits limits_;
 };
@@ -678,6 +744,11 @@ ImpedanceSample ReachableCartesianImpedanceController::makeEffectiveTimeHoldSamp
   hold.ddp.setZero();
   hold.w.setZero();
   hold.dw.setZero();
+  if (hold.nominal_path_time_valid) {
+    hold.nominal_path_rate = 0.0;
+    hold.nominal_path_acceleration = 0.0;
+    hold.nominal_path_kinematics_valid = true;
+  }
   hold.failsafe = false;
   return hold;
 }
@@ -841,6 +912,9 @@ bool ReachableCartesianImpedanceController::anchorLastCommandedSampleToPathStart
 
   last_commanded_sample_.nominal_path_time = path_start.t;
   last_commanded_sample_.nominal_path_time_valid = true;
+  last_commanded_sample_.nominal_path_rate = path_time_rate_target_;
+  last_commanded_sample_.nominal_path_acceleration = 0.0;
+  last_commanded_sample_.nominal_path_kinematics_valid = true;
   return true;
 }
 
@@ -999,14 +1073,11 @@ bool ReachableCartesianImpedanceController::isOneStepCommandTransitionContinuous
     const ImpedanceSample& next,
     bool allow_measured_derivative_reanchor) const {
   const double transition_dt = std::max(local_replan_dt_, kMinDt);
-  const double axis_factor = std::sqrt(3.0);
-  const double max_acceleration =
-      axis_factor * local_replan_max_acceleration_;
-  const double max_jerk = axis_factor * local_replan_max_jerk_;
+  const double max_acceleration = local_replan_max_acceleration_;
+  const double max_jerk = local_replan_max_jerk_;
   const double max_angular_acceleration =
-      axis_factor * local_replan_max_angular_acceleration_;
-  const double max_angular_jerk =
-      axis_factor * local_replan_max_angular_jerk_;
+      local_replan_max_angular_acceleration_;
+  const double max_angular_jerk = local_replan_max_angular_jerk_;
   constexpr double kPositionTolerance = 1.0e-5;
   constexpr double kVelocityTolerance = 1.0e-5;
   constexpr double kAccelerationTolerance = 1.0e-4;
@@ -1120,15 +1191,14 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     }
     const auto& first = samples.front();
     const double dt = std::max(local_replan_dt_, kMinDt);
-    const double vector_axis_factor = std::sqrt(3.0);
     const double linear_accel_step =
-        vector_axis_factor * local_replan_max_acceleration_ * dt;
+        local_replan_max_acceleration_ * dt;
     const double linear_jerk_step =
-        vector_axis_factor * local_replan_max_jerk_ * dt;
+        local_replan_max_jerk_ * dt;
     const double angular_accel_step =
-        vector_axis_factor * local_replan_max_angular_acceleration_ * dt;
+        local_replan_max_angular_acceleration_ * dt;
     const double angular_jerk_step =
-        vector_axis_factor * local_replan_max_angular_jerk_ * dt;
+        local_replan_max_angular_jerk_ * dt;
     constexpr double kSeamTolerance = 1.0e-6;
 
     const double max_linear_speed =
@@ -1138,13 +1208,11 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     const bool pose_continuous =
         (first.p - planning_start.p).norm() <=
             max_linear_speed * dt +
-                0.5 * vector_axis_factor *
-                    local_replan_max_acceleration_ * dt * dt +
+                0.5 * local_replan_max_acceleration_ * dt * dt +
                 kSeamTolerance &&
         computeOrientationError(planning_start.q, first.q).norm() <=
             max_angular_speed * dt +
-                0.5 * vector_axis_factor *
-                    local_replan_max_angular_acceleration_ * dt * dt +
+                0.5 * local_replan_max_angular_acceleration_ * dt * dt +
                 kSeamTolerance;
     const bool derivatives_continuous =
         (first.dp - planning_start.dp).norm() <=
@@ -1193,7 +1261,7 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     path_config.max_path_rate = std::max(path_time_rate_max_, 1e-4);
     path_config.max_path_acceleration =
         std::max(path_time_acc_limit_, 1e-4);
-    path_config.max_path_jerk = std::max(local_replan_max_jerk_, 1e-4);
+    path_config.max_path_jerk = std::max(path_time_jerk_limit_, 1e-4);
     path_config.target_path_rate =
         std::clamp(target_path_rate, path_time_rate_min_,
                    path_time_rate_max_);
@@ -1249,6 +1317,10 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     if (planned_samples_are_path_consistent) {
       s.nominal_path_time = planned_sample.t;
       s.nominal_path_time_valid = true;
+      s.nominal_path_rate = planned_sample.path_rate;
+      s.nominal_path_acceleration = planned_sample.path_acceleration;
+      s.nominal_path_kinematics_valid =
+          planned_sample.path_kinematics_valid;
     }
     s.p = planned_sample.p;
     s.dp = planned_sample.dp;
@@ -1374,10 +1446,16 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
       path_brake_config.path_lookahead_sec = local_path_lookahead_sec_;
       path_brake_config.max_path_rate = std::max(path_time_rate_max_, 1e-4);
       path_brake_config.max_path_acceleration =
-          std::max(failsafe_brake_max_acceleration_, 1e-4);
+          std::max(failsafe_path_time_acc_limit_, 1e-4);
       path_brake_config.max_path_jerk =
-          std::max(failsafe_brake_max_jerk_, 1e-4);
+          std::max(failsafe_path_time_jerk_limit_, 1e-4);
       path_brake_config.target_path_rate = 0.0;
+      if (freeze_anchor.nominal_path_kinematics_valid) {
+        path_brake_config.initial_path_rate =
+            freeze_anchor.nominal_path_rate;
+        path_brake_config.initial_path_acceleration =
+            freeze_anchor.nominal_path_acceleration;
+      }
 
       brake_samples = makePathConsistentTimedPathBrake(
           freeze_anchor.nominal_path_time,
@@ -1391,35 +1469,32 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
       if (!brake_samples.empty()) {
         const auto& first = brake_samples.front();
         const double dt = failsafe_plan_dt;
-        const double axis_factor = std::sqrt(3.0);
         constexpr double kBrakeSeamTolerance = 1.0e-6;
         const bool position_continuous =
             (first.p - freeze_anchor.p).norm() <=
             std::max(freeze_anchor.dp.norm(), first.dp.norm()) * dt +
-                0.5 * axis_factor * failsafe_brake_max_acceleration_ *
-                    dt * dt +
+                0.5 * failsafe_brake_max_acceleration_ * dt * dt +
                 kBrakeSeamTolerance;
         const bool velocity_continuous =
             (first.dp - freeze_anchor.dp).norm() <=
-            axis_factor * failsafe_brake_max_acceleration_ * dt +
+            failsafe_brake_max_acceleration_ * dt +
                 kBrakeSeamTolerance;
         const bool acceleration_continuous =
             (first.ddp - freeze_anchor.ddp).norm() <=
-            axis_factor * failsafe_brake_max_jerk_ * dt +
+            failsafe_brake_max_jerk_ * dt +
                 kBrakeSeamTolerance;
         const bool orientation_continuous =
             computeOrientationError(freeze_anchor.q, first.q).norm() <=
             std::max(freeze_anchor.w.norm(), first.w.norm()) * dt +
-                0.5 * axis_factor *
-                    failsafe_brake_max_angular_acceleration_ * dt * dt +
+                0.5 * failsafe_brake_max_angular_acceleration_ * dt * dt +
                 kBrakeSeamTolerance;
         const bool angular_velocity_continuous =
             (first.w - freeze_anchor.w).norm() <=
-            axis_factor * failsafe_brake_max_angular_acceleration_ * dt +
+            failsafe_brake_max_angular_acceleration_ * dt +
                 kBrakeSeamTolerance;
         const bool angular_acceleration_continuous =
             (first.dw - freeze_anchor.dw).norm() <=
-            axis_factor * failsafe_brake_max_angular_jerk_ * dt +
+            failsafe_brake_max_angular_jerk_ * dt +
                 kBrakeSeamTolerance;
         path_consistent_brake =
             position_continuous && velocity_continuous &&
@@ -1472,6 +1547,9 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
       if (path_consistent_brake) {
         s.nominal_path_time = brake.t;
         s.nominal_path_time_valid = true;
+        s.nominal_path_rate = brake.path_rate;
+        s.nominal_path_acceleration = brake.path_acceleration;
+        s.nominal_path_kinematics_valid = brake.path_kinematics_valid;
       }
       s.p = brake.p;
       s.dp = brake.dp;
@@ -1492,7 +1570,6 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
   // No online k_budget / k_selected update is performed here.
   fill_failsafe_prefix(K_f_target_);
 
-  const double axis_factor = std::sqrt(3.0);
   auto sample_within_limits = [&](const ImpedanceSample& sample) {
     const bool failsafe_limits = sample.failsafe;
     const double max_velocity =
@@ -1540,11 +1617,11 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
            sample.q.coeffs().allFinite() && sample.w.allFinite() &&
            sample.dw.allFinite() && sample.K.allFinite() &&
            sample.D.allFinite() &&
-           sample.dp.norm() <= axis_factor * max_velocity + 1.0e-6 &&
-           sample.ddp.norm() <= axis_factor * max_acceleration + 1.0e-6 &&
-           sample.w.norm() <= axis_factor * max_angular_velocity + 1.0e-6 &&
+           sample.dp.norm() <= max_velocity + 1.0e-6 &&
+           sample.ddp.norm() <= max_acceleration + 1.0e-6 &&
+           sample.w.norm() <= max_angular_velocity + 1.0e-6 &&
            sample.dw.norm() <=
-               axis_factor * max_angular_acceleration + 1.0e-6;
+               max_angular_acceleration + 1.0e-6;
   };
 
   auto transition_within_limits =
@@ -1553,18 +1630,18 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
           bool allow_measured_derivative_reanchor) {
     const bool failsafe_limits = previous.failsafe || current.failsafe;
     const double dt = std::max(current.t - previous.t, kMinDt);
-    const double max_acceleration = axis_factor *
-        (failsafe_limits ? failsafe_brake_max_acceleration_
-                         : local_replan_max_acceleration_);
-    const double max_jerk = axis_factor *
-        (failsafe_limits ? failsafe_brake_max_jerk_
-                         : local_replan_max_jerk_);
-    const double max_angular_acceleration = axis_factor *
-        (failsafe_limits ? failsafe_brake_max_angular_acceleration_
-                         : local_replan_max_angular_acceleration_);
-    const double max_angular_jerk = axis_factor *
-        (failsafe_limits ? failsafe_brake_max_angular_jerk_
-                         : local_replan_max_angular_jerk_);
+    const double max_acceleration =
+        failsafe_limits ? failsafe_brake_max_acceleration_
+                        : local_replan_max_acceleration_;
+    const double max_jerk =
+        failsafe_limits ? failsafe_brake_max_jerk_
+                        : local_replan_max_jerk_;
+    const double max_angular_acceleration =
+        failsafe_limits ? failsafe_brake_max_angular_acceleration_
+                        : local_replan_max_angular_acceleration_;
+    const double max_angular_jerk =
+        failsafe_limits ? failsafe_brake_max_angular_jerk_
+                        : local_replan_max_angular_jerk_;
     constexpr double kPositionTolerance = 1.0e-5;
     constexpr double kVelocityTolerance = 1.0e-5;
     constexpr double kAccelerationTolerance = 1.0e-4;
@@ -1822,6 +1899,8 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
     const Vector6d& ee_twist,
     const Matrix7d& inertia,
     const Matrix67d& J_geo,
+    const Vector7d& coriolis,
+    const Vector6d& control_jdot_dq,
     const Vector7d& previous_torque_command,
     const Matrix6d& K_runtime,
     const Matrix6d& D_runtime,
@@ -1858,6 +1937,29 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
   config.torque_rate_limit = panda_limits::kTorqueRateLimit;
   config.joint_rollout_max_dt = local_replan_dt_;
 
+  // Use the snapshot read by the 1 kHz controller for the rollout's initial
+  // state. J_geo is expressed at the collision center here; shift it back to
+  // the controlled TCP because collision_center_offset is applied separately
+  // inside the joint monitor.
+  config.current_joint_dynamics.control_position = current_position;
+  config.current_joint_dynamics.control_orientation = current_orientation;
+  config.current_joint_dynamics.control_jacobian = J_geo;
+  const Vector3d collision_offset_world =
+      current_orientation.normalized() * ee_collision_center_offset_;
+  config.current_joint_dynamics.control_jacobian.topRows<3>() +=
+      skewSymmetric(collision_offset_world) * J_geo.bottomRows<3>();
+  config.current_joint_dynamics.control_jdot_dq = control_jdot_dq;
+  config.current_joint_dynamics.inertia = inertia;
+  config.current_joint_dynamics.coriolis = coriolis;
+  config.current_joint_dynamics.valid =
+      current_position.allFinite() &&
+      current_orientation.coeffs().allFinite() &&
+      config.current_joint_dynamics.control_jacobian.allFinite() &&
+      control_jdot_dq.allFinite() && inertia.allFinite() &&
+      coriolis.allFinite();
+  config.current_joint_dynamics_valid =
+      config.current_joint_dynamics.valid;
+
   if (monitor_joint_dynamics_provider_) {
     return cps_safety_monitor::verifyReachablePlanJointSpace(
         plan,
@@ -1892,7 +1994,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     double wall_time, double nominal_guess_time,
     const Vector7d& q, const Vector7d& dq,
     const Vector3d& current_position, const Quaterniond& current_orientation,
-    const Vector6d& ee_twist, const Matrix7d& inertia, const Matrix67d& J_geo) {
+    const Vector6d& ee_twist, const Matrix7d& inertia, const Matrix67d& J_geo,
+    const Vector7d& coriolis, const Vector6d& control_jdot_dq) {
   const auto decision_tic = SteadyClock::now();
   double planner_ms = 0.0;
   double plan_build_ms = 0.0;
@@ -1918,6 +2021,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
         ee_twist,
         inertia,
         J_geo,
+        coriolis,
+        control_jdot_dq,
         tau_cmd_prev_,
         K_runtime_,
         D_runtime_,
@@ -1959,6 +2064,12 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
           last_commanded_sample_.nominal_path_time;
       planning_start_command.nominal_path_time_valid =
           last_commanded_sample_.nominal_path_time_valid;
+      planning_start_command.nominal_path_rate =
+          last_commanded_sample_.nominal_path_rate;
+      planning_start_command.nominal_path_acceleration =
+          last_commanded_sample_.nominal_path_acceleration;
+      planning_start_command.nominal_path_kinematics_valid =
+          last_commanded_sample_.nominal_path_kinematics_valid;
     } else {
       planning_start_command.p = current_position;
       planning_start_command.q = current_orientation;
@@ -1977,6 +2088,22 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
         cartesian_effective_time_frozen_ &&
         cartesian_effective_time_hold_sample_valid_ &&
         measured_path_rate_valid_;
+    const bool reanchor_from_scalar_command =
+        !reanchor_from_measured_hold &&
+        planning_start_command.nominal_path_time_valid &&
+        planning_start_command.nominal_path_kinematics_valid;
+    const bool reanchor_path_kinematics =
+        reanchor_from_measured_hold || reanchor_from_scalar_command;
+    const double reanchor_path_rate =
+        reanchor_from_measured_hold
+            ? measured_path_rate_
+            : planning_start_command.nominal_path_rate;
+    const double reanchor_path_acceleration =
+        reanchor_from_measured_hold
+            ? (measured_path_acceleration_valid_
+                   ? measured_path_acceleration_
+                   : 0.0)
+            : planning_start_command.nominal_path_acceleration;
     const auto planner_tic = SteadyClock::now();
     const std::vector<ImpedanceSample> intended_buffer =
         makeIntendedBufferFromReplanner(
@@ -1985,12 +2112,9 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
             commanded_path_rate_,
             path_time_rate_target_,
             commanded_path_time_,
-            reanchor_from_measured_hold,
-            reanchor_from_measured_hold ? measured_path_rate_ : 0.0,
-            reanchor_from_measured_hold &&
-                    measured_path_acceleration_valid_
-                ? measured_path_acceleration_
-                : 0.0,
+            reanchor_path_kinematics,
+            reanchor_path_rate,
+            reanchor_path_acceleration,
             &plan_failure_reason);
     planner_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - planner_tic).count();
@@ -2184,6 +2308,12 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
           input.last_commanded_sample.nominal_path_time;
       planning_start_command.nominal_path_time_valid =
           input.last_commanded_sample.nominal_path_time_valid;
+      planning_start_command.nominal_path_rate =
+          input.last_commanded_sample.nominal_path_rate;
+      planning_start_command.nominal_path_acceleration =
+          input.last_commanded_sample.nominal_path_acceleration;
+      planning_start_command.nominal_path_kinematics_valid =
+          input.last_commanded_sample.nominal_path_kinematics_valid;
     } else {
       planning_start_command.p = input.current_position;
       planning_start_command.q = input.current_orientation;
@@ -2304,6 +2434,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
         input.ee_twist,
         input.inertia,
         input.J_geo,
+        input.coriolis,
+        input.control_jdot_dq,
         input.previous_torque_command,
         input.K_runtime,
         input.D_runtime,
@@ -2382,1326 +2514,17 @@ bool ReachableCartesianImpedanceController::publishAsyncMonitorInput(
 
 bool ReachableCartesianImpedanceController::takeAsyncMonitorOutput(
     AsyncMonitorOutput* output) {
-  if (output == nullptr) {
-    return false;
+  const auto result = async_output_mailbox_.takeLatest(output);
+  if (result.discarded_older > 0) {
+    async_monitor_output_overwrite_count_.fetch_add(
+        result.discarded_older, std::memory_order_relaxed);
   }
-
-  if (!async_output_mutex_.try_lock()) {
-    return false;
-  }
-
-  const bool has_new_output =
-      latest_async_output_.valid &&
-      latest_async_output_.sequence > last_consumed_async_output_sequence_;
-
-  if (has_new_output) {
-    *output = std::move(latest_async_output_);
-    latest_async_output_.valid = false;
-    last_consumed_async_output_sequence_ = output->sequence;
+  if (result.taken) {
     async_monitor_output_consumed_count_.fetch_add(
         1, std::memory_order_relaxed);
   }
-
-  async_output_mutex_.unlock();
-  return has_new_output;
+  return result.taken;
 }
-
-bool ReachableCartesianImpedanceController::takePendingCartesianViaPoints(
-    std::vector<Vector3d>* points,
-    std::vector<Quaterniond>* orientations,
-    std::shared_ptr<CartesianViaMotionGoalHandle>* goal_handle,
-    std::uint64_t* sequence) {
-  if (points == nullptr || orientations == nullptr ||
-      goal_handle == nullptr || sequence == nullptr) {
-    return false;
-  }
-
-  std::lock_guard<std::mutex> lock(pending_cartesian_via_points_mutex_);
-  if (!pending_cartesian_via_points_available_) {
-    return false;
-  }
-
-  *points = pending_cartesian_via_points_;
-  *orientations = pending_cartesian_via_point_quaternions_;
-  *goal_handle = pending_cartesian_via_points_goal_handle_;
-  *sequence = pending_cartesian_via_points_sequence_;
-  pending_cartesian_via_points_available_ = false;
-  pending_cartesian_via_points_goal_handle_.reset();
-  return true;
-}
-
-std::vector<CartesianTrajectorySample>
-ReachableCartesianImpedanceController::buildCartesianViaPointPath(
-    const Vector3d& start_position,
-    const Quaterniond& start_orientation,
-    const std::vector<Vector3d>& via_points,
-    const std::vector<Quaterniond>& via_orientations,
-    std::size_t* waypoint_count) const {
-  std::vector<Vector3d> waypoints;
-  std::vector<Quaterniond> waypoint_orientations;
-  const std::size_t via_pose_count =
-      std::max(via_points.size(), via_orientations.size());
-  waypoints.reserve(via_pose_count + 1);
-  waypoint_orientations.reserve(via_pose_count + 1);
-
-  Quaterniond normalized_start_orientation =
-      normalizedQuaternionOrIdentity(start_orientation);
-  normalized_start_orientation.normalize();
-  waypoints.push_back(start_position);
-  waypoint_orientations.push_back(normalized_start_orientation);
-
-  for (std::size_t i = 0; i < via_pose_count; ++i) {
-    const Vector3d waypoint =
-        i < via_points.size() ? via_points[i] : waypoints.back();
-
-    Quaterniond waypoint_orientation = normalized_start_orientation;
-    if (i < via_orientations.size()) {
-      waypoint_orientation = normalizedQuaternionOrIdentity(via_orientations[i]);
-      waypoint_orientation.normalize();
-    }
-
-    if ((waypoint - waypoints.back()).norm() > 1e-9 ||
-        std::abs(waypoint_orientation.coeffs().dot(
-            waypoint_orientations.back().coeffs())) < 1.0 - 1e-9) {
-      waypoints.push_back(waypoint);
-      waypoint_orientations.push_back(waypoint_orientation);
-    }
-  }
-
-  if (waypoint_count != nullptr) {
-    *waypoint_count = waypoints.size();
-  }
-  if (waypoints.size() < 2) {
-    return {};
-  }
-
-  LocalCartesianReplanConfig via_config;
-  via_config.horizon_steps = local_replan_horizon_steps_;
-  via_config.dt = local_replan_dt_;
-  via_config.path_lookahead_sec = local_path_lookahead_sec_;
-  via_config.max_velocity = local_replan_max_velocity_;
-  via_config.max_acceleration = local_replan_max_acceleration_;
-  via_config.max_jerk = local_replan_max_jerk_;
-  via_config.max_angular_velocity = local_replan_max_angular_velocity_;
-  via_config.max_angular_acceleration = local_replan_max_angular_acceleration_;
-  via_config.max_angular_jerk = local_replan_max_angular_jerk_;
-  return makeSmoothViaPointCartesianTrajectory(
-      waypoints,
-      waypoint_orientations,
-      via_config);
-}
-
-void ReachableCartesianImpedanceController::acceptPendingCartesianViaPoints(
-    const Vector3d& current_position,
-    const Quaterniond& current_orientation,
-    double wall_time) {
-  std::vector<Vector3d> via_points;
-  std::vector<Quaterniond> via_orientations;
-  std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle;
-  std::uint64_t sequence = 0;
-  if (!takePendingCartesianViaPoints(
-          &via_points, &via_orientations, &goal_handle, &sequence)) {
-    return;
-  }
-
-  std::size_t waypoint_count = 0;
-  std::vector<CartesianTrajectorySample> path =
-      buildCartesianViaPointPath(
-          current_position,
-          current_orientation,
-          via_points,
-          via_orientations,
-          &waypoint_count);
-
-  if (path.empty()) {
-    RCLCPP_WARN(
-        get_node()->get_logger(),
-        "Received cartesian_via_points message %lu, but no valid path could be time-parameterized. Keeping the current path.",
-        static_cast<unsigned long>(sequence));
-    if (goal_handle && goal_handle->is_active()) {
-      goal_handle->abort(makeCartesianViaMotionActionResult(
-          SimpleActionResult::REJECTED,
-          "No valid Cartesian via-point path could be time-parameterized."));
-    }
-    return;
-  }
-
-  cartesian_via_points_ = std::move(via_points);
-  cartesian_via_point_quaternions_ = std::move(via_orientations);
-  {
-    std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
-    cartesian_via_point_path_ = std::move(path);
-  }
-
-  resetViaPointExecutionState(current_position, current_orientation, wall_time);
-  command_recording_active_ = true;
-
-  std::shared_ptr<CartesianViaMotionGoalHandle> previous_active_goal;
-  {
-    std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
-    previous_active_goal = active_cartesian_via_points_goal_handle_;
-    active_cartesian_via_points_goal_handle_ = goal_handle;
-    cartesian_via_points_action_last_feedback_wall_time_ = -1.0;
-  }
-  if (previous_active_goal &&
-      previous_active_goal != goal_handle &&
-      previous_active_goal->is_active()) {
-    previous_active_goal->abort(makeCartesianViaMotionActionResult(
-        SimpleActionResult::ABORTED,
-        "Cartesian via-point goal was replaced by a newer via-point command."));
-  }
-
-  std::vector<CartesianTrajectorySample> path_snapshot;
-  {
-    std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
-    path_snapshot = cartesian_via_point_path_;
-  }
-  RCLCPP_INFO(
-      get_node()->get_logger(),
-      "Accepted cartesian_via_points message %lu: poses=%zu waypoints=%zu samples=%zu duration=%.3f s",
-      static_cast<unsigned long>(sequence),
-      cartesian_via_points_.size(),
-      waypoint_count,
-      path_snapshot.size(),
-      path_snapshot.empty() ? 0.0 : path_snapshot.back().t);
-}
-
-void ReachableCartesianImpedanceController::resetViaPointExecutionState(
-    const Vector3d& current_position,
-    const Quaterniond& current_orientation,
-    double wall_time) {
-  paused_nominal_time_sec_ = wall_time;
-  failsafe_start_time_sec_ = -1.0;
-  failsafe_enter_wall_time_sec_ = -1.0;
-  commanded_path_time_ = 0.0;
-  // The nominal Cartesian path is already jerk-limited and starts with zero
-  // Cartesian velocity and acceleration. Run its clock at the requested
-  // nominal rate immediately; ramping this scalar from zero would apply a
-  // second acceleration profile on top of the smooth timed path.
-  commanded_path_rate_ = path_time_rate_target_;
-  mode_ = SafetyMode::kNominal;
-
-  last_verified_plan_ = VerifiedPlan{};
-  ++last_verified_plan_generation_;
-  last_verified_command_stage_ = 0;
-  last_verified_command_index_ = 0;
-  contact_intended_plan_ = VerifiedPlan{};
-  contact_intended_input_control_sequence_ = 0;
-  contact_intended_input_wall_time_ = -1.0;
-  last_shield_decision_valid_ = false;
-  last_async_output_valid_ = false;
-  last_async_output_wall_time_ = -1.0;
-  // Start a fresh monitor phase immediately for the new trajectory without
-  // depending on ROS/simulation wall time.
-  next_async_monitor_control_sequence_ = control_update_sequence_;
-  cartesian_effective_time_frozen_ = false;
-  contact_verification_hold_active_ = false;
-  contact_verification_hold_reason_ = FallbackReason::kNone;
-  cartesian_effective_time_freeze_start_wall_time_ = -1.0;
-  cartesian_effective_time_hold_sample_valid_ = false;
-  cartesian_energy_hold_dp_ds_.setZero();
-  cartesian_energy_hold_w_ds_.setZero();
-  cartesian_energy_hold_tangent_valid_ = false;
-  measured_path_rate_ = 0.0;
-  measured_path_rate_valid_ = false;
-  measured_path_acceleration_ = 0.0;
-  measured_path_acceleration_valid_ = false;
-  cartesian_effective_time_hold_monitor_ = MonitorResult{};
-
-  {
-    std::lock_guard<std::mutex> input_lock(async_input_mutex_);
-    async_input_pending_ = false;
-  }
-  {
-    std::lock_guard<std::mutex> output_lock(async_output_mutex_);
-    latest_async_output_ = AsyncMonitorOutput{};
-    last_consumed_async_output_sequence_ = 0;
-  }
-
-  last_commanded_sample_ = ImpedanceSample{};
-  last_commanded_sample_.t = 0.0;
-  last_commanded_sample_.p = current_position;
-  last_commanded_sample_.dp.setZero();
-  last_commanded_sample_.ddp.setZero();
-  last_commanded_sample_.q = normalizedQuaternionOrIdentity(current_orientation);
-  last_commanded_sample_.w.setZero();
-  last_commanded_sample_.dw.setZero();
-  last_commanded_sample_.K = K_nominal_;
-  last_commanded_sample_.D = D_nominal_;
-  last_commanded_sample_.failsafe = false;
-  last_commanded_sample_valid_ = true;
-  bool active_path_available = false;
-  {
-    std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
-    active_path_available = !cartesian_via_point_path_.empty();
-  }
-  if (active_path_available && !anchorLastCommandedSampleToPathStart()) {
-    RCLCPP_ERROR(
-        get_node()->get_logger(),
-        "Strict path-consistent execution could not anchor the new path to "
-        "the current command state. Holding until a continuous path is supplied.");
-  }
-}
-
-void ReachableCartesianImpedanceController::updateCartesianViaPointsActionStatus(
-    const Vector3d& current_position,
-    const Quaterniond& current_orientation,
-    double wall_time) {
-  std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle;
-  {
-    std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
-    goal_handle = active_cartesian_via_points_goal_handle_;
-  }
-
-  if (!goal_handle) {
-    return;
-  }
-
-  if (goal_handle->is_canceling()) {
-    {
-      std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
-      cartesian_via_point_path_.clear();
-    }
-    cartesian_via_points_.clear();
-    cartesian_via_point_quaternions_.clear();
-    resetViaPointExecutionState(current_position, current_orientation, wall_time);
-    goal_handle->canceled(makeCartesianViaMotionActionResult(
-        SimpleActionResult::PREEMPTED,
-        "Cartesian via-point goal was canceled."));
-    {
-      std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
-      if (active_cartesian_via_points_goal_handle_ == goal_handle) {
-        active_cartesian_via_points_goal_handle_.reset();
-      }
-    }
-    return;
-  }
-
-  if (!goal_handle->is_active()) {
-    std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
-    if (active_cartesian_via_points_goal_handle_ == goal_handle) {
-      active_cartesian_via_points_goal_handle_.reset();
-    }
-    return;
-  }
-
-  double path_duration = 0.0;
-  {
-    std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
-    if (!cartesian_via_point_path_.empty()) {
-      path_duration = cartesian_via_point_path_.back().t;
-    }
-  }
-
-  if (path_duration <= kMinDt) {
-    return;
-  }
-
-  const double progress =
-      std::clamp(commanded_path_time_ / path_duration, 0.0, 1.0);
-  bool should_publish_feedback = false;
-  {
-    std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
-    should_publish_feedback =
-        cartesian_via_points_action_last_feedback_wall_time_ < 0.0 ||
-        wall_time - cartesian_via_points_action_last_feedback_wall_time_ >=
-            cartesian_via_points_action_feedback_period_sec_;
-    if (should_publish_feedback) {
-      cartesian_via_points_action_last_feedback_wall_time_ = wall_time;
-    }
-  }
-
-  if (should_publish_feedback) {
-    auto feedback = std::make_shared<CartesianViaMotion::Feedback>();
-    feedback->progress = static_cast<float>(progress);
-    feedback->time_to_completion =
-        static_cast<float>(std::max(0.0, path_duration - commanded_path_time_));
-    goal_handle->publish_feedback(feedback);
-  }
-
-  const bool path_finished =
-      commanded_path_time_ >= path_duration - kMinDt &&
-      isNominalSafetyMode(mode_) &&
-      !cartesian_effective_time_frozen_;
-  if (!path_finished) {
-    return;
-  }
-
-  goal_handle->succeed(makeCartesianViaMotionActionResult(
-      SimpleActionResult::SUCCESS,
-      "Cartesian via-point goal completed."));
-  {
-    std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
-    if (active_cartesian_via_points_goal_handle_ == goal_handle) {
-      active_cartesian_via_points_goal_handle_.reset();
-    }
-  }
-}
-
-rclcpp_action::GoalResponse
-ReachableCartesianImpedanceController::handleCartesianViaPointsActionGoal(
-    const rclcpp_action::GoalUUID& uuid,
-    std::shared_ptr<const CartesianViaMotion::Goal> goal) {
-  (void)uuid;
-  if (!goal || goal->via_poses.empty()) {
-    RCLCPP_WARN(
-        get_node()->get_logger(),
-        "Rejecting Cartesian via-point action goal because it contains no poses.");
-    return rclcpp_action::GoalResponse::REJECT;
-  }
-
-  for (std::size_t i = 0; i < goal->via_poses.size(); ++i) {
-    const auto& pose = goal->via_poses[i];
-    const Vector3d position(
-        pose.position.x,
-        pose.position.y,
-        pose.position.z);
-    const Quaterniond orientation(
-        pose.orientation.w,
-        pose.orientation.x,
-        pose.orientation.y,
-        pose.orientation.z);
-    if (!std::isfinite(position.x()) ||
-        !std::isfinite(position.y()) ||
-        !std::isfinite(position.z())) {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "Rejecting Cartesian via-point action goal because pose %zu has a non-finite position.",
-          i);
-      return rclcpp_action::GoalResponse::REJECT;
-    }
-    const double orientation_norm = orientation.norm();
-    if (!std::isfinite(orientation_norm) || orientation_norm < 1.0e-12) {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "Rejecting Cartesian via-point action goal because pose %zu has an invalid quaternion.",
-          i);
-      return rclcpp_action::GoalResponse::REJECT;
-    }
-  }
-
-  return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
-}
-
-rclcpp_action::CancelResponse
-ReachableCartesianImpedanceController::handleCartesianViaPointsActionCancel(
-    const std::shared_ptr<CartesianViaMotionGoalHandle> /*goal_handle*/) {
-  return rclcpp_action::CancelResponse::ACCEPT;
-}
-
-void ReachableCartesianImpedanceController::handleCartesianViaPointsActionAccepted(
-    const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle) {
-  if (!goal_handle) {
-    return;
-  }
-
-  const auto goal = goal_handle->get_goal();
-  std::vector<Vector3d> points;
-  std::vector<Quaterniond> orientations;
-  points.reserve(goal->via_poses.size());
-  orientations.reserve(goal->via_poses.size());
-
-  for (const auto& pose : goal->via_poses) {
-    points.emplace_back(pose.position.x, pose.position.y, pose.position.z);
-    orientations.push_back(normalizedQuaternionOrIdentity(Quaterniond(
-        pose.orientation.w,
-        pose.orientation.x,
-        pose.orientation.y,
-        pose.orientation.z)));
-  }
-
-  std::shared_ptr<CartesianViaMotionGoalHandle> previous_pending_goal;
-  std::uint64_t sequence = 0;
-  {
-    std::lock_guard<std::mutex> lock(pending_cartesian_via_points_mutex_);
-    previous_pending_goal = pending_cartesian_via_points_goal_handle_;
-    pending_cartesian_via_points_ = std::move(points);
-    pending_cartesian_via_point_quaternions_ = std::move(orientations);
-    pending_cartesian_via_points_goal_handle_ = goal_handle;
-    sequence = ++pending_cartesian_via_points_sequence_;
-    pending_cartesian_via_points_available_ = true;
-  }
-
-  std::shared_ptr<CartesianViaMotionGoalHandle> previous_active_goal;
-  {
-    std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
-    previous_active_goal = active_cartesian_via_points_goal_handle_;
-    if (previous_active_goal && previous_active_goal != goal_handle) {
-      active_cartesian_via_points_goal_handle_.reset();
-    }
-  }
-
-  if (previous_pending_goal &&
-      previous_pending_goal != goal_handle &&
-      previous_pending_goal->is_active()) {
-    previous_pending_goal->abort(makeCartesianViaMotionActionResult(
-        SimpleActionResult::ABORTED,
-        "Cartesian via-point goal was replaced by a newer action goal."));
-  }
-  if (previous_active_goal &&
-      previous_active_goal != goal_handle &&
-      previous_active_goal->is_active()) {
-    previous_active_goal->abort(makeCartesianViaMotionActionResult(
-        SimpleActionResult::ABORTED,
-        "Cartesian via-point goal was replaced by a newer action goal."));
-  }
-
-  RCLCPP_INFO(
-      get_node()->get_logger(),
-      "Queued Cartesian via-point action goal %lu with %zu poses.",
-      static_cast<unsigned long>(sequence),
-      goal->via_poses.size());
-}
-
-void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop() {
-  bool worker_affinity_applied = false;
-  if (monitor_worker_cpu_affinity_ >= 0) {
-    cpu_set_t cpu_set;
-    CPU_ZERO(&cpu_set);
-    if (monitor_worker_cpu_affinity_ < CPU_SETSIZE) {
-      CPU_SET(monitor_worker_cpu_affinity_, &cpu_set);
-      const int affinity_result = pthread_setaffinity_np(
-          pthread_self(), sizeof(cpu_set), &cpu_set);
-      if (affinity_result == 0) {
-        worker_affinity_applied = true;
-        RCLCPP_INFO(
-            get_node()->get_logger(),
-            "Safety monitor worker pinned to CPU %d.",
-            monitor_worker_cpu_affinity_);
-      } else {
-        RCLCPP_WARN(
-            get_node()->get_logger(),
-            "Failed to pin safety monitor worker to CPU %d: %s",
-            monitor_worker_cpu_affinity_,
-            std::strerror(affinity_result));
-      }
-    } else {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "monitor_worker_cpu_affinity=%d exceeds CPU_SETSIZE=%d; affinity disabled.",
-          monitor_worker_cpu_affinity_,
-          CPU_SETSIZE);
-    }
-  }
-
-  if (monitor_worker_realtime_priority_ > 0) {
-    if (!worker_affinity_applied) {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "Safety monitor SCHED_FIFO priority %d was requested without a "
-          "successfully applied dedicated CPU affinity; keeping the default "
-          "scheduler to protect the controller update thread.",
-          monitor_worker_realtime_priority_);
-    } else {
-      sched_param scheduling_parameters{};
-      scheduling_parameters.sched_priority =
-          monitor_worker_realtime_priority_;
-      const int scheduling_result = pthread_setschedparam(
-          pthread_self(), SCHED_FIFO, &scheduling_parameters);
-      if (scheduling_result == 0) {
-        RCLCPP_INFO(
-            get_node()->get_logger(),
-            "Safety monitor worker uses SCHED_FIFO priority %d on its dedicated CPU.",
-            monitor_worker_realtime_priority_);
-      } else {
-        RCLCPP_WARN(
-            get_node()->get_logger(),
-            "Failed to set safety monitor worker SCHED_FIFO priority %d: %s. "
-            "Continuing with the default scheduler.",
-            monitor_worker_realtime_priority_,
-            std::strerror(scheduling_result));
-      }
-    }
-  }
-
-  VerifiedPlan last_verified_plan;
-
-  while (safety_monitor_worker_running_.load()) {
-    AsyncMonitorInput input;
-
-    {
-      std::unique_lock<std::mutex> lock(async_input_mutex_);
-      async_input_cv_.wait(lock, [&]() {
-        return async_input_pending_ || !safety_monitor_worker_running_.load();
-      });
-
-      if (!safety_monitor_worker_running_.load()) {
-        break;
-      }
-
-      input = std::move(latest_async_input_);
-      async_input_pending_ = false;
-    }
-
-    const std::int64_t worker_start_ns = steadyNowNanoseconds();
-    AsyncMonitorOutput output;
-    output.sequence = input.sequence;
-    output.input_wall_time = input.wall_time;
-    output.valid = true;
-    output.worker_start_steady_time_ns = worker_start_ns;
-    output.worker_queue_wait_ms = nanosecondsToMilliseconds(
-        std::max<std::int64_t>(
-            0, worker_start_ns - input.publish_steady_time_ns));
-    output.decision =
-        computeShieldDecisionForAsyncInput(input, last_verified_plan);
-    output.input = std::move(input);
-    output.worker_finish_steady_time_ns = steadyNowNanoseconds();
-    output.worker_compute_ms = nanosecondsToMilliseconds(
-        std::max<std::int64_t>(
-            0,
-            output.worker_finish_steady_time_ns -
-                output.worker_start_steady_time_ns));
-    async_monitor_worker_processed_count_.fetch_add(
-        1, std::memory_order_relaxed);
-
-    {
-      std::lock_guard<std::mutex> lock(async_output_mutex_);
-      if (latest_async_output_.valid) {
-        async_monitor_output_overwrite_count_.fetch_add(
-            1, std::memory_order_relaxed);
-      }
-      latest_async_output_ = std::move(output);
-    }
-  }
-}
-
-void ReachableCartesianImpedanceController::startSafetyMonitorWorker() {
-  if (!async_safety_monitor_ || safety_monitor_worker_running_.load()) {
-    return;
-  }
-
-  safety_monitor_worker_running_.store(true);
-  async_input_pending_ = false;
-  latest_async_output_ = AsyncMonitorOutput{};
-  last_consumed_async_output_sequence_ = 0;
-  last_async_output_wall_time_ = -1.0;
-  last_async_output_valid_ = false;
-
-  safety_monitor_worker_thread_ =
-      std::thread(&ReachableCartesianImpedanceController::safetyMonitorWorkerLoop, this);
-}
-
-void ReachableCartesianImpedanceController::stopSafetyMonitorWorker() {
-  if (!safety_monitor_worker_running_.exchange(false)) {
-    return;
-  }
-
-  async_input_cv_.notify_all();
-
-  if (safety_monitor_worker_thread_.joinable()) {
-    safety_monitor_worker_thread_.join();
-  }
-}
-
-void ReachableCartesianImpedanceController::handleCartesianViaPoints(
-    const geometry_msgs::msg::PoseArray::SharedPtr msg) {
-  if (!msg) {
-    return;
-  }
-
-  const std::string& frame_id = msg->header.frame_id;
-  const std::string robot_base_frame_id =
-      arm_id_.empty() ? "panda_link0" : arm_id_ + "_link0";
-  if (!frame_id.empty() && frame_id != robot_base_frame_id) {
-    RCLCPP_WARN(
-        get_node()->get_logger(),
-        "Received cartesian_via_points in frame '%s'. Interpreting poses as robot base frame '%s'.",
-        frame_id.c_str(),
-        robot_base_frame_id.c_str());
-  }
-
-  std::vector<Vector3d> points;
-  std::vector<Quaterniond> orientations;
-  points.reserve(msg->poses.size());
-  orientations.reserve(msg->poses.size());
-
-  for (std::size_t i = 0; i < msg->poses.size(); ++i) {
-    const auto& pose = msg->poses[i];
-    const Vector3d position(
-        pose.position.x,
-        pose.position.y,
-        pose.position.z);
-    const Quaterniond orientation(
-        pose.orientation.w,
-        pose.orientation.x,
-        pose.orientation.y,
-        pose.orientation.z);
-
-    if (!std::isfinite(position.x()) ||
-        !std::isfinite(position.y()) ||
-        !std::isfinite(position.z())) {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "Ignoring cartesian_via_points message because pose %zu has a non-finite position.",
-          i);
-      return;
-    }
-
-    const double orientation_norm = orientation.norm();
-    if (!std::isfinite(orientation_norm) || orientation_norm < 1.0e-12) {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "Ignoring cartesian_via_points message because pose %zu has an invalid quaternion.",
-          i);
-      return;
-    }
-
-    points.push_back(position);
-    orientations.push_back(normalizedQuaternionOrIdentity(orientation));
-  }
-
-  if (points.empty()) {
-    RCLCPP_WARN(
-        get_node()->get_logger(),
-        "Ignoring empty cartesian_via_points PoseArray message.");
-    return;
-  }
-
-  std::uint64_t sequence = 0;
-  {
-    std::lock_guard<std::mutex> lock(pending_cartesian_via_points_mutex_);
-    pending_cartesian_via_points_ = std::move(points);
-    pending_cartesian_via_point_quaternions_ = std::move(orientations);
-    pending_cartesian_via_points_goal_handle_.reset();
-    sequence = ++pending_cartesian_via_points_sequence_;
-    pending_cartesian_via_points_available_ = true;
-  }
-
-  RCLCPP_INFO(
-      get_node()->get_logger(),
-      "Queued cartesian_via_points message %lu with %zu base-frame poses.",
-      static_cast<unsigned long>(sequence),
-      msg->poses.size());
-}
-
-void ReachableCartesianImpedanceController::handleMujocoContactSensor(
-    const mujoco_ros_msgs::msg::ScalarStamped::SharedPtr msg) {
-  const double value = msg->value;
-  latest_mujoco_contact_value_.store(value, std::memory_order_relaxed);
-  latest_mujoco_contact_msg_time_.store(
-      rclcpp::Time(msg->header.stamp).seconds(),
-      std::memory_order_relaxed);
-
-  const bool active = value > mujoco_contact_threshold_;
-  latest_mujoco_contact_active_.store(active, std::memory_order_relaxed);
-}
-
-void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
-    double wall_time,
-    double nominal_guess_time,
-    const Vector7d& current_q,
-    const Vector7d& current_dq,
-    const Vector3d& current_position,
-    const Quaterniond& current_orientation,
-    const Vector6d& ee_twist,
-    const Matrix7d& inertia,
-    const Matrix37d& Jv,
-    const Matrix6d& K_runtime,
-    const Matrix6d& D_runtime,
-    const cps_human_workspace::HumanWorkspace& human_workspace,
-    const VerifiedPlan& evaluated_plan,
-    const std::vector<JointPredictionSample>& joint_prediction_trace,
-    const AsyncMonitorTiming& async_timing,
-    const MonitorResult& monitor,
-    int mode,
-    bool candidate_verified,
-    bool executing_last_verified_monitored,
-    double monitor_total_ms,
-    double planner_ms,
-    double plan_build_ms,
-    double monitor_eval_ms,
-    const char* source) {
-  if (!enable_prediction_logging_ || !prediction_log_writer_.running() ||
-      !command_recording_active_ ||
-      !evaluated_plan.valid) {
-    return;
-  }
-
-  prediction_log_writer_.tryEmplace([&](PredictionLogRecord& record) {
-    record.wall_time = wall_time;
-    record.nominal_guess_time = nominal_guess_time;
-    record.current_q = current_q;
-    record.current_dq = current_dq;
-    record.current_position = current_position;
-    record.current_orientation = current_orientation;
-    record.ee_twist = ee_twist;
-    record.inertia = inertia;
-    record.Jv = Jv;
-    record.K_runtime = K_runtime;
-    record.D_runtime = D_runtime;
-    record.human_workspace = human_workspace;
-    record.evaluated_plan = evaluated_plan;
-    record.joint_prediction_trace = joint_prediction_trace;
-    record.async_timing = async_timing;
-    record.monitor = monitor;
-    record.mode = mode;
-    record.candidate_verified = candidate_verified;
-    record.executing_last_verified_monitored =
-        executing_last_verified_monitored;
-    record.monitor_total_ms = monitor_total_ms;
-    record.planner_ms = planner_ms;
-    record.plan_build_ms = plan_build_ms;
-    record.monitor_eval_ms = monitor_eval_ms;
-    record.async_source = source != nullptr && std::strcmp(source, "async") == 0;
-  });
-}
-
-void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
-    std::ostream& output,
-    double wall_time,
-    double nominal_guess_time,
-    const Vector7d& current_q,
-    const Vector7d& current_dq,
-    const Vector3d& current_position,
-    const Quaterniond& current_orientation,
-    const Vector6d& ee_twist,
-    const Matrix7d& inertia,
-    const Matrix37d& Jv,
-    const Matrix6d& K_runtime,
-    const Matrix6d& D_runtime,
-    const cps_human_workspace::HumanWorkspace& human_workspace,
-    const VerifiedPlan& evaluated_plan,
-    const std::vector<JointPredictionSample>& joint_prediction_trace,
-    const AsyncMonitorTiming& async_timing,
-    const MonitorResult& monitor,
-    int mode,
-    bool candidate_verified,
-    bool executing_last_verified_monitored,
-    double monitor_total_ms,
-    double planner_ms,
-    double plan_build_ms,
-    double monitor_eval_ms,
-    const char* source) {
-  if (!evaluated_plan.valid) {
-    return;
-  }
-
-  struct PredictionRow {
-    const char* stage{""};
-    int index{0};
-    bool failsafe{false};
-    double sample_t{0.0};
-    double dt{0.0};
-    Vector3d collision_target_p{Vector3d::Zero()};
-    Vector3d x_pred{Vector3d::Zero()};
-    Vector3d v_pred{Vector3d::Zero()};
-    Vector3d x_next{Vector3d::Zero()};
-    Vector3d v_next{Vector3d::Zero()};
-    Vector3d a_pred{Vector3d::Zero()};
-    bool joint_state_valid{false};
-    double joint_sample_t{std::numeric_limits<double>::quiet_NaN()};
-    Vector7d joint_q{Vector7d::Constant(
-        std::numeric_limits<double>::quiet_NaN())};
-    Vector7d joint_dq{Vector7d::Constant(
-        std::numeric_limits<double>::quiet_NaN())};
-    double d_segment{0.0};
-    Vector3d human_center_end{Vector3d::Zero()};
-    bool contact_possible{false};
-    double Kx{0.0};
-    double Ky{0.0};
-    double Kz{0.0};
-    double Dx{0.0};
-    double Dy{0.0};
-    double Dz{0.0};
-  };
-
-  const VerifiedPlan monitor_plan = makeSparsePlanForMonitor(evaluated_plan);
-  const VerifiedPlan collision_plan =
-      makeCollisionCenterPlanForMonitor(monitor_plan);
-  const Vector3d collision_center =
-      current_position + collisionCenterOffsetWorld(current_orientation);
-  const Vector6d collision_twist =
-      twistAtCollisionCenter(current_orientation, ee_twist);
-
-  const double acc_error_bound =
-      std::max(0.0, tracking_acc_error_bound_);
-
-  Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
-  task_inertia_inv.diagonal().array() += kSmallPositive;
-  Matrix6d K_exec = K_runtime;
-  Matrix6d D_exec = D_runtime;
-
-  Vector3d x_pred = collision_center;
-  Vector3d v_pred = collision_twist.head<3>();
-  Matrix6d tracking_tube = Matrix6d::Zero();
-  double t_prev = collision_plan.anchor.t;
-  std::vector<PredictionRow> rows;
-  rows.reserve(1 + collision_plan.intended.size() + collision_plan.failsafe.size());
-  std::size_t joint_trace_index = 0;
-
-  auto append_row = [&](const char* stage,
-                        int index,
-                        const ImpedanceSample& collision_sample,
-                        double dtp) {
-    const double segment_start_time_sec = wall_time + t_prev;
-    const double segment_end_time_sec = wall_time + collision_sample.t;
-    K_exec = collision_sample.K;
-    D_exec = collision_sample.D;
-
-    const Matrix3d Kp_raw = K_exec.topLeftCorner<3, 3>();
-    const Matrix3d Dp_raw = D_exec.topLeftCorner<3, 3>();
-    const Matrix3d Kp = positiveSemidefinitePart(Kp_raw);
-    const Matrix3d Dp = positiveSemidefinitePart(Dp_raw);
-    const Vector3d force_pred =
-        Kp_raw * (collision_sample.p - x_pred) -
-        Dp_raw * (v_pred - collision_sample.dp);
-    Vector3d a_pred = Vector3d::Zero();
-    if (use_dynamic_consistent_impedance_) {
-      a_pred = collision_sample.ddp + task_inertia_inv * force_pred;
-    } else {
-      a_pred = task_inertia_inv * force_pred;
-    }
-
-    const Vector3d x_next =
-        x_pred + v_pred * dtp + 0.5 * a_pred * dtp * dtp;
-    const Vector3d v_next = v_pred + a_pred * dtp;
-
-    const Matrix6d tracking_tube_next =
-        propagateTrackingTube(
-            tracking_tube,
-            task_inertia_inv,
-            Kp,
-            Dp,
-            dtp,
-            acc_error_bound);
-    const double rho_p_segment =
-        std::max(maxTrackingBlockRadius(tracking_tube, 0),
-                 maxTrackingBlockRadius(tracking_tube_next, 0));
-    const double inflated_contact_radius_segment =
-        human_workspace.inflatedCollisionRadius(
-            ee_collision_radius_,
-            rho_p_segment);
-
-    PredictionRow row;
-    row.stage = stage;
-    row.index = index;
-    row.failsafe = collision_sample.failsafe;
-    row.sample_t = collision_sample.t;
-    row.dt = dtp;
-    row.collision_target_p = collision_sample.p;
-    row.x_pred = x_pred;
-    row.v_pred = v_pred;
-    row.x_next = x_next;
-    row.v_next = v_next;
-    row.a_pred = a_pred;
-    while (joint_trace_index + 1 < joint_prediction_trace.size() &&
-           std::abs(joint_prediction_trace[joint_trace_index + 1].t -
-                    collision_sample.t) <=
-               std::abs(joint_prediction_trace[joint_trace_index].t -
-                        collision_sample.t)) {
-      ++joint_trace_index;
-    }
-    if (joint_trace_index < joint_prediction_trace.size()) {
-      const JointPredictionSample& joint_sample =
-          joint_prediction_trace[joint_trace_index];
-      if (std::abs(joint_sample.t - collision_sample.t) <= 1.0e-8 &&
-          joint_sample.q.allFinite() && joint_sample.dq.allFinite()) {
-        row.joint_state_valid = true;
-        row.joint_sample_t = joint_sample.t;
-        row.joint_q = joint_sample.q;
-        row.joint_dq = joint_sample.dq;
-      }
-    }
-    row.human_center_end = human_workspace.centerAtTime(segment_end_time_sec);
-    row.d_segment =
-        human_workspace.signedDistanceSegmentToInflatedSphere(
-            x_pred,
-            x_next,
-            inflated_contact_radius_segment,
-            segment_start_time_sec,
-            segment_end_time_sec);
-    row.contact_possible = row.d_segment <= 0.0;
-    row.Kx = K_exec(0, 0);
-    row.Ky = K_exec(1, 1);
-    row.Kz = K_exec(2, 2);
-    row.Dx = D_exec(0, 0);
-    row.Dy = D_exec(1, 1);
-    row.Dz = D_exec(2, 2);
-    rows.push_back(row);
-
-    x_pred = x_next;
-    v_pred = v_next;
-    tracking_tube = tracking_tube_next;
-  };
-
-  auto append_samples = [&](const char* stage,
-                            const std::vector<ImpedanceSample>& collision_samples) {
-    for (std::size_t i = 0; i < collision_samples.size(); ++i) {
-      const double dtp = std::max(collision_samples[i].t - t_prev, kMinDt);
-      append_row(stage,
-                 static_cast<int>(i),
-                 collision_samples[i],
-                 dtp);
-      t_prev = collision_samples[i].t;
-    }
-  };
-
-  append_samples("intended", collision_plan.intended);
-  append_samples("failsafe", collision_plan.failsafe);
-
-  const double actual_collision_distance =
-      human_workspace.signedDistanceToInflatedSphere(
-          collision_center,
-          human_workspace.inflatedCollisionRadius(
-              ee_collision_radius_,
-              0.0),
-          wall_time);
-  const Vector3d actual_human_center = human_workspace.centerAtTime(wall_time);
-
-  output << std::fixed << std::setprecision(9);
-  for (const auto& row : rows) {
-    output
-        << wall_time << "," << nominal_guess_time << ","
-        << (source == nullptr ? "" : source) << ","
-        << static_cast<int>(async_timing.valid) << ","
-        << async_timing.input_sequence << ","
-        << async_timing.input_control_loop_sequence << ","
-        << async_timing.scheduled_control_loop_sequence << ","
-        << async_timing.publish_lateness_cycles << ","
-        << async_timing.worker_queue_wait_ms << ","
-        << async_timing.worker_compute_ms << ","
-        << async_timing.output_handoff_ms << ","
-        << async_timing.end_to_end_ms << ","
-        << monitor_total_ms << ","
-        << planner_ms << ","
-        << plan_build_ms << ","
-        << monitor_eval_ms << ","
-        << mode << ","
-        << static_cast<int>(candidate_verified) << ","
-        << static_cast<int>(executing_last_verified_monitored) << ","
-        << static_cast<int>(monitor.predicted_trigger) << ","
-        << static_cast<int>(monitor.monitored_contact_possible) << ","
-        << monitor_plan.intended.size() << ","
-        << monitor_plan.failsafe.size() << ","
-        << row.stage << "," << row.index << ","
-        << static_cast<int>(row.failsafe) << ","
-        << row.sample_t << "," << row.dt << ","
-        << collision_center(0) << "," << collision_center(1) << "," << collision_center(2) << ","
-        << actual_human_center(0) << "," << actual_human_center(1) << "," << actual_human_center(2) << ","
-        << actual_collision_distance << ","
-        << current_q(0) << "," << current_q(1) << "," << current_q(2) << ","
-        << current_q(3) << "," << current_q(4) << "," << current_q(5) << ","
-        << current_q(6) << ","
-        << current_dq(0) << "," << current_dq(1) << "," << current_dq(2) << ","
-        << current_dq(3) << "," << current_dq(4) << "," << current_dq(5) << ","
-        << current_dq(6) << ","
-        << row.collision_target_p(0) << "," << row.collision_target_p(1) << "," << row.collision_target_p(2) << ","
-        << row.x_pred(0) << "," << row.x_pred(1) << "," << row.x_pred(2) << ","
-        << row.v_pred(0) << "," << row.v_pred(1) << "," << row.v_pred(2) << ","
-        << row.x_next(0) << "," << row.x_next(1) << "," << row.x_next(2) << ","
-        << row.v_next(0) << "," << row.v_next(1) << "," << row.v_next(2) << ","
-        << row.a_pred(0) << "," << row.a_pred(1) << "," << row.a_pred(2) << ","
-        << static_cast<int>(row.joint_state_valid) << ","
-        << row.joint_sample_t << ","
-        << row.joint_q(0) << "," << row.joint_q(1) << "," << row.joint_q(2) << ","
-        << row.joint_q(3) << "," << row.joint_q(4) << "," << row.joint_q(5) << ","
-        << row.joint_q(6) << ","
-        << row.joint_dq(0) << "," << row.joint_dq(1) << "," << row.joint_dq(2) << ","
-        << row.joint_dq(3) << "," << row.joint_dq(4) << "," << row.joint_dq(5) << ","
-        << row.joint_dq(6) << ","
-        << row.human_center_end(0) << "," << row.human_center_end(1) << "," << row.human_center_end(2) << ","
-        << row.d_segment << ","
-        << static_cast<int>(row.contact_possible) << ","
-        << row.Kx << "," << row.Ky << "," << row.Kz << ","
-        << row.Dx << "," << row.Dy << "," << row.Dz << ","
-        << monitor.worst_case_cartesian_kinetic_energy_ub << ","
-        << monitor.worst_case_joint_kinetic_energy_ub << ","
-        << monitor.worst_case_cartesian_potential_energy_ub << ","
-        << monitor.worst_case_total_control_energy_ub << ","
-        << monitor.terminal_energy_ub << ","
-        << monitor.workspace_distance_margin << ","
-        << monitor.h_monitored_energy << ","
-        << static_cast<int>(monitor.current_cartesian_energy_valid) << ","
-        << monitor.current_cartesian_kinetic_energy << ","
-        << static_cast<int>(monitor.current_joint_energy_valid) << ","
-        << monitor.current_joint_kinetic_energy << ","
-        << monitor.current_cartesian_potential_energy << ","
-        << monitor.current_total_control_energy << ","
-        << static_cast<int>(monitor.joint_limit_unsafe) << ","
-        << monitor.joint_limit_index << ","
-        << monitor.joint_position_violation << ","
-        << monitor.joint_velocity_violation << ","
-        << monitor.joint_acceleration_violation << ","
-        << monitor.joint_torque_violation << "\n";
-  }
-}
-
-bool ReachableCartesianImpedanceController::startLogWriters() {
-  const std::string control_header =
-      "wall_time_sec,nominal_time_sec,paused_nominal_time_sec,"
-      "commanded_path_time_sec,command_path_time_sec,"
-      "command_path_time_valid,commanded_path_rate,"
-      "generator_target_path_rate,measured_path_rate,"
-      "measured_path_rate_valid,measured_path_acceleration,"
-      "measured_path_acceleration_valid,mode,execution_stage,fallback_reason,"
-      "plan_failure_reason,candidate_verified,monitor_prediction_valid,"
-      "predicted_trigger,predicted_contact_possible,"
-      "monitored_contact_possible,contact_relevant_for_energy,"
-      "collision_energy_unsafe,monitored_unsafe,joint_limit_unsafe,"
-      "joint_limit_index,joint_position_violation,joint_velocity_violation,"
-      "joint_acceleration_violation,joint_torque_violation,workspace_distance_now,"
-      "workspace_distance_min,workspace_distance_margin,"
-      "measured_q1,measured_q2,measured_q3,measured_q4,measured_q5,"
-      "measured_q6,measured_q7,measured_dq1,measured_dq2,measured_dq3,"
-      "measured_dq4,measured_dq5,measured_dq6,measured_dq7,"
-      "des_px,des_py,des_pz,cur_px,cur_py,cur_pz,"
-      "cur_vx,cur_vy,cur_vz,cur_wx,cur_wy,cur_wz,"
-      "collision_center_px,collision_center_py,collision_center_pz,"
-      "human_center_px,human_center_py,human_center_pz,"
-      "collision_center_vx,collision_center_vy,collision_center_vz,"
-      "des_vx,des_vy,des_vz,err_px,err_py,err_pz,err_rx,err_ry,err_rz,"
-      "tau_cmd_norm,torque_rate_limited,torque_rate_max_ratio,Kx,Ky,Kz,Dx,Dy,Dz,"
-      "worst_case_contact_time,worst_case_workspace_distance_at_candidate,"
-      "worst_case_cartesian_kinetic_energy_ub,"
-      "worst_case_joint_kinetic_energy_ub,"
-      "worst_case_cartesian_potential_energy_ub,"
-      "worst_case_total_control_energy_ub,"
-      "h_monitored_energy,terminal_energy_ub,h_terminal_energy,"
-      "worst_case_pos_error_radius,worst_case_vel_error_radius,"
-      "monitor_current_cartesian_energy_valid,"
-      "monitor_current_cartesian_kinetic_energy,"
-      "monitor_current_joint_energy_valid,"
-      "monitor_current_joint_kinetic_energy,"
-      "monitor_current_cartesian_potential_energy,"
-      "monitor_current_total_control_energy,monitored_steps,"
-      "monitored_intended_steps,"
-      "monitored_failsafe_steps,control_loop_sequence,"
-      "monitor_period_control_cycles,next_async_monitor_control_sequence,"
-      "last_async_input_publish_control_sequence,async_timing_valid,"
-      "async_monitor_input_sequence,async_monitor_input_control_sequence,"
-      "async_monitor_scheduled_control_sequence,async_monitor_publish_lateness_cycles,"
-      "async_monitor_worker_queue_wait_ms,async_monitor_worker_compute_ms,"
-      "async_monitor_output_handoff_ms,async_monitor_end_to_end_ms,"
-      "async_monitor_inputs_published,async_monitor_inputs_overwritten,"
-      "async_monitor_worker_processed,async_monitor_outputs_overwritten,"
-      "async_monitor_outputs_consumed,async_monitor_schedule_late_cycles,"
-      "async_monitor_schedule_skipped_slots,verified_plan_age_sec,"
-      "verified_next_intended_exec_index,verified_next_failsafe_exec_index,"
-      "cartesian_energy_budget_active,cartesian_effective_time_frozen,"
-      "cartesian_energy_lambda_valid,cartesian_energy_scale,"
-      "joint_kinetic_energy,cartesian_potential_energy,"
-      "total_control_energy,energy_budget_joule,mujoco_contact_value,"
-      "mujoco_contact_active,mujoco_contact_sample_age_sec";
-
-  const std::size_t expected_control_columns =
-      1 + static_cast<std::size_t>(
-              std::count(control_header.begin(), control_header.end(), ','));
-  if (expected_control_columns > ControlLogRecord::kMaxValues) {
-    RCLCPP_ERROR(
-        get_node()->get_logger(),
-        "Control log schema has %zu columns but the fixed record holds %zu.",
-        expected_control_columns,
-        ControlLogRecord::kMaxValues);
-    return false;
-  }
-
-  if (enable_error_logging_) {
-    if (!control_log_writer_.start(
-            error_log_file_path_,
-            control_header,
-            control_log_max_queue_size_,
-            log_batch_size_,
-            log_flush_period_sec_,
-            [this, expected_control_columns](
-                std::ostream& output, const ControlLogRecord& record) {
-              if (record.value_count != expected_control_columns) {
-                control_log_column_mismatch_count_.fetch_add(
-                    1, std::memory_order_relaxed);
-              }
-              output << std::fixed << std::setprecision(9);
-              const std::size_t count = std::min(
-                  record.value_count, ControlLogRecord::kMaxValues);
-              for (std::size_t i = 0; i < count; ++i) {
-                if (i != 0) {
-                  output << ',';
-                }
-                output << record.values[i];
-              }
-              output << '\n';
-            })) {
-      RCLCPP_ERROR(get_node()->get_logger(),
-                   "Failed to start asynchronous control logger: %s",
-                   error_log_file_path_.c_str());
-      return false;
-    }
-  }
-
-  if (enable_prediction_logging_) {
-    const std::string prediction_header =
-        "wall_time_sec,nominal_time_sec,source,async_timing_valid,"
-        "monitor_input_sequence,monitor_input_control_loop_sequence,"
-        "monitor_scheduled_control_loop_sequence,monitor_publish_lateness_cycles,"
-        "worker_queue_wait_ms,worker_compute_ms,output_handoff_ms,"
-        "monitor_end_to_end_ms,monitor_total_ms,planner_ms,"
-        "plan_build_ms,monitor_eval_ms,mode,candidate_verified,"
-        "executing_last_verified_monitored,predicted_trigger,"
-        "monitored_contact_possible,plan_intended_steps,plan_failsafe_steps,"
-        "stage,index,is_failsafe_sample,sample_t,dt,actual_collision_px,actual_collision_py,"
-        "actual_collision_pz,actual_human_center_px,actual_human_center_py,"
-        "actual_human_center_pz,actual_collision_distance,"
-        "measured_q1,measured_q2,measured_q3,measured_q4,measured_q5,"
-        "measured_q6,measured_q7,measured_dq1,measured_dq2,measured_dq3,"
-        "measured_dq4,measured_dq5,measured_dq6,measured_dq7,collision_target_px,"
-        "collision_target_py,collision_target_pz,pred_start_px,pred_start_py,"
-        "pred_start_pz,pred_start_vx,pred_start_vy,pred_start_vz,pred_next_px,"
-        "pred_next_py,pred_next_pz,pred_next_vx,pred_next_vy,pred_next_vz,"
-        "pred_ax,pred_ay,pred_az,pred_joint_state_valid,pred_joint_sample_t,"
-        "pred_q1,pred_q2,pred_q3,pred_q4,pred_q5,pred_q6,pred_q7,"
-        "pred_dq1,pred_dq2,pred_dq3,pred_dq4,pred_dq5,pred_dq6,pred_dq7,"
-        "human_center_end_px,human_center_end_py,"
-        "human_center_end_pz,distance_segment,contact_possible,"
-        "Kx,Ky,Kz,Dx,Dy,Dz,"
-        "monitor_worst_case_cartesian_kinetic_energy_ub,"
-        "monitor_worst_case_joint_kinetic_energy_ub,"
-        "monitor_worst_case_cartesian_potential_energy_ub,"
-        "monitor_worst_case_total_control_energy_ub,"
-        "monitor_terminal_energy_ub,monitor_workspace_distance_margin,"
-        "monitor_h_monitored_energy,"
-        "monitor_current_cartesian_energy_valid,"
-        "monitor_current_cartesian_kinetic_energy,"
-        "monitor_current_joint_energy_valid,"
-        "monitor_current_joint_kinetic_energy,"
-        "monitor_current_cartesian_potential_energy,"
-        "monitor_current_total_control_energy,joint_limit_unsafe,"
-        "joint_limit_index,joint_position_violation,joint_velocity_violation,"
-        "joint_acceleration_violation,joint_torque_violation";
-    const std::size_t reserved_plan_steps = std::max<std::size_t>(
-        128,
-        std::max<std::size_t>(
-            static_cast<std::size_t>(std::max(1, local_replan_horizon_steps_)),
-            async_planning_lead_steps_ + async_verified_horizon_steps_));
-    if (!prediction_log_writer_.start(
-            prediction_log_file_path_,
-            prediction_header,
-            prediction_log_max_queue_size_,
-            log_batch_size_,
-            log_flush_period_sec_,
-            [this](std::ostream& output,
-                   const PredictionLogRecord& record) {
-              writeShieldPredictionTrajectory(
-                  output,
-                  record.wall_time,
-                  record.nominal_guess_time,
-                  record.current_q,
-                  record.current_dq,
-                  record.current_position,
-                  record.current_orientation,
-                  record.ee_twist,
-                  record.inertia,
-                  record.Jv,
-                  record.K_runtime,
-                  record.D_runtime,
-                  record.human_workspace,
-                  record.evaluated_plan,
-                  record.joint_prediction_trace,
-                  record.async_timing,
-                  record.monitor,
-                  record.mode,
-                  record.candidate_verified,
-                  record.executing_last_verified_monitored,
-                  record.monitor_total_ms,
-                  record.planner_ms,
-                  record.plan_build_ms,
-                  record.monitor_eval_ms,
-                  record.async_source ? "async" : "sync");
-            },
-            [reserved_plan_steps](PredictionLogRecord& record) {
-              record.evaluated_plan.intended.reserve(reserved_plan_steps);
-              record.evaluated_plan.failsafe.reserve(reserved_plan_steps);
-              record.joint_prediction_trace.reserve(4 * reserved_plan_steps + 1);
-            })) {
-      RCLCPP_ERROR(get_node()->get_logger(),
-                   "Failed to start asynchronous prediction logger: %s",
-                   prediction_log_file_path_.c_str());
-      control_log_writer_.stop();
-      return false;
-    }
-  }
-
-  return true;
-}
-
-void ReachableCartesianImpedanceController::stopLogWriters() {
-  prediction_log_writer_.stop();
-  control_log_writer_.stop();
-
-  if (!enable_error_logging_ && !enable_prediction_logging_) {
-    return;
-  }
-
-  const std::size_t control_enqueued = control_log_writer_.enqueuedCount();
-  const std::size_t control_written = control_log_writer_.writtenCount();
-  const std::size_t control_dropped = control_log_writer_.droppedCount();
-  const std::size_t prediction_enqueued =
-      prediction_log_writer_.enqueuedCount();
-  const std::size_t prediction_written = prediction_log_writer_.writtenCount();
-  const std::size_t prediction_dropped =
-      prediction_log_writer_.droppedCount();
-  const std::size_t schema_mismatches =
-      control_log_column_mismatch_count_.load(std::memory_order_relaxed);
-  const std::uint64_t monitor_inputs_published =
-      async_monitor_input_publish_count_.load(std::memory_order_relaxed);
-  const std::uint64_t monitor_inputs_overwritten =
-      async_monitor_input_overwrite_count_.load(std::memory_order_relaxed);
-  const std::uint64_t monitor_worker_processed =
-      async_monitor_worker_processed_count_.load(std::memory_order_relaxed);
-  const std::uint64_t monitor_outputs_overwritten =
-      async_monitor_output_overwrite_count_.load(std::memory_order_relaxed);
-  const std::uint64_t monitor_outputs_consumed =
-      async_monitor_output_consumed_count_.load(std::memory_order_relaxed);
-
-  RCLCPP_INFO(
-      get_node()->get_logger(),
-      "Asynchronous logs drained: control=%zu/%zu dropped=%zu, "
-      "prediction=%zu/%zu dropped=%zu, schema_mismatch=%zu, "
-      "monitor published/processed/consumed=%lu/%lu/%lu, input/output overwrite=%lu/%lu",
-      control_written,
-      control_enqueued,
-      control_dropped,
-      prediction_written,
-      prediction_enqueued,
-      prediction_dropped,
-      schema_mismatches,
-      static_cast<unsigned long>(monitor_inputs_published),
-      static_cast<unsigned long>(monitor_worker_processed),
-      static_cast<unsigned long>(monitor_outputs_consumed),
-      static_cast<unsigned long>(monitor_inputs_overwritten),
-      static_cast<unsigned long>(monitor_outputs_overwritten));
-
-  if (!error_log_run_dir_.empty()) {
-    const std::filesystem::path run_info_path =
-        std::filesystem::path(error_log_run_dir_) / "run_info.txt";
-    std::ofstream run_info_file(
-        run_info_path, std::ios::out | std::ios::app);
-    if (run_info_file.is_open()) {
-      run_info_file
-          << "control_log_enqueued: " << control_enqueued << "\n"
-          << "control_log_written: " << control_written << "\n"
-          << "control_log_dropped: " << control_dropped << "\n"
-          << "prediction_log_enqueued: " << prediction_enqueued << "\n"
-          << "prediction_log_written: " << prediction_written << "\n"
-          << "prediction_log_dropped: " << prediction_dropped << "\n"
-          << "control_log_schema_mismatch: " << schema_mismatches << "\n"
-          << "async_monitor_inputs_published: "
-          << monitor_inputs_published << "\n"
-          << "async_monitor_inputs_overwritten: "
-          << monitor_inputs_overwritten << "\n"
-          << "async_monitor_worker_processed: "
-          << monitor_worker_processed << "\n"
-          << "async_monitor_outputs_overwritten: "
-          << monitor_outputs_overwritten << "\n"
-          << "async_monitor_outputs_consumed: "
-          << monitor_outputs_consumed << "\n"
-          << "async_monitor_schedule_late_cycles: "
-          << async_monitor_schedule_late_cycles_ << "\n"
-          << "async_monitor_schedule_skipped_slots: "
-          << async_monitor_schedule_skipped_slots_ << "\n";
-    }
-  }
-}
-
-// ============================================================================
-// computeImpedanceTorque -- corrected dynamic-consistent true branch
 // ============================================================================
 Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
     const Vector7d& q,
@@ -4007,6 +2830,14 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   FallbackReason async_output_rejection_reason = FallbackReason::kNone;
 
   if (async_safety_monitor_) {
+    // Consume a completed result before constructing and publishing the next
+    // monitor input. The worker can finish a short rollout while this control
+    // cycle is still building its input; taking the previous result first
+    // prevents that new result from superseding an otherwise usable output.
+    AsyncMonitorOutput async_output;
+    bool async_output_available =
+        takeAsyncMonitorOutput(&async_output);
+
     const bool publish_monitor_input =
         control_loop_sequence >= next_async_monitor_control_sequence_;
 
@@ -4027,6 +2858,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       async_input.current_orientation = current_orientation;
       async_input.ee_twist = ee_twist;
       async_input.inertia = inertia;
+      async_input.coriolis = coriolis;
+      // This filtered finite-difference value comes from the live 1 kHz
+      // Jacobian stream. Franka does not publish Jdot*dq directly.
+      async_input.control_jdot_dq = Jdot_dq_filtered_;
       async_input.Jv = Jv_collision;
       async_input.J_geo = J_collision_geo;
       async_input.previous_torque_command = tau_cmd_prev_;
@@ -4115,6 +2950,11 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           committed_command.ddp.setZero();
           committed_command.w.setZero();
           committed_command.dw.setZero();
+          if (committed_command.nominal_path_time_valid) {
+            committed_command.nominal_path_rate = 0.0;
+            committed_command.nominal_path_acceleration = 0.0;
+            committed_command.nominal_path_kinematics_valid = true;
+          }
           committed_command.failsafe = true;
           command_available = true;
         }
@@ -4132,18 +2972,27 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                   return !command.failsafe;
                 }));
       }
-      // If the committed stream has already reached a verified braking tail,
-      // construct the next intended segment from the same scalar path state
-      // and its current rate. This is a derivative seam re-anchor only; it
-      // neither changes the Cartesian route nor skips any committed command.
-      // Without it, repeated replans from a decelerating sample can fail the
-      // strict intended seam check and leave no intended stream at contact.
+      // Continue from the explicit scalar state of the committed command.
+      // Cartesian derivatives cannot recover path rate at a legitimate cusp:
+      // both dp and w are zero while nominal path time must continue through
+      // the direction reversal. The finite-difference branch is retained only
+      // for plans created before explicit scalar metadata was available.
       if (!async_input.reanchor_path_kinematics &&
           !async_input.committed_prefix.empty()) {
         const ImpedanceSample& committed_end =
             async_input.committed_prefix.back();
-        if (committed_end.failsafe &&
-            committed_end.nominal_path_time_valid) {
+        if (committed_end.nominal_path_time_valid &&
+            committed_end.nominal_path_kinematics_valid) {
+          async_input.reanchor_path_kinematics = true;
+          async_input.reanchor_path_rate = std::clamp(
+              committed_end.nominal_path_rate,
+              path_time_rate_min_,
+              path_time_rate_max_);
+          async_input.reanchor_path_acceleration = std::clamp(
+              committed_end.nominal_path_acceleration,
+              -path_time_acc_limit_,
+              path_time_acc_limit_);
+        } else if (committed_end.nominal_path_time_valid) {
           async_input.reanchor_path_kinematics = true;
           const double prefix_dt = std::max(local_replan_dt_, kMinDt);
           const std::size_t prefix_size =
@@ -4199,8 +3048,15 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       }
     }
 
-    AsyncMonitorOutput async_output;
-    if (takeAsyncMonitorOutput(&async_output)) {
+    // If no result was ready at the beginning of this cycle, make one more
+    // non-blocking read after input publication. This catches a worker result
+    // that completed concurrently while the controller assembled the input,
+    // without ever replacing a result already selected for this cycle.
+    if (!async_output_available) {
+      async_output_available = takeAsyncMonitorOutput(&async_output);
+    }
+
+    if (async_output_available) {
       const std::int64_t output_take_steady_time_ns =
           steadyNowNanoseconds();
       AsyncMonitorTiming async_timing;
@@ -4490,7 +3346,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       shield_dec = computeShieldDecision(wall_time, nominal_guess_time,
                                          q, dq,
                                          current_position, current_orientation,
-                                         ee_twist, inertia, J_collision_geo);
+                                         ee_twist, inertia, J_collision_geo,
+                                         coriolis, Jdot_dq_filtered_);
       last_shield_decision_ = shield_dec;
       last_shield_decision_valid_ = true;
       if (shield_dec.has_evaluated_plan) {
@@ -4932,7 +3789,12 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     }
   }
   double candidate_path_rate = commanded_path_rate_;
-  if (candidate_budget_command.nominal_path_time_valid) {
+  if (candidate_budget_command.nominal_path_kinematics_valid) {
+    candidate_path_rate = std::clamp(
+        candidate_budget_command.nominal_path_rate,
+        path_time_rate_min_,
+        path_time_rate_max_);
+  } else if (candidate_budget_command.nominal_path_time_valid) {
     candidate_path_rate = std::clamp(
         (candidate_budget_command.nominal_path_time -
          commanded_path_time_) /
@@ -4999,8 +3861,11 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       cartesian_energy_hold_dp_ds_.setZero();
       cartesian_energy_hold_w_ds_.setZero();
       cartesian_energy_hold_tangent_valid_ = false;
-      double tangent_source_rate = commanded_path_rate_;
       const ImpedanceSample* tangent_source = &hold_source;
+      double tangent_source_rate =
+          tangent_source->nominal_path_kinematics_valid
+              ? tangent_source->nominal_path_rate
+              : commanded_path_rate_;
       if (tangent_source_rate <= 1.0e-6 &&
           candidate_path_rate > 1.0e-6) {
         tangent_source_rate = candidate_path_rate;
@@ -5085,10 +3950,17 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     const double next_path_time =
         std::max(commanded_path_time_,
                  shield_dec.command.nominal_path_time);
-    commanded_path_rate_ = std::clamp(
-        (next_path_time - commanded_path_time_) / std::max(dt, kMinDt),
-        path_time_rate_min_,
-        path_time_rate_max_);
+    if (shield_dec.command.nominal_path_kinematics_valid) {
+      commanded_path_rate_ = std::clamp(
+          shield_dec.command.nominal_path_rate,
+          path_time_rate_min_,
+          path_time_rate_max_);
+    } else {
+      commanded_path_rate_ = std::clamp(
+          (next_path_time - commanded_path_time_) / std::max(dt, kMinDt),
+          path_time_rate_min_,
+          path_time_rate_max_);
+    }
     commanded_path_time_ = next_path_time;
   } else if (shield_dec.command.failsafe ||
              cartesian_effective_time_frozen_) {
@@ -5417,6 +4289,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<std::string>(
         "monitor_urdf_model_path",
         "/home/developer/multipanda_ws/src/model_urdf/panda_ng.urdf");
+    auto_declare<std::string>("monitor_joint_dynamics_source", "auto");
     auto_declare<std::vector<double>>(
         "ee_collision_center_offset", std::vector<double>{0.0, 0.0, 0.0});
     auto_declare<bool>("async_safety_monitor", true);
@@ -5697,15 +4570,33 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     }
     monitor_urdf_model_path_ =
         get_node()->get_parameter("monitor_urdf_model_path").as_string();
-    if (monitor_urdf_model_path_.empty()) {
+    monitor_joint_dynamics_source_ =
+        get_node()->get_parameter("monitor_joint_dynamics_source").as_string();
+    std::transform(
+        monitor_joint_dynamics_source_.begin(),
+        monitor_joint_dynamics_source_.end(),
+        monitor_joint_dynamics_source_.begin(),
+        [](unsigned char value) {
+          return static_cast<char>(std::tolower(value));
+        });
+    if (monitor_joint_dynamics_source_ != "auto" &&
+        monitor_joint_dynamics_source_ != "franka_interface" &&
+        monitor_joint_dynamics_source_ != "pinocchio") {
       RCLCPP_ERROR(
           get_node()->get_logger(),
-          "monitor_urdf_model_path must not be empty when joint-space monitoring is enabled.");
+          "monitor_joint_dynamics_source must be auto, franka_interface, or pinocchio (got '%s').",
+          monitor_joint_dynamics_source_.c_str());
       return CallbackReturn::ERROR;
     }
-    monitor_joint_dynamics_provider_ =
-        std::make_unique<PinocchioJointDynamicsProvider>(
-            monitor_urdf_model_path_, tcp_offset_);
+    if (monitor_joint_dynamics_source_ == "pinocchio" &&
+        monitor_urdf_model_path_.empty()) {
+      RCLCPP_ERROR(
+          get_node()->get_logger(),
+          "monitor_urdf_model_path must not be empty when Pinocchio monitoring is selected.");
+      return CallbackReturn::ERROR;
+    }
+    monitor_joint_dynamics_provider_.reset();
+    active_monitor_joint_dynamics_source_.clear();
     const auto ee_collision_center_offset =
         get_node()->get_parameter("ee_collision_center_offset").as_double_array();
     if (ee_collision_center_offset.size() == 3) {
@@ -5759,10 +4650,16 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         std::max(path_time_rate_min_, trajectory_settings.path_time_rate_max);
     path_time_acc_limit_ =
         std::max(0.0, trajectory_settings.path_time_acc_limit);
+    path_time_jerk_limit_ =
+        std::max(1e-4, trajectory_settings.path_time_jerk_limit);
     path_time_rate_target_ =
         std::clamp(trajectory_settings.path_time_rate_target,
                    path_time_rate_min_,
                    path_time_rate_max_);
+    failsafe_path_time_acc_limit_ =
+        std::max(1e-4, trajectory_settings.failsafe_path_time_acc_limit);
+    failsafe_path_time_jerk_limit_ =
+        std::max(1e-4, trajectory_settings.failsafe_path_time_jerk_limit);
     local_replan_horizon_steps_ =
         std::max(1, trajectory_settings.local_replan_horizon_steps);
     local_replan_dt_ = std::max(trajectory_settings.local_replan_dt, kMinDt);
@@ -5784,6 +4681,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
             get_node()->get_parameter("async_verified_horizon_steps").as_int()));
     local_path_lookahead_sec_ =
         std::max(trajectory_settings.local_path_lookahead_sec, local_replan_dt_);
+    waypoint_merge_position_tolerance_ = std::max(
+        0.0, trajectory_settings.waypoint_merge_position_tolerance);
+    waypoint_merge_orientation_tolerance_ = std::max(
+        0.0, trajectory_settings.waypoint_merge_orientation_tolerance);
     local_replan_max_velocity_ =
         std::max(1e-4, trajectory_settings.local_replan_max_velocity);
     local_replan_max_acceleration_ =
@@ -5963,7 +4864,50 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   franka_robot_model_->assign_loaned_state_interfaces(state_interfaces_);
   start_time_ = this->get_node()->now();
 
-  const Eigen::Map<const Vector7d> q(franka_robot_model_->getRobotState()->q.data());
+  franka::RobotState* robot_state = franka_robot_model_->getRobotState();
+  const Eigen::Map<const Vector7d> q(robot_state->q.data());
+  try {
+    monitor_joint_dynamics_provider_.reset();
+    active_monitor_joint_dynamics_source_.clear();
+    const bool interface_supports_prediction =
+        franka_robot_model_->supportsStateDependentEvaluation();
+    const bool use_franka_interface =
+        monitor_joint_dynamics_source_ == "franka_interface" ||
+        (monitor_joint_dynamics_source_ == "auto" &&
+         interface_supports_prediction);
+
+    if (use_franka_interface) {
+      if (!interface_supports_prediction) {
+        throw std::runtime_error(
+            "selected Franka model backend does not evaluate arbitrary predicted q/dq");
+      }
+      monitor_joint_dynamics_provider_ =
+          std::make_unique<FrankaInterfaceJointDynamicsProvider>(
+              franka_robot_model_.get(), *robot_state, tcp_offset_);
+      active_monitor_joint_dynamics_source_ = "franka_interface";
+    } else {
+      if (monitor_urdf_model_path_.empty()) {
+        throw std::runtime_error(
+            "Pinocchio fallback requires monitor_urdf_model_path");
+      }
+      monitor_joint_dynamics_provider_ =
+          std::make_unique<PinocchioJointDynamicsProvider>(
+              monitor_urdf_model_path_, tcp_offset_);
+      active_monitor_joint_dynamics_source_ = "pinocchio";
+    }
+    RCLCPP_INFO(
+        get_node()->get_logger(),
+        "Joint rollout dynamics source: %s (configured: %s)",
+        active_monitor_joint_dynamics_source_.c_str(),
+        monitor_joint_dynamics_source_.c_str());
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(
+        get_node()->get_logger(),
+        "Failed to initialize joint rollout dynamics: %s", e.what());
+    monitor_joint_dynamics_provider_.reset();
+    franka_robot_model_->release_interfaces();
+    return CallbackReturn::ERROR;
+  }
   if (nullspace_home_pose_valid_) {
     desired_qn_ = nullspace_home_pose_;
   } else {
@@ -6116,8 +5060,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   last_shield_decision_valid_ = false;
   async_input_sequence_.store(0);
   async_input_pending_ = false;
-  latest_async_output_ = AsyncMonitorOutput{};
-  last_consumed_async_output_sequence_ = 0;
+  async_output_mailbox_.resetStopped();
   last_async_output_wall_time_ = -1.0;
   last_async_output_valid_ = false;
 
@@ -6231,6 +5174,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "async_verified_horizon_steps: "
                     << async_verified_horizon_steps_ << "\n"
                     << "monitor_frequency_hz: " << monitor_frequency_hz_ << "\n"
+                    << "monitor_joint_dynamics_source_configured: "
+                    << monitor_joint_dynamics_source_ << "\n"
+                    << "monitor_joint_dynamics_source_active: "
+                    << active_monitor_joint_dynamics_source_ << "\n"
                     << "monitor_update_period_sec: " << monitor_update_period_sec_ << "\n"
                     << "monitor_decimation: " << monitor_decimation_ << "\n"
                     << "shield_intended_steps: " << shield_intended_steps_ << "\n"
@@ -6359,6 +5306,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_deactivate(
   J_geo_prev_.setZero();
   Jdot_dq_filtered_.setZero();
   J_geo_prev_valid_ = false;
+  monitor_joint_dynamics_provider_.reset();
+  active_monitor_joint_dynamics_source_.clear();
   franka_robot_model_->release_interfaces();
   return CallbackReturn::SUCCESS;
 }

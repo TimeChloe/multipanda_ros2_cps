@@ -18,4 +18,12 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}/
 )
 
+# Pinocchio monitor base generated from the same calibrated Panda inertial
+# parameters as the MuJoCo panda_ng model. End-effectors are attached at launch.
+install(
+  FILES ../model_urdf/panda_ng.urdf
+  DESTINATION share/${PROJECT_NAME}/model_urdf
+  RENAME panda_ng_monitor_base.urdf
+)
+
 ament_package()
