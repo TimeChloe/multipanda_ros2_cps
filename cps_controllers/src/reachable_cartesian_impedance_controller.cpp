@@ -311,7 +311,14 @@ class ReachableCartesianImpedanceController::PinocchioJointDynamicsProvider
     final : public cps_safety_monitor::JointDynamicsProvider {
  public:
   PinocchioJointDynamicsProvider(const std::string& urdf_model_path,
-                                 const Vector3d& tcp_offset) {
+                                 const Vector3d& tcp_offset,
+                                 const Vector7d& joint_armature)
+      : joint_armature_(joint_armature) {
+    if (!joint_armature_.allFinite() ||
+        (joint_armature_.array() < 0.0).any()) {
+      throw std::runtime_error(
+          "Prediction joint armature must contain finite nonnegative values");
+    }
     pinocchio::urdf::buildModel(urdf_model_path, model_);
     if (model_.nq != 7 || model_.nv != 7) {
       throw std::runtime_error(
@@ -385,6 +392,9 @@ class ReachableCartesianImpedanceController::PinocchioJointDynamicsProvider
       Matrix7d inertia = data_->M;
       inertia.triangularView<Eigen::StrictlyLower>() =
           inertia.transpose().triangularView<Eigen::StrictlyLower>();
+      // MuJoCo armature is a constant inertia expressed directly in each
+      // hinge coordinate. URDF link inertias do not contain this term.
+      inertia.diagonal() += joint_armature_;
       pinocchio::computeCoriolisMatrix(model_, *data_, q, dq);
 
       sample->control_position =
@@ -416,6 +426,7 @@ class ReachableCartesianImpedanceController::PinocchioJointDynamicsProvider
   mutable std::unique_ptr<pinocchio::Data> data_;
   pinocchio::FrameIndex frame_id_{0};
   Vector3d tcp_offset_{Vector3d::Zero()};
+  Vector7d joint_armature_{Vector7d::Zero()};
   cps_safety_monitor::JointDynamicsLimits limits_;
 };
 
@@ -1686,8 +1697,15 @@ SafetyMonitorConfig ReachableCartesianImpedanceController::makeSafetyMonitorConf
   config.D_runtime = D_runtime;
   config.wall_time_sec = wall_time;
   config.energy_budget_joule = energy_budget_joule_;
-  config.energy_budget_margin_joule = energy_budget_margin_joule_;
+  config.kinetic_energy_error_bound_joule =
+      kinetic_energy_error_bound_joule_;
+  config.potential_energy_error_bound_joule =
+      potential_energy_error_bound_joule_;
   config.ee_collision_radius = ee_collision_radius_;
+  config.tracking_position_error_bound =
+      tracking_position_error_bound_;
+  config.tracking_orientation_error_bound =
+      tracking_orientation_error_bound_;
   config.tracking_acc_error_bound = tracking_acc_error_bound_;
   config.use_dynamic_consistent_impedance = use_dynamic_consistent_impedance_;
   return config;
@@ -1869,7 +1887,6 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
   config.nullspace_stiffness = n_stiffness_;
   config.disable_nullspace_in_failsafe = disable_nullspace_in_failsafe_;
   config.collision_center_offset = ee_collision_center_offset_;
-  config.joint_velocity_error_bound = joint_velocity_error_bound_;
   config.previous_torque_command = previous_torque_command;
   config.previous_torque_command_valid = true;
   config.torque_rate_limit = panda_limits::kTorqueRateLimit;
@@ -1897,6 +1914,7 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
       coriolis.allFinite();
   config.current_joint_dynamics_valid =
       config.current_joint_dynamics.valid;
+  config.enable_inertia_model_comparison = enable_prediction_logging_;
 
   if (monitor_joint_dynamics_provider_) {
     return cps_safety_monitor::verifyReachablePlanJointSpace(
@@ -2860,6 +2878,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       async_timing.input_sequence = async_output.input.sequence;
       async_timing.input_control_loop_sequence =
           async_output.input.control_loop_sequence;
+      async_timing.source_plan_generation =
+          async_output.input.source_plan_generation;
+      async_timing.committed_prefix_steps =
+          async_output.input.committed_prefix.size();
       async_timing.scheduled_control_loop_sequence =
           async_output.input.scheduled_control_loop_sequence;
       async_timing.publish_lateness_cycles =
@@ -2878,7 +2900,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
               0,
               output_take_steady_time_ns -
                   async_output.input.publish_steady_time_ns));
-      last_async_monitor_timing_ = async_timing;
       const std::size_t async_plan_elapsed_steps =
           control_loop_sequence >= async_output.input.control_loop_sequence
               ? static_cast<std::size_t>(
@@ -2923,6 +2944,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           async_output_matches_source_plan &&
           (async_output_before_activation ||
            async_output_late_catchup_continuous);
+      async_timing.source_plan_matches_at_handoff =
+          async_output_matches_source_plan;
+      async_timing.output_usable = async_output_usable;
+      last_async_monitor_timing_ = async_timing;
       if (!async_output_matches_source_plan) {
         async_output_rejection_reason =
             FallbackReason::kAsyncOutputUnavailable;
@@ -3210,8 +3235,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           : nominalSafetyModeForMonitor(monitor);
 
   CartesianEnergyBudgetInfo cartesian_energy_info;
-  const bool use_cartesian_energy_budget =
+  const bool contact_energy_budget_active =
       shouldApplyCartesianEnergyBudget(monitor);
+  const bool apply_runtime_energy_scaling =
+      enable_runtime_energy_scaling_ && contact_energy_budget_active;
   const bool track_cartesian_energy_budget =
       enable_safety_monitor_ &&
       human_workspace_active_;
@@ -3320,6 +3347,16 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     return terms;
   };
 
+  // At the beginning of this cycle the measured state is the result of the
+  // command sent in the previous cycle. Keep this same-command energy pair for
+  // exact comparison with a predicted rollout endpoint at the corresponding
+  // control-loop sequence. The command selected below belongs to the next
+  // interval and would otherwise make potential-energy matching off by one.
+  const ContactEnergyTerms previous_applied_energy_terms =
+      last_commanded_sample_valid_
+          ? compute_contact_energy_terms(last_commanded_sample_)
+          : ContactEnergyTerms{};
+
   const ImpedanceSample candidate_budget_command = shield_dec.command;
   const Vector6d error =
       compute_error_for_command(candidate_budget_command);
@@ -3333,7 +3370,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       energy_budget_terms.kinetic_energy,
       energy_budget_terms.potential_energy,
       energy_budget_terms.valid,
-      use_cartesian_energy_budget,
+      apply_runtime_energy_scaling,
       budget_cartesian_task_inertia_sqrt,
       budget_cartesian_task_inertia_valid,
       &cartesian_energy_info);
@@ -3407,7 +3444,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   const Vector7d tau_cmd = computeImpedanceTorque(
       q, dq, inertia, coriolis, J_geo,
       current_position, current_orientation,
-      shield_dec.command, use_cartesian_energy_budget, dt);
+      shield_dec.command, contact_energy_budget_active, dt);
   const auto toc_torque = SteadyClock::now();
 
   for (int i = 0; i < kNumJoints; ++i) command_interfaces_[i].set_value(tau_cmd(i));
@@ -3499,6 +3536,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(monitor.worst_case_total_control_energy_ub);
           add(monitor.terminal_energy_ub);
           add(monitor.worst_case_pos_error_radius);
+          add(monitor.worst_case_orientation_error_radius);
           add(monitor.worst_case_vel_error_radius);
           add(static_cast<double>(monitor.current_cartesian_energy_valid));
           add(monitor.current_cartesian_kinetic_energy);
@@ -3519,6 +3557,14 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
               last_async_monitor_timing_.input_sequence));
           add(static_cast<double>(
               last_async_monitor_timing_.input_control_loop_sequence));
+          add(static_cast<double>(
+              last_async_monitor_timing_.source_plan_generation));
+          add(static_cast<double>(
+              last_async_monitor_timing_.committed_prefix_steps));
+          add(static_cast<double>(
+              last_async_monitor_timing_.source_plan_matches_at_handoff));
+          add(static_cast<double>(
+              last_async_monitor_timing_.output_usable));
           add(static_cast<double>(
               last_async_monitor_timing_.scheduled_control_loop_sequence));
           add(static_cast<double>(
@@ -3542,6 +3588,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(verified_plan_age_sec);
           add(static_cast<double>(last_verified_plan_.intended_exec_index));
           add(static_cast<double>(last_verified_plan_.failsafe_exec_index));
+          add(static_cast<double>(enable_runtime_energy_scaling_));
           add(static_cast<double>(last_cartesian_energy_budget_active_));
           add(0.0);
           add(static_cast<double>(last_cartesian_energy_budget_lambda_valid_));
@@ -3551,6 +3598,11 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(last_cartesian_control_energy_before_scaling_);
           add(last_cartesian_potential_energy_);
           add(last_cartesian_control_energy_);
+          add(static_cast<double>(previous_applied_energy_terms.valid));
+          add(previous_applied_energy_terms.kinetic_energy);
+          add(previous_applied_energy_terms.potential_energy);
+          add(previous_applied_energy_terms.kinetic_energy +
+              previous_applied_energy_terms.potential_energy);
           add(energy_budget_joule_);
           add(latest_mujoco_contact_value_.load(std::memory_order_relaxed));
           add(static_cast<double>(
@@ -3699,7 +3751,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<bool>("enable_safety_monitor", true);
 
     auto_declare<double>("energy_budget_joule", 0.05);
-    auto_declare<double>("energy_budget_margin_joule", 0.005);
+    auto_declare<double>("kinetic_energy_error_bound_joule", 0.0);
+    auto_declare<double>("potential_energy_error_bound_joule", 0.0);
+    auto_declare<bool>("enable_runtime_energy_scaling", true);
     auto_declare<double>("cartesian_energy_min_pos_stiffness", 0.0);
     auto_declare<double>("cartesian_energy_lambda_update_period_sec", 0.001);
     auto_declare<double>("cartesian_energy_damping_ratio", 0.8);
@@ -3710,6 +3764,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
         "monitor_urdf_model_path",
         "/home/developer/multipanda_ws/src/model_urdf/panda_ng.urdf");
     auto_declare<std::string>("monitor_joint_dynamics_source", "auto");
+    auto_declare<std::vector<double>>(
+        "prediction_joint_armature",
+        std::vector<double>(7, 0.0));
     auto_declare<std::vector<double>>(
         "ee_collision_center_offset", std::vector<double>{0.0, 0.0, 0.0});
     auto_declare<bool>("async_safety_monitor", true);
@@ -3723,8 +3780,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<std::string>("human_workspace_topic", "human_workspace/state");
     auto_declare<double>("human_workspace_timeout_sec", 0.5);
 
+    auto_declare<double>("tracking_position_error_bound", 0.0);
+    auto_declare<double>("tracking_orientation_error_bound", 0.0);
     auto_declare<double>("tracking_acc_error_bound", 0.2);
-    auto_declare<double>("joint_velocity_error_bound", 0.0);
 
     auto_declare<bool>("use_dynamic_consistent_impedance", true);
 
@@ -3957,9 +4015,17 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
 
     energy_budget_joule_ =
         std::max(0.0, get_node()->get_parameter("energy_budget_joule").as_double());
+    kinetic_energy_error_bound_joule_ = std::max(
+        0.0,
+        get_node()->get_parameter(
+            "kinetic_energy_error_bound_joule").as_double());
+    potential_energy_error_bound_joule_ = std::max(
+        0.0,
+        get_node()->get_parameter(
+            "potential_energy_error_bound_joule").as_double());
+    enable_runtime_energy_scaling_ =
+        get_node()->get_parameter("enable_runtime_energy_scaling").as_bool();
 
-    energy_budget_margin_joule_ =
-        std::max(0.0, get_node()->get_parameter("energy_budget_margin_joule").as_double());
     cartesian_energy_min_pos_stiffness_ =
         std::max(0.0, get_node()->get_parameter("cartesian_energy_min_pos_stiffness").as_double());
     cartesian_energy_lambda_update_period_sec_ =
@@ -3984,6 +4050,26 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         get_node()->get_parameter("monitor_urdf_model_path").as_string();
     monitor_joint_dynamics_source_ =
         get_node()->get_parameter("monitor_joint_dynamics_source").as_string();
+    const auto prediction_joint_armature =
+        get_node()->get_parameter(
+            "prediction_joint_armature").as_double_array();
+    if (prediction_joint_armature.size() != 7) {
+      RCLCPP_ERROR(
+          get_node()->get_logger(),
+          "prediction_joint_armature must contain exactly 7 values");
+      return CallbackReturn::ERROR;
+    }
+    for (std::size_t i = 0; i < prediction_joint_armature.size(); ++i) {
+      const double value = prediction_joint_armature[i];
+      if (!std::isfinite(value) || value < 0.0) {
+        RCLCPP_ERROR(
+            get_node()->get_logger(),
+            "prediction_joint_armature[%zu] must be finite and nonnegative",
+            i);
+        return CallbackReturn::ERROR;
+      }
+      prediction_joint_armature_(static_cast<Eigen::Index>(i)) = value;
+    }
     std::transform(
         monitor_joint_dynamics_source_.begin(),
         monitor_joint_dynamics_source_.end(),
@@ -4043,10 +4129,18 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     async_plan_max_age_sec_ =
         std::max(0.0, get_node()->get_parameter("async_plan_max_age_sec").as_double());
 
-    tracking_acc_error_bound_ = std::max(0.0, get_node()->get_parameter("tracking_acc_error_bound").as_double());
-    joint_velocity_error_bound_ = std::max(
+    tracking_position_error_bound_ = std::max(
         0.0,
-        get_node()->get_parameter("joint_velocity_error_bound").as_double());
+        get_node()->get_parameter(
+            "tracking_position_error_bound").as_double());
+    tracking_orientation_error_bound_ = std::max(
+        0.0,
+        get_node()->get_parameter(
+            "tracking_orientation_error_bound").as_double());
+    tracking_acc_error_bound_ = std::max(
+        0.0,
+        get_node()->get_parameter(
+            "tracking_acc_error_bound").as_double());
 
     trajectory_generator_config_path_ =
         cps_trajectory_generators::defaultTrajectoryGeneratorConfigPath();
@@ -4298,7 +4392,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
       }
       monitor_joint_dynamics_provider_ =
           std::make_unique<PinocchioJointDynamicsProvider>(
-              monitor_urdf_model_path_, tcp_offset_);
+              monitor_urdf_model_path_,
+              tcp_offset_,
+              prediction_joint_armature_);
       active_monitor_joint_dynamics_source_ = "pinocchio";
     }
     RCLCPP_INFO(
@@ -4497,6 +4593,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << static_cast<int>(enable_error_logging_) << "\n"
                     << "enable_prediction_logging: "
                     << static_cast<int>(enable_prediction_logging_) << "\n"
+                    << "enable_inertia_model_comparison: "
+                    << static_cast<int>(enable_prediction_logging_) << "\n"
+                    << "inertia_model_comparison_semantics: "
+                       "same_q_dq_runtime_snapshot_vs_prediction_provider\n"
                     << "logging_backend: bounded_async_csv\n"
                     << "control_log_max_queue_size: "
                     << control_log_max_queue_size_ << "\n"
@@ -4564,6 +4664,19 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << monitor_joint_dynamics_source_ << "\n"
                     << "monitor_joint_dynamics_source_active: "
                     << active_monitor_joint_dynamics_source_ << "\n"
+                    << "prediction_joint_armature: ["
+                    << prediction_joint_armature_(0) << ", "
+                    << prediction_joint_armature_(1) << ", "
+                    << prediction_joint_armature_(2) << ", "
+                    << prediction_joint_armature_(3) << ", "
+                    << prediction_joint_armature_(4) << ", "
+                    << prediction_joint_armature_(5) << ", "
+                    << prediction_joint_armature_(6) << "]\n"
+                    << "prediction_joint_armature_applied: "
+                    << static_cast<int>(
+                           active_monitor_joint_dynamics_source_ ==
+                           "pinocchio")
+                    << "\n"
                     << "monitor_update_period_sec: " << monitor_update_period_sec_ << "\n"
                     << "monitor_decimation: " << monitor_decimation_ << "\n"
                     << "shield_intended_steps: " << shield_intended_steps_ << "\n"
@@ -4583,6 +4696,13 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "rot_damping: " << D_base_(3, 3) << "\n"
                     << "energy_budget_joule: "
                     << energy_budget_joule_ << "\n"
+                    << "kinetic_energy_error_bound_joule: "
+                    << kinetic_energy_error_bound_joule_ << "\n"
+                    << "potential_energy_error_bound_joule: "
+                    << potential_energy_error_bound_joule_ << "\n"
+                    << "enable_runtime_energy_scaling: "
+                    << static_cast<int>(enable_runtime_energy_scaling_)
+                    << "\n"
                     << "cartesian_energy_min_pos_stiffness: "
                     << cartesian_energy_min_pos_stiffness_ << "\n"
                     << "cartesian_energy_lambda_update_period_sec: "
@@ -4594,6 +4714,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "contact_relevant_for_energy_legend: "
                        "1=workspace_distance_now_nonpositive\n"
                     << "cartesian_effective_time_freeze_enabled: 0\n"
+                    << "tracking_position_error_bound: "
+                    << tracking_position_error_bound_ << "\n"
+                    << "tracking_orientation_error_bound: "
+                    << tracking_orientation_error_bound_ << "\n"
                     << "tracking_acc_error_bound: "
                     << tracking_acc_error_bound_ << "\n"
                     << "nullspace_home_pose: ["

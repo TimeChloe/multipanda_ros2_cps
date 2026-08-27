@@ -51,6 +51,15 @@ double maxTrackingBlockRadius(const Matrix6d & tube, int block_start)
   return std::sqrt(std::max(0.0, eig.eigenvalues().maxCoeff()));
 }
 
+double orientationInducedPositionError(
+  double offset_norm, double orientation_error_bound)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  const double angle = std::clamp(
+    std::max(0.0, orientation_error_bound), 0.0, kPi);
+  return 2.0 * std::max(0.0, offset_norm) * std::sin(0.5 * angle);
+}
+
 Matrix6d propagateTrackingTube(
   const Matrix6d & tube,
   const Matrix3d & task_inertia_inv,
@@ -188,6 +197,13 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     Vector3d a_pred{Vector3d::Zero()};
     bool joint_state_valid{false};
     double joint_sample_t{std::numeric_limits<double>::quiet_NaN()};
+    bool expected_control_sequence_valid{false};
+    std::uint64_t expected_control_sequence{0};
+    std::size_t horizon_steps{0};
+    bool guaranteed_committed_sample{false};
+    bool joint_energy_valid{false};
+    double joint_kinetic_energy{0.0};
+    double cartesian_potential_energy{0.0};
     Vector7d joint_q{Vector7d::Constant(
         std::numeric_limits<double>::quiet_NaN())};
     Vector7d joint_dq{Vector7d::Constant(
@@ -222,6 +238,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   Vector3d x_pred = collision_center;
   Vector3d v_pred = collision_twist.head<3>();
   Matrix6d tracking_tube = Matrix6d::Zero();
+  double previous_position_error_radius = 0.0;
+  double previous_orientation_error_radius = 0.0;
   double t_prev = collision_plan.anchor.t;
   std::vector<PredictionRow> rows;
   rows.reserve(1 + collision_plan.intended.size() + collision_plan.failsafe.size());
@@ -262,10 +280,20 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         Dp,
         dtp,
         acc_error_bound);
+      const double next_position_error_radius =
+        std::max(0.0, tracking_position_error_bound_) +
+        maxTrackingBlockRadius(tracking_tube_next, 0);
+      const double next_orientation_error_radius =
+        std::max(0.0, tracking_orientation_error_bound_);
       const double rho_p_segment =
         std::max(
-        maxTrackingBlockRadius(tracking_tube, 0),
-        maxTrackingBlockRadius(tracking_tube_next, 0));
+        previous_position_error_radius,
+        next_position_error_radius) +
+        orientationInducedPositionError(
+        ee_collision_center_offset_.norm(),
+        std::max(
+        previous_orientation_error_radius,
+        next_orientation_error_radius));
       const double inflated_contact_radius_segment =
         human_workspace.inflatedCollisionRadius(
         ee_collision_radius_,
@@ -303,6 +331,24 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
           row.joint_sample_t = joint_sample.t;
           row.joint_q = joint_sample.q;
           row.joint_dq = joint_sample.dq;
+          row.joint_energy_valid = joint_sample.energy_valid;
+          row.joint_kinetic_energy =
+            joint_sample.joint_kinetic_energy;
+          row.cartesian_potential_energy =
+            joint_sample.cartesian_potential_energy;
+          if (async_timing.valid) {
+            row.horizon_steps = static_cast<std::size_t>(std::max<long long>(
+                0,
+                std::llround(
+                  joint_sample.t /
+                  std::max(local_replan_dt_, kMinDt))));
+            row.expected_control_sequence_valid = true;
+            row.expected_control_sequence =
+              async_timing.input_control_loop_sequence + row.horizon_steps;
+            row.guaranteed_committed_sample =
+              row.horizon_steps > 0 &&
+              row.horizon_steps <= async_timing.committed_prefix_steps;
+          }
         }
       }
       row.human_center_end = human_workspace.centerAtTime(segment_end_time_sec);
@@ -325,6 +371,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       x_pred = x_next;
       v_pred = v_next;
       tracking_tube = tracking_tube_next;
+      previous_position_error_radius = next_position_error_radius;
+      previous_orientation_error_radius = next_orientation_error_radius;
     };
 
   auto append_samples = [&](const char * stage,
@@ -360,6 +408,11 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << static_cast<int>(async_timing.valid) << ","
       << async_timing.input_sequence << ","
       << async_timing.input_control_loop_sequence << ","
+      << async_timing.source_plan_generation << ","
+      << async_timing.committed_prefix_steps << ","
+      << static_cast<int>(
+        async_timing.source_plan_matches_at_handoff) << ","
+      << static_cast<int>(async_timing.output_usable) << ","
       << async_timing.scheduled_control_loop_sequence << ","
       << async_timing.publish_lateness_cycles << ","
       << async_timing.worker_queue_wait_ms << ","
@@ -399,6 +452,21 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << row.a_pred(0) << "," << row.a_pred(1) << "," << row.a_pred(2) << ","
       << static_cast<int>(row.joint_state_valid) << ","
       << row.joint_sample_t << ","
+      << static_cast<int>(row.expected_control_sequence_valid) << ","
+      << row.expected_control_sequence << ","
+      << row.horizon_steps << ","
+      << static_cast<int>(row.guaranteed_committed_sample) << ","
+      << static_cast<int>(row.joint_energy_valid) << ","
+      << row.joint_kinetic_energy << ","
+      << row.cartesian_potential_energy << ","
+      << row.joint_kinetic_energy + row.cartesian_potential_energy << ","
+      << row.joint_kinetic_energy +
+        std::max(0.0, kinetic_energy_error_bound_joule_) << ","
+      << row.cartesian_potential_energy +
+        std::max(0.0, potential_energy_error_bound_joule_) << ","
+      << row.joint_kinetic_energy + row.cartesian_potential_energy +
+        std::max(0.0, kinetic_energy_error_bound_joule_) +
+        std::max(0.0, potential_energy_error_bound_joule_) << ","
       << row.joint_q(0) << "," << row.joint_q(1) << "," << row.joint_q(2) << ","
       << row.joint_q(3) << "," << row.joint_q(4) << "," << row.joint_q(5) << ","
       << row.joint_q(6) << ","
@@ -423,6 +491,18 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << monitor.current_joint_kinetic_energy << ","
       << monitor.current_cartesian_potential_energy << ","
       << monitor.current_total_control_energy << ","
+      << static_cast<int>(monitor.inertia_model_comparison_valid) << ","
+      << monitor.runtime_model_joint_kinetic_energy << ","
+      << monitor.prediction_model_joint_kinetic_energy << ","
+      << monitor.inertia_model_kinetic_energy_error << ","
+      << monitor.inertia_model_difference_frobenius_norm << ","
+      << monitor.inertia_model_difference_relative_frobenius_norm << ","
+      << monitor.inertia_model_difference_max_abs << ","
+      << monitor.inertia_model_difference_max_abs_row << ","
+      << monitor.inertia_model_difference_max_abs_col << ","
+      << static_cast<int>(monitor.inertia_model_energy_ratio_valid) << ","
+      << monitor.inertia_model_min_energy_ratio << ","
+      << monitor.inertia_model_max_energy_ratio << ","
       << static_cast<int>(monitor.joint_limit_unsafe) << ","
       << monitor.joint_limit_index << ","
       << monitor.joint_position_violation << ","
@@ -464,7 +544,8 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "worst_case_cartesian_potential_energy_ub,"
     "worst_case_total_control_energy_ub,"
     "terminal_energy_ub,"
-    "worst_case_pos_error_radius,worst_case_vel_error_radius,"
+    "worst_case_pos_error_radius,worst_case_orientation_error_radius,"
+    "worst_case_vel_error_radius,"
     "monitor_current_cartesian_energy_valid,"
     "monitor_current_cartesian_kinetic_energy,"
     "monitor_current_joint_energy_valid,"
@@ -476,6 +557,8 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "monitor_period_control_cycles,next_async_monitor_control_sequence,"
     "last_async_input_publish_control_sequence,async_timing_valid,"
     "async_monitor_input_sequence,async_monitor_input_control_sequence,"
+    "async_monitor_source_plan_generation,async_committed_prefix_steps,"
+    "async_source_plan_matches_at_handoff,async_output_usable,"
     "async_monitor_scheduled_control_sequence,async_monitor_publish_lateness_cycles,"
     "async_monitor_worker_queue_wait_ms,async_monitor_worker_compute_ms,"
     "async_monitor_output_handoff_ms,async_monitor_end_to_end_ms,"
@@ -484,12 +567,17 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "async_monitor_outputs_consumed,async_monitor_schedule_late_cycles,"
     "async_monitor_schedule_skipped_slots,verified_plan_age_sec,"
     "verified_next_intended_exec_index,verified_next_failsafe_exec_index,"
+    "runtime_energy_scaling_enabled,"
     "cartesian_energy_budget_active,cartesian_effective_time_frozen,"
     "cartesian_energy_lambda_valid,cartesian_energy_scale,"
     "joint_kinetic_energy,cartesian_potential_energy_before_scaling,"
     "total_control_energy_before_scaling,"
     "cartesian_potential_energy_after_scaling,"
-    "total_control_energy_after_scaling,energy_budget_joule,mujoco_contact_value,"
+    "total_control_energy_after_scaling,"
+    "previous_applied_energy_valid,"
+    "previous_applied_joint_kinetic_energy,"
+    "previous_applied_cartesian_potential_energy,"
+    "previous_applied_total_energy,energy_budget_joule,mujoco_contact_value,"
     "mujoco_contact_active,mujoco_contact_sample_age_sec";
 
   const std::size_t expected_control_columns =
@@ -541,6 +629,8 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     const std::string prediction_header =
       "wall_time_sec,nominal_time_sec,source,async_timing_valid,"
       "monitor_input_sequence,monitor_input_control_loop_sequence,"
+      "monitor_source_plan_generation,committed_prefix_steps,"
+      "source_plan_matches_at_handoff,async_output_usable,"
       "monitor_scheduled_control_loop_sequence,monitor_publish_lateness_cycles,"
       "worker_queue_wait_ms,worker_compute_ms,output_handoff_ms,"
       "monitor_end_to_end_ms,monitor_total_ms,planner_ms,"
@@ -557,6 +647,12 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "pred_start_pz,pred_start_vx,pred_start_vy,pred_start_vz,pred_next_px,"
       "pred_next_py,pred_next_pz,pred_next_vx,pred_next_vy,pred_next_vz,"
       "pred_ax,pred_ay,pred_az,pred_joint_state_valid,pred_joint_sample_t,"
+      "expected_control_sequence_valid,expected_control_loop_sequence,"
+      "prediction_horizon_steps,guaranteed_committed_sample,"
+      "pred_energy_valid,pred_joint_kinetic_energy,"
+      "pred_cartesian_potential_energy,pred_total_energy,"
+      "pred_joint_kinetic_energy_ub,pred_cartesian_potential_energy_ub,"
+      "pred_total_energy_ub,"
       "pred_q1,pred_q2,pred_q3,pred_q4,pred_q5,pred_q6,pred_q7,"
       "pred_dq1,pred_dq2,pred_dq3,pred_dq4,pred_dq5,pred_dq6,pred_dq7,"
       "human_center_end_px,human_center_end_py,"
@@ -572,7 +668,20 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "monitor_current_joint_energy_valid,"
       "monitor_current_joint_kinetic_energy,"
       "monitor_current_cartesian_potential_energy,"
-      "monitor_current_total_control_energy,joint_limit_unsafe,"
+      "monitor_current_total_control_energy,"
+      "inertia_model_comparison_valid,"
+      "runtime_model_joint_kinetic_energy,"
+      "prediction_model_joint_kinetic_energy,"
+      "inertia_model_kinetic_energy_error,"
+      "inertia_model_difference_frobenius_norm,"
+      "inertia_model_difference_relative_frobenius_norm,"
+      "inertia_model_difference_max_abs,"
+      "inertia_model_difference_max_abs_row,"
+      "inertia_model_difference_max_abs_col,"
+      "inertia_model_energy_ratio_valid,"
+      "inertia_model_min_energy_ratio,"
+      "inertia_model_max_energy_ratio,"
+      "joint_limit_unsafe,"
       "joint_limit_index,joint_position_violation,joint_velocity_violation,"
       "joint_acceleration_violation,joint_torque_violation";
     const std::size_t reserved_plan_steps = std::max<std::size_t>(

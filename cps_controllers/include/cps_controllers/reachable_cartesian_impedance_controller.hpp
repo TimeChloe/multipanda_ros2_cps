@@ -205,6 +205,10 @@ class ReachableCartesianImpedanceController
     bool valid{false};
     std::uint64_t input_sequence{0};
     std::uint64_t input_control_loop_sequence{0};
+    std::uint64_t source_plan_generation{0};
+    std::size_t committed_prefix_steps{0};
+    bool source_plan_matches_at_handoff{false};
+    bool output_usable{false};
     std::uint64_t scheduled_control_loop_sequence{0};
     std::uint64_t publish_lateness_cycles{0};
     double worker_queue_wait_ms{0.0};
@@ -472,6 +476,10 @@ class ReachableCartesianImpedanceController
   std::string monitor_joint_dynamics_source_{"auto"};
   std::string active_monitor_joint_dynamics_source_;
   std::string monitor_urdf_model_path_;
+  // Constant joint-space inertia added only by the Pinocchio prediction
+  // backend. This represents simulator armature/rotor inertia that is absent
+  // from the URDF. The real Franka model interface ignores this value.
+  Vector7d prediction_joint_armature_{Vector7d::Zero()};
 
   rclcpp::Time start_time_;
 
@@ -502,6 +510,9 @@ class ReachableCartesianImpedanceController
   bool enable_safety_monitor_{true};
 
   double energy_budget_joule_{0.05};
+  double kinetic_energy_error_bound_joule_{0.0};
+  double potential_energy_error_bound_joule_{0.0};
+  bool enable_runtime_energy_scaling_{true};
   double ee_collision_radius_{0.04};
   Vector3d tcp_offset_{Vector3d::Zero()};
   Vector3d ee_collision_center_offset_{Vector3d::Zero()};
@@ -530,9 +541,11 @@ class ReachableCartesianImpedanceController
   std::atomic_bool human_workspace_live_received_{false};
   std::atomic<double> latest_human_workspace_msg_time_sec_{-1.0};
 
-  // 替换了旧的 error_pos_gain_alpha_ 等常数，改用固定的误差管道边界
+  // Certified fixed pose error bounds plus the propagated acceleration-error
+  // tube used by the verifier.
+  double tracking_position_error_bound_{0.0};
+  double tracking_orientation_error_bound_{0.0};
   double tracking_acc_error_bound_{0.2};
-  double joint_velocity_error_bound_{0.0};
 
   double shield_plan_dt_{0.01};
   int shield_intended_steps_{1};
@@ -652,7 +665,6 @@ class ReachableCartesianImpedanceController
   double prof_io_sum_ms_{0.0};
   double prof_io_max_ms_{0.0};
 
-  double energy_budget_margin_joule_{0.005};
   double cartesian_energy_min_pos_stiffness_{0.0};
   double cartesian_energy_lambda_update_period_sec_{0.001};
   double cartesian_energy_damping_ratio_{0.8};

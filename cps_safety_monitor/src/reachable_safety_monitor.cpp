@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include <Eigen/Eigenvalues>
+
 namespace cps_safety_monitor {
 
 namespace {
@@ -65,29 +67,18 @@ Quaterniond integrateWorldAngularVelocity(const Quaterniond& orientation,
   return (delta * orientation).normalized();
 }
 
-double quadraticEnergyUpperBound(const Vector6d& state,
-                                 const Matrix6d& metric_psd,
-                                 double translational_error_radius) {
-  const double nominal_metric_norm = std::sqrt(std::max(
-      0.0, (state.transpose() * metric_psd * state)(0, 0)));
-  // The reachable tube currently bounds translational position/velocity only.
-  // Do not pretend that this radius is also an angular uncertainty: that would
-  // be dimensionally wrong and needlessly conservative. For a disturbance
-  // delta=[delta_translation, 0], only the leading 3x3 metric block enters
-  // delta^T metric delta; the triangle inequality then gives this upper bound.
-  const Matrix3d translational_metric = positiveSemidefinitePart(
-      Matrix3d(metric_psd.topLeftCorner<3, 3>()));
-  const Eigen::SelfAdjointEigenSolver<Matrix3d> eig(translational_metric);
-  const double max_eigenvalue =
-      eig.info() == Eigen::Success
-          ? std::max(0.0, eig.eigenvalues().maxCoeff())
-          : std::max(0.0, translational_metric.norm());
-  const double uncertainty_metric_norm =
-      std::sqrt(max_eigenvalue) *
-      std::max(0.0, translational_error_radius);
-  const double upper_metric_norm =
-      nominal_metric_norm + uncertainty_metric_norm;
-  return 0.5 * upper_metric_norm * upper_metric_norm;
+double quadraticEnergy(const Vector6d& state,
+                       const Matrix6d& metric_psd) {
+  return std::max(
+      0.0, 0.5 * (state.transpose() * metric_psd * state)(0, 0));
+}
+
+double orientationInducedPositionError(double offset_norm,
+                                       double orientation_error_bound) {
+  constexpr double kPi = 3.14159265358979323846;
+  const double angle = std::clamp(
+      std::max(0.0, orientation_error_bound), 0.0, kPi);
+  return 2.0 * std::max(0.0, offset_norm) * std::sin(0.5 * angle);
 }
 
 double maxBlockRadius(const Matrix6d& tube, int block_start) {
@@ -166,9 +157,18 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
 
   const double acc_error_bound =
       std::max(0.0, config.tracking_acc_error_bound);
+  const double fixed_position_error_bound =
+      std::max(0.0, config.tracking_position_error_bound);
+  const double fixed_orientation_error_bound =
+      std::max(0.0, config.tracking_orientation_error_bound);
+  const double kinetic_energy_error_bound =
+      std::max(0.0, config.kinetic_energy_error_bound_joule);
+  const double potential_energy_error_bound =
+      std::max(0.0, config.potential_energy_error_bound_joule);
   Matrix6d tracking_tube = Matrix6d::Zero();
 
-  out.worst_case_pos_error_radius = maxBlockRadius(tracking_tube, 0);
+  out.worst_case_pos_error_radius = 0.0;
+  out.worst_case_orientation_error_radius = 0.0;
   out.worst_case_vel_error_radius = maxBlockRadius(tracking_tube, 3);
 
   if (config.current_energy_reference_valid) {
@@ -180,10 +180,10 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
         orientationError(current_orientation, current_reference.q);
     const Matrix6d current_stiffness =
         positiveSemidefinitePart(current_reference.K);
-    out.current_cartesian_kinetic_energy = quadraticEnergyUpperBound(
-        ee_twist, cartesian_inertia, 0.0);
-    out.current_cartesian_potential_energy = quadraticEnergyUpperBound(
-        current_error, current_stiffness, 0.0);
+    out.current_cartesian_kinetic_energy =
+        quadraticEnergy(ee_twist, cartesian_inertia);
+    out.current_cartesian_potential_energy =
+        quadraticEnergy(current_error, current_stiffness);
     out.current_cartesian_control_energy =
         out.current_cartesian_kinetic_energy +
         out.current_cartesian_potential_energy;
@@ -214,6 +214,21 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   double terminal_V_ub = 0.0;
   bool terminal_sample_found = false;
   double t_prev = plan.anchor.t;
+
+  Vector6d previous_edge_twist = ee_twist;
+  Vector6d previous_edge_error = Vector6d::Zero();
+  previous_edge_error.head<3>() = current_position - plan.anchor.p;
+  previous_edge_error.tail<3>() =
+      orientationError(current_orientation, plan.anchor.q);
+  double previous_edge_T_ub =
+      quadraticEnergy(previous_edge_twist, cartesian_inertia);
+  double previous_edge_V_ub = quadraticEnergy(
+      previous_edge_error, positiveSemidefinitePart(plan.anchor.K));
+  double previous_edge_energy_ub =
+      previous_edge_T_ub + previous_edge_V_ub;
+  double previous_edge_time = plan.anchor.t;
+  double previous_position_error_radius = 0.0;
+  double previous_orientation_error_radius = 0.0;
 
   auto eval_sample = [&](const ImpedanceSample& s, double dtp) {
     const double segment_start_time_sec = config.wall_time_sec + t_prev;
@@ -265,9 +280,22 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
             Dp,
             dtp,
             acc_error_bound);
+    const double next_position_error_radius =
+        fixed_position_error_bound +
+        maxBlockRadius(tracking_tube_next, 0);
+    const double next_orientation_error_radius =
+        fixed_orientation_error_bound;
+    const double segment_position_error_radius =
+        std::max(previous_position_error_radius,
+                 next_position_error_radius);
+    const double segment_orientation_error_radius =
+        std::max(previous_orientation_error_radius,
+                 next_orientation_error_radius);
     const double rho_p_segment =
-        std::max(maxBlockRadius(tracking_tube, 0),
-                 maxBlockRadius(tracking_tube_next, 0));
+        segment_position_error_radius +
+        orientationInducedPositionError(
+            config.collision_center_offset.norm(),
+            segment_orientation_error_radius);
     const double inflated_contact_radius_segment =
         config.human_workspace.inflatedCollisionRadius(
             config.ee_collision_radius,
@@ -289,29 +317,37 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     Vector6d next_pose_error = Vector6d::Zero();
     next_pose_error.head<3>() = x_next - s.p;
     next_pose_error.tail<3>() = orientationError(q_next, s.q);
-    const double cartesian_T_ub = quadraticEnergyUpperBound(
-        next_twist,
-        cartesian_inertia,
-        maxBlockRadius(tracking_tube_next, 3));
-    const double cartesian_V_ub = quadraticEnergyUpperBound(
-        next_pose_error,
-        K_cartesian,
-        maxBlockRadius(tracking_tube_next, 0));
+    // Pose tracking bounds enlarge collision geometry only. Energy-model
+    // mismatch is represented directly by the independent one-sided K/V
+    // error bounds, so it is not counted a second time through the pose tube.
+    const double cartesian_T_ub =
+        quadraticEnergy(next_twist, cartesian_inertia) +
+        kinetic_energy_error_bound;
+    const double cartesian_V_ub =
+        quadraticEnergy(next_pose_error, K_cartesian) +
+        potential_energy_error_bound;
 
     const bool contact_possible_step = d_segment <= 0.0;
     // Candidate acceptance is based on the maximum complete Cartesian control
     // energy over every monitored sample that may intersect the workspace.
     // The normal-projected energy remains available only as a collision
     // diagnostic and must not authorize a 6D-energetic trajectory.
-    const double E_contact_ub = cartesian_T_ub + cartesian_V_ub;
-    if (contact_possible_step && E_contact_ub > E_contact_max) {
-      E_contact_max = E_contact_ub;
+    const double next_edge_energy_ub = cartesian_T_ub + cartesian_V_ub;
+    const bool previous_edge_is_worst =
+        previous_edge_energy_ub >= next_edge_energy_ub;
+    const double interval_energy_ub =
+        std::max(previous_edge_energy_ub, next_edge_energy_ub);
+    if (contact_possible_step && interval_energy_ub > E_contact_max) {
+      E_contact_max = interval_energy_ub;
 
-      out.worst_case_contact_time = s.t;
+      out.worst_case_contact_time =
+          previous_edge_is_worst ? previous_edge_time : s.t;
       out.worst_case_workspace_distance_at_candidate = d_segment;
-      out.worst_case_cartesian_kinetic_energy_ub = cartesian_T_ub;
-      out.worst_case_cartesian_potential_energy_ub = cartesian_V_ub;
-      out.worst_case_cartesian_control_energy_ub = E_contact_ub;
+      out.worst_case_cartesian_kinetic_energy_ub =
+          previous_edge_is_worst ? previous_edge_T_ub : cartesian_T_ub;
+      out.worst_case_cartesian_potential_energy_ub =
+          previous_edge_is_worst ? previous_edge_V_ub : cartesian_V_ub;
+      out.worst_case_cartesian_control_energy_ub = interval_energy_ub;
     }
 
     if (s.failsafe) {
@@ -325,9 +361,18 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     q_pred = q_next;
     w_pred = w_next;
     tracking_tube = tracking_tube_next;
+    previous_edge_T_ub = cartesian_T_ub;
+    previous_edge_V_ub = cartesian_V_ub;
+    previous_edge_energy_ub = next_edge_energy_ub;
+    previous_edge_time = s.t;
+    previous_position_error_radius = next_position_error_radius;
+    previous_orientation_error_radius = next_orientation_error_radius;
     out.worst_case_pos_error_radius =
         std::max(out.worst_case_pos_error_radius,
-                 maxBlockRadius(tracking_tube, 0));
+                 next_position_error_radius);
+    out.worst_case_orientation_error_radius =
+        std::max(out.worst_case_orientation_error_radius,
+                 next_orientation_error_radius);
     out.worst_case_vel_error_radius =
         std::max(out.worst_case_vel_error_radius,
                  maxBlockRadius(tracking_tube, 3));
@@ -357,8 +402,7 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   out.terminal_energy_ub = terminal_T_ub + terminal_V_ub;
 
   const double energy_budget_eff =
-      std::max(0.0, config.energy_budget_joule -
-                        config.energy_budget_margin_joule);
+      std::max(0.0, config.energy_budget_joule);
 
   // Keep runtime energy adaptation orthogonal to candidate verification:
   // current geometry gates the runtime stiffness budget, while any predicted
@@ -404,22 +448,11 @@ MonitorResult verifyReachablePlanJointSpace(
   auto symmetrize7 = [](const Matrix7d& matrix) {
     return 0.5 * (matrix + matrix.transpose());
   };
-  auto jointKineticUpperBound = [&](const Vector7d& dq,
-                                    const Matrix7d& inertia) {
+  auto jointKineticEnergy = [&](const Vector7d& dq,
+                                const Matrix7d& inertia) {
     const Matrix7d metric = symmetrize7(inertia);
-    const double nominal_metric_norm = std::sqrt(std::max(
-        0.0, (dq.transpose() * metric * dq)(0, 0)));
-    const Eigen::SelfAdjointEigenSolver<Matrix7d> eig(metric);
-    const double max_eigenvalue =
-        eig.info() == Eigen::Success
-            ? std::max(0.0, eig.eigenvalues().maxCoeff())
-            : std::max(0.0, metric.norm());
-    const double uncertainty_metric_norm =
-        std::sqrt(max_eigenvalue) *
-        std::max(0.0, config.joint_velocity_error_bound);
-    const double upper_metric_norm =
-        nominal_metric_norm + uncertainty_metric_norm;
-    return 0.5 * upper_metric_norm * upper_metric_norm;
+    return std::max(
+        0.0, 0.5 * (dq.transpose() * metric * dq)(0, 0));
   };
   auto taskInertia = [&](const Matrix7d& inertia,
                         const Matrix67d& jacobian,
@@ -472,9 +505,73 @@ MonitorResult verifyReachablePlanJointSpace(
     out.joint_limit_unsafe = true;
     return out;
   }
-  if (prediction_trace != nullptr) {
-    prediction_trace->push_back(
-        JointPredictionSample{plan.anchor.t, q_pred, dq_pred});
+
+  if (config.enable_inertia_model_comparison &&
+      config.current_joint_dynamics_valid) {
+    JointDynamicsSample prediction_model_state;
+    if (dynamics.evaluate(
+            current_q, current_dq, &prediction_model_state) &&
+        prediction_model_state.valid &&
+        prediction_model_state.inertia.allFinite() &&
+        config.current_joint_dynamics.inertia.allFinite()) {
+      const Matrix7d runtime_inertia =
+          symmetrize7(config.current_joint_dynamics.inertia);
+      const Matrix7d prediction_inertia =
+          symmetrize7(prediction_model_state.inertia);
+      const Matrix7d inertia_difference =
+          runtime_inertia - prediction_inertia;
+
+      out.runtime_model_joint_kinetic_energy =
+          jointKineticEnergy(current_dq, runtime_inertia);
+      out.prediction_model_joint_kinetic_energy =
+          jointKineticEnergy(current_dq, prediction_inertia);
+      out.inertia_model_kinetic_energy_error =
+          out.runtime_model_joint_kinetic_energy -
+          out.prediction_model_joint_kinetic_energy;
+      out.inertia_model_difference_frobenius_norm =
+          inertia_difference.norm();
+      out.inertia_model_difference_relative_frobenius_norm =
+          inertia_difference.norm() /
+          std::max(runtime_inertia.norm(), kSmallPositive);
+      Eigen::Index max_row = -1;
+      Eigen::Index max_col = -1;
+      out.inertia_model_difference_max_abs =
+          inertia_difference.cwiseAbs().maxCoeff(&max_row, &max_col);
+      out.inertia_model_difference_max_abs_row =
+          static_cast<int>(max_row);
+      out.inertia_model_difference_max_abs_col =
+          static_cast<int>(max_col);
+      out.inertia_model_comparison_valid =
+          std::isfinite(out.runtime_model_joint_kinetic_energy) &&
+          std::isfinite(out.prediction_model_joint_kinetic_energy) &&
+          std::isfinite(out.inertia_model_kinetic_energy_error) &&
+          std::isfinite(out.inertia_model_difference_frobenius_norm) &&
+          std::isfinite(
+              out.inertia_model_difference_relative_frobenius_norm) &&
+          std::isfinite(out.inertia_model_difference_max_abs);
+
+      // The generalized eigenvalues of (M_runtime, M_prediction) bound the
+      // kinetic-energy ratio for every nonzero velocity direction:
+      // lambda_min <= K_runtime/K_prediction <= lambda_max.
+      const Eigen::SelfAdjointEigenSolver<Matrix7d>
+          prediction_inertia_eigenvalues(prediction_inertia);
+      if (prediction_inertia_eigenvalues.info() == Eigen::Success &&
+          prediction_inertia_eigenvalues.eigenvalues().minCoeff() >
+              kSmallPositive) {
+        const Eigen::GeneralizedSelfAdjointEigenSolver<Matrix7d>
+            energy_ratio_solver(runtime_inertia, prediction_inertia);
+        if (energy_ratio_solver.info() == Eigen::Success &&
+            energy_ratio_solver.eigenvalues().allFinite()) {
+          out.inertia_model_min_energy_ratio =
+              energy_ratio_solver.eigenvalues().minCoeff();
+          out.inertia_model_max_energy_ratio =
+              energy_ratio_solver.eigenvalues().maxCoeff();
+          out.inertia_model_energy_ratio_valid =
+              std::isfinite(out.inertia_model_min_energy_ratio) &&
+              std::isfinite(out.inertia_model_max_energy_ratio);
+        }
+      }
+    }
   }
 
   const double inflated_contact_radius_now =
@@ -500,17 +597,17 @@ MonitorResult verifyReachablePlanJointSpace(
         config.current_energy_reference.K);
     const Vector6d current_twist = state.control_jacobian * dq_pred;
     if (current_lambda_valid) {
-      out.current_cartesian_kinetic_energy = quadraticEnergyUpperBound(
-          current_twist, positiveSemidefinitePart(current_lambda), 0.0);
+      out.current_cartesian_kinetic_energy = quadraticEnergy(
+          current_twist, positiveSemidefinitePart(current_lambda));
     }
-    out.current_cartesian_potential_energy = quadraticEnergyUpperBound(
-        current_error, current_stiffness, 0.0);
+    out.current_cartesian_potential_energy =
+        quadraticEnergy(current_error, current_stiffness);
     out.current_cartesian_control_energy =
         out.current_cartesian_kinetic_energy +
         out.current_cartesian_potential_energy;
     out.current_cartesian_energy_valid = current_lambda_valid;
     out.current_joint_kinetic_energy =
-        jointKineticUpperBound(dq_pred, state.inertia);
+        jointKineticEnergy(dq_pred, state.inertia);
     out.current_total_control_energy =
         out.current_joint_kinetic_energy +
         out.current_cartesian_potential_energy;
@@ -519,6 +616,14 @@ MonitorResult verifyReachablePlanJointSpace(
 
   const JointDynamicsLimits limits = dynamics.limits();
   Matrix6d tracking_tube = Matrix6d::Zero();
+  const double fixed_position_error_bound =
+      std::max(0.0, config.tracking_position_error_bound);
+  const double fixed_orientation_error_bound =
+      std::max(0.0, config.tracking_orientation_error_bound);
+  const double kinetic_energy_error_bound =
+      std::max(0.0, config.kinetic_energy_error_bound_joule);
+  const double potential_energy_error_bound =
+      std::max(0.0, config.potential_energy_error_bound_joule);
   double total_contact_energy_max = 0.0;
   double terminal_total_energy = 0.0;
   bool terminal_sample_found = false;
@@ -526,6 +631,39 @@ MonitorResult verifyReachablePlanJointSpace(
   Vector7d previous_torque_command = config.previous_torque_command;
   bool previous_torque_command_valid =
       config.previous_torque_command_valid;
+
+  const Vector6d previous_edge_twist_initial =
+      state.control_jacobian * dq_pred;
+  const Vector6d previous_edge_error_initial =
+      poseError(state, plan.anchor);
+  double previous_edge_cartesian_kinetic = current_lambda_valid
+      ? quadraticEnergy(
+            previous_edge_twist_initial,
+            positiveSemidefinitePart(current_lambda))
+      : 0.0;
+  double previous_edge_joint_kinetic =
+      jointKineticEnergy(dq_pred, state.inertia);
+  double previous_edge_potential = quadraticEnergy(
+      previous_edge_error_initial,
+      positiveSemidefinitePart(plan.anchor.K));
+  double previous_edge_total_energy =
+      previous_edge_joint_kinetic + previous_edge_potential;
+  double previous_edge_time = plan.anchor.t;
+  double previous_position_error_radius = 0.0;
+  double previous_orientation_error_radius = 0.0;
+
+  if (prediction_trace != nullptr) {
+    JointPredictionSample initial_prediction;
+    initial_prediction.t = plan.anchor.t;
+    initial_prediction.q = q_pred;
+    initial_prediction.dq = dq_pred;
+    initial_prediction.energy_valid = true;
+    initial_prediction.joint_kinetic_energy =
+        previous_edge_joint_kinetic;
+    initial_prediction.cartesian_potential_energy =
+        previous_edge_potential;
+    prediction_trace->push_back(initial_prediction);
+  }
 
   auto recordLimitViolation = [&](const Vector7d& q,
                                   const Vector7d& dq,
@@ -642,11 +780,6 @@ MonitorResult verifyReachablePlanJointSpace(
     const Vector7d q_next = q_pred + 0.5 * (dq_pred + dq_next) * h;
 
     recordLimitViolation(q_next, dq_next, ddq, torque_command);
-    if (prediction_trace != nullptr &&
-        q_next.allFinite() && dq_next.allFinite()) {
-      prediction_trace->push_back(
-          JointPredictionSample{desired.t, q_next, dq_next});
-    }
     if (!q_next.allFinite() || !dq_next.allFinite()) {
       out.joint_limit_unsafe = true;
       return false;
@@ -671,9 +804,18 @@ MonitorResult verifyReachablePlanJointSpace(
             Matrix3d(desired.D.topLeftCorner<3, 3>())),
         h,
         config.tracking_acc_error_bound);
+    const double next_position_error_radius =
+        fixed_position_error_bound +
+        maxBlockRadius(tracking_tube_next, 0);
+    const double next_orientation_error_radius =
+        fixed_orientation_error_bound;
     const double rho_p = std::max(
-        maxBlockRadius(tracking_tube, 0),
-        maxBlockRadius(tracking_tube_next, 0));
+        previous_position_error_radius,
+        next_position_error_radius) +
+        orientationInducedPositionError(
+            config.collision_center_offset.norm(),
+            std::max(previous_orientation_error_radius,
+                     next_orientation_error_radius));
     const Vector3d collision_end = collisionPosition(next_state);
     const double segment_distance =
         config.human_workspace.signedDistanceSegmentToInflatedSphere(
@@ -695,31 +837,56 @@ MonitorResult verifyReachablePlanJointSpace(
     const Vector6d next_twist =
         next_state.control_jacobian * dq_next;
     const double cartesian_kinetic = next_lambda_valid
-        ? quadraticEnergyUpperBound(
-              next_twist,
-              positiveSemidefinitePart(next_lambda),
-              maxBlockRadius(tracking_tube_next, 3))
+        ? quadraticEnergy(
+              next_twist, positiveSemidefinitePart(next_lambda))
         : 0.0;
+    const double nominal_joint_kinetic =
+        jointKineticEnergy(dq_next, next_state.inertia);
+    const double nominal_potential = quadraticEnergy(
+        next_error, positiveSemidefinitePart(desired.K));
     const double joint_kinetic =
-        jointKineticUpperBound(dq_next, next_state.inertia);
-    const double potential = quadraticEnergyUpperBound(
-        next_error,
-        positiveSemidefinitePart(desired.K),
-        maxBlockRadius(tracking_tube_next, 0));
+        nominal_joint_kinetic + kinetic_energy_error_bound;
+    const double potential =
+        nominal_potential + potential_energy_error_bound;
     const double total_energy = joint_kinetic + potential;
 
+    if (prediction_trace != nullptr) {
+      JointPredictionSample endpoint_prediction;
+      endpoint_prediction.t = desired.t;
+      endpoint_prediction.q = q_next;
+      endpoint_prediction.dq = dq_next;
+      endpoint_prediction.energy_valid = true;
+      endpoint_prediction.joint_kinetic_energy =
+          nominal_joint_kinetic;
+      endpoint_prediction.cartesian_potential_energy =
+          nominal_potential;
+      prediction_trace->push_back(endpoint_prediction);
+    }
+
+    const bool previous_edge_is_worst =
+        previous_edge_total_energy >= total_energy;
+    const double interval_energy =
+        std::max(previous_edge_total_energy, total_energy);
     if (segment_distance <= 0.0 &&
-        total_energy > total_contact_energy_max) {
-      total_contact_energy_max = total_energy;
-      out.worst_case_contact_time = desired.t;
+        interval_energy > total_contact_energy_max) {
+      total_contact_energy_max = interval_energy;
+      out.worst_case_contact_time =
+          previous_edge_is_worst ? previous_edge_time : desired.t;
       out.worst_case_workspace_distance_at_candidate = segment_distance;
-      out.worst_case_cartesian_kinetic_energy_ub = cartesian_kinetic;
-      out.worst_case_joint_kinetic_energy_ub = joint_kinetic;
-      out.worst_case_cartesian_potential_energy_ub = potential;
+      out.worst_case_cartesian_kinetic_energy_ub =
+          previous_edge_is_worst
+              ? previous_edge_cartesian_kinetic
+              : cartesian_kinetic;
+      out.worst_case_joint_kinetic_energy_ub =
+          previous_edge_is_worst
+              ? previous_edge_joint_kinetic
+              : joint_kinetic;
+      out.worst_case_cartesian_potential_energy_ub =
+          previous_edge_is_worst ? previous_edge_potential : potential;
       // Kept for CSV/API compatibility; this now denotes the kinetic metric
       // that actually gates the paper energy budget plus Cartesian potential.
-      out.worst_case_cartesian_control_energy_ub = total_energy;
-      out.worst_case_total_control_energy_ub = total_energy;
+      out.worst_case_cartesian_control_energy_ub = interval_energy;
+      out.worst_case_total_control_energy_ub = interval_energy;
     }
     if (desired.failsafe) {
       terminal_total_energy = total_energy;
@@ -732,9 +899,19 @@ MonitorResult verifyReachablePlanJointSpace(
     previous_torque_command_valid = true;
     state = next_state;
     tracking_tube = tracking_tube_next;
+    previous_edge_cartesian_kinetic = cartesian_kinetic;
+    previous_edge_joint_kinetic = joint_kinetic;
+    previous_edge_potential = potential;
+    previous_edge_total_energy = total_energy;
+    previous_edge_time = desired.t;
+    previous_position_error_radius = next_position_error_radius;
+    previous_orientation_error_radius = next_orientation_error_radius;
     out.worst_case_pos_error_radius = std::max(
         out.worst_case_pos_error_radius,
-        maxBlockRadius(tracking_tube, 0));
+        next_position_error_radius);
+    out.worst_case_orientation_error_radius = std::max(
+        out.worst_case_orientation_error_radius,
+        next_orientation_error_radius);
     out.worst_case_vel_error_radius = std::max(
         out.worst_case_vel_error_radius,
         maxBlockRadius(tracking_tube, 3));
@@ -820,9 +997,8 @@ MonitorResult verifyReachablePlanJointSpace(
   // contact in the complete monitored trajectory is still energy-verified.
   out.contact_relevant_for_energy = out.workspace_distance_now <= 0.0;
 
-  const double energy_budget_eff = std::max(
-      0.0,
-      config.energy_budget_joule - config.energy_budget_margin_joule);
+  const double energy_budget_eff =
+      std::max(0.0, config.energy_budget_joule);
   const bool predicted_contact_requires_verification =
       out.monitored_contact_possible;
   const bool current_collision_energy_unsafe =

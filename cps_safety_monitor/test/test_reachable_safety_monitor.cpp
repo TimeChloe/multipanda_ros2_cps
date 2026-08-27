@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <cmath>
+
 #include <Eigen/Geometry>
 
 #include "cps_safety_monitor/reachable_safety_monitor.hpp"
@@ -24,7 +26,7 @@ class IdentityJointDynamicsProvider final : public JointDynamicsProvider {
     sample->control_jacobian.setZero();
     sample->control_jacobian.leftCols<6>() = Matrix6d::Identity();
     sample->control_jdot_dq.setZero();
-    sample->inertia = Matrix7d::Identity();
+    sample->inertia = inertia_scale_ * Matrix7d::Identity();
     sample->coriolis.setZero();
     return true;
   }
@@ -32,6 +34,7 @@ class IdentityJointDynamicsProvider final : public JointDynamicsProvider {
   JointDynamicsLimits limits() const override { return limits_; }
 
   JointDynamicsLimits limits_;
+  double inertia_scale_{1.0};
   mutable int evaluate_count_{0};
 };
 
@@ -44,7 +47,6 @@ TEST(ReachableSafetyMonitor, RejectsTangentialAndRotationalCartesianEnergy) {
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.12;
-  config.energy_budget_margin_joule = 0.0;
   config.tracking_acc_error_bound = 0.0;
 
   VerifiedPlan plan;
@@ -96,7 +98,6 @@ TEST(ReachableSafetyMonitor,
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.01;
-  config.energy_budget_margin_joule = 0.0;
   config.tracking_acc_error_bound = 0.0;
 
   VerifiedPlan plan;
@@ -142,7 +143,6 @@ TEST(ReachableSafetyMonitor,
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.01;
-  config.energy_budget_margin_joule = 0.0;
   config.tracking_acc_error_bound = 0.0;
 
   VerifiedPlan plan;
@@ -186,7 +186,6 @@ TEST(ReachableSafetyMonitor,
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.01;
-  config.energy_budget_margin_joule = 0.0;
   config.tracking_acc_error_bound = 0.0;
 
   VerifiedPlan plan;
@@ -224,7 +223,6 @@ TEST(ReachableSafetyMonitor,
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.01;
-  config.energy_budget_margin_joule = 0.0;
   config.tracking_acc_error_bound = 0.0;
 
   VerifiedPlan plan;
@@ -417,6 +415,210 @@ TEST(ReachableSafetyMonitor, JointRolloutDetectsPositionLimit) {
   EXPECT_NEAR(prediction_trace.back().t, sample.t, 1.0e-12);
   EXPECT_GT(prediction_trace.back().q(0), 0.0);
   EXPECT_GT(prediction_trace.back().dq(0), 0.0);
+}
+
+TEST(ReachableSafetyMonitor, ContactIntervalUsesMaximumEndpointEnergy) {
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
+  workspace_parameters.sphere_center = Vector3d::Zero();
+  workspace_parameters.motion_radius = 0.10;
+  workspace_parameters.hand_radius = 0.0;
+  config.human_workspace.setParameters(workspace_parameters);
+  config.ee_collision_radius = 0.04;
+  config.energy_budget_joule = 0.10;
+  config.tracking_acc_error_bound = 0.0;
+  config.joint_rollout_max_dt = 0.001;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample braking_sample = plan.anchor;
+  braking_sample.t = 0.001;
+  braking_sample.D(0, 0) = 1000.0;
+  plan.intended.push_back(braking_sample);
+
+  Vector7d dq = Vector7d::Zero();
+  dq(0) = 1.0;
+  const MonitorResult result = verifyReachablePlanJointSpace(
+      plan,
+      Vector7d::Zero(),
+      dq,
+      dynamics,
+      config);
+
+  ASSERT_TRUE(result.monitored_contact_possible);
+  EXPECT_NEAR(result.worst_case_contact_time, plan.anchor.t, 1.0e-12);
+  EXPECT_NEAR(result.worst_case_joint_kinetic_energy_ub, 0.5, 1.0e-12);
+  EXPECT_NEAR(result.worst_case_total_control_energy_ub, 0.5, 1.0e-12);
+  EXPECT_TRUE(result.predicted_trigger);
+}
+
+TEST(ReachableSafetyMonitor,
+     FixedTrackingPoseBoundsInflateContactButNotPotentialEnergy) {
+  SafetyMonitorConfig config;
+  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
+  workspace_parameters.sphere_center = Vector3d::Zero();
+  workspace_parameters.motion_radius = 0.10;
+  workspace_parameters.hand_radius = 0.0;
+  config.human_workspace.setParameters(workspace_parameters);
+  config.ee_collision_radius = 0.04;
+  config.collision_center_offset = Vector3d(0.10, 0.0, 0.0);
+  config.energy_budget_joule = 0.05;
+  config.tracking_acc_error_bound = 0.0;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.p = Vector3d(0.151, 0.0, 0.0);
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.t = 0.01;
+  sample.K(0, 0) = 100.0;
+  sample.K(3, 3) = 10.0;
+  plan.intended.push_back(sample);
+
+  Matrix67d jacobian = Matrix67d::Zero();
+  jacobian.leftCols<6>() = Matrix6d::Identity();
+  const MonitorResult nominal = verifyReachablePlan(
+      plan,
+      plan.anchor.p,
+      plan.anchor.q,
+      Vector6d::Zero(),
+      Matrix7d::Identity(),
+      jacobian,
+      config);
+
+  EXPECT_GT(nominal.workspace_distance_now, 0.0);
+  EXPECT_FALSE(nominal.monitored_contact_possible);
+
+  config.tracking_position_error_bound = 0.012;
+  config.tracking_orientation_error_bound = 0.10;
+  const MonitorResult bounded = verifyReachablePlan(
+      plan,
+      plan.anchor.p,
+      plan.anchor.q,
+      Vector6d::Zero(),
+      Matrix7d::Identity(),
+      jacobian,
+      config);
+
+  // The current measured geometry remains nominal; only future reachable
+  // states are enlarged by the certified tracking bounds.
+  EXPECT_NEAR(bounded.workspace_distance_now,
+              nominal.workspace_distance_now,
+              1.0e-12);
+  EXPECT_TRUE(bounded.monitored_contact_possible);
+  EXPECT_NEAR(bounded.worst_case_pos_error_radius, 0.012, 1.0e-12);
+  EXPECT_NEAR(bounded.worst_case_orientation_error_radius, 0.10, 1.0e-12);
+  EXPECT_NEAR(bounded.worst_case_cartesian_potential_energy_ub,
+              0.0,
+              1.0e-12);
+  EXPECT_FALSE(bounded.predicted_trigger);
+
+  config.potential_energy_error_bound_joule = 0.06;
+  const MonitorResult energy_bounded = verifyReachablePlan(
+      plan,
+      plan.anchor.p,
+      plan.anchor.q,
+      Vector6d::Zero(),
+      Matrix7d::Identity(),
+      jacobian,
+      config);
+  EXPECT_NEAR(energy_bounded.worst_case_cartesian_potential_energy_ub,
+              0.06,
+              1.0e-12);
+  EXPECT_TRUE(energy_bounded.predicted_trigger);
+}
+
+TEST(ReachableSafetyMonitor,
+     DirectKineticEnergyErrorBoundAppliesToFutureEndpoint) {
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
+  workspace_parameters.sphere_center = Vector3d::Zero();
+  workspace_parameters.motion_radius = 0.10;
+  workspace_parameters.hand_radius = 0.0;
+  config.human_workspace.setParameters(workspace_parameters);
+  config.ee_collision_radius = 0.04;
+  config.energy_budget_joule = 0.05;
+  config.kinetic_energy_error_bound_joule = 0.06;
+  config.tracking_acc_error_bound = 0.0;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.t = 0.001;
+  plan.intended.push_back(sample);
+
+  std::vector<JointPredictionSample> prediction_trace;
+  const MonitorResult result = verifyReachablePlanJointSpace(
+      plan,
+      Vector7d::Zero(),
+      Vector7d::Zero(),
+      dynamics,
+      config,
+      &prediction_trace);
+
+  EXPECT_TRUE(result.monitored_contact_possible);
+  EXPECT_NEAR(result.worst_case_joint_kinetic_energy_ub, 0.06, 1.0e-12);
+  EXPECT_NEAR(result.worst_case_total_control_energy_ub, 0.06, 1.0e-12);
+  EXPECT_TRUE(result.predicted_trigger);
+  ASSERT_EQ(prediction_trace.size(), 2U);
+  EXPECT_TRUE(prediction_trace.back().energy_valid);
+  EXPECT_NEAR(prediction_trace.back().joint_kinetic_energy, 0.0, 1.0e-12);
+  EXPECT_NEAR(prediction_trace.back().cartesian_potential_energy,
+              0.0,
+              1.0e-12);
+}
+
+TEST(ReachableSafetyMonitor,
+     ComparesRuntimeAndPredictionInertiaAtSameMeasuredState) {
+  IdentityJointDynamicsProvider dynamics;
+  dynamics.inertia_scale_ = 1.0;
+
+  SafetyMonitorConfig config;
+  config.enable_inertia_model_comparison = true;
+  config.current_joint_dynamics_valid = true;
+  config.current_joint_dynamics.valid = true;
+  config.current_joint_dynamics.control_orientation = Quaterniond::Identity();
+  config.current_joint_dynamics.inertia =
+      2.0 * Matrix7d::Identity();
+  config.current_joint_dynamics.control_jacobian.setZero();
+  config.tracking_acc_error_bound = 0.0;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.t = 0.001;
+  plan.intended.push_back(sample);
+
+  Vector7d dq = Vector7d::Zero();
+  dq(0) = 1.0;
+  const MonitorResult result = verifyReachablePlanJointSpace(
+      plan,
+      Vector7d::Zero(),
+      dq,
+      dynamics,
+      config);
+
+  ASSERT_TRUE(result.inertia_model_comparison_valid);
+  EXPECT_NEAR(result.runtime_model_joint_kinetic_energy, 1.0, 1.0e-12);
+  EXPECT_NEAR(result.prediction_model_joint_kinetic_energy, 0.5, 1.0e-12);
+  EXPECT_NEAR(result.inertia_model_kinetic_energy_error, 0.5, 1.0e-12);
+  EXPECT_NEAR(result.inertia_model_difference_frobenius_norm,
+              std::sqrt(7.0),
+              1.0e-12);
+  EXPECT_NEAR(result.inertia_model_difference_relative_frobenius_norm,
+              0.5,
+              1.0e-12);
+  EXPECT_NEAR(result.inertia_model_difference_max_abs, 1.0, 1.0e-12);
+  EXPECT_EQ(result.inertia_model_difference_max_abs_row,
+            result.inertia_model_difference_max_abs_col);
+  ASSERT_TRUE(result.inertia_model_energy_ratio_valid);
+  EXPECT_NEAR(result.inertia_model_min_energy_ratio, 2.0, 1.0e-12);
+  EXPECT_NEAR(result.inertia_model_max_energy_ratio, 2.0, 1.0e-12);
 }
 
 }  // namespace

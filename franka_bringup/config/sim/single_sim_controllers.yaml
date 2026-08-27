@@ -239,7 +239,13 @@ reachable_cartesian_impedance_controller:
     enable_safety_monitor: true
 
     energy_budget_joule: 0.12
-    energy_budget_margin_joule: 0.000
+    # One-sided prediction error bounds. Keep zero until calibration data has
+    # been matched by control-loop sequence and validated.
+    kinetic_energy_error_bound_joule: 0.0
+    potential_energy_error_bound_joule: 0.0
+    # Calibration mode: keep the impedance K/D command unchanged while the
+    # safety monitor and energy logging continue to run.
+    enable_runtime_energy_scaling: false
     cartesian_energy_min_pos_stiffness: 0.0
     cartesian_energy_lambda_update_period_sec: 0.001
     # Lachner Eq. (9a): modal Cartesian damping ratio used with the current
@@ -255,12 +261,12 @@ reachable_cartesian_impedance_controller:
     ee_collision_radius: 0.03
     tcp_offset: [0.0, 0.0, 0.06]
     ee_collision_center_offset: [0.0, 0.0, -0.03]
-    # auto uses the real libfranka model for arbitrary predicted q,dq on the
-    # robot. ModelSim currently exposes only the live MuJoCo state, so auto
-    # safely falls back to the URDF/Pinocchio rollout in simulation. In both
-    # cases the rollout's initial state uses the live Franka interface values.
-    monitor_joint_dynamics_source: auto
+    # Simulation uses the Gaz-parameter URDF plus the same constant joint
+    # armature as the MuJoCo Panda model. On the real robot select
+    # franka_interface instead; this armature vector is Pinocchio-only.
+    monitor_joint_dynamics_source: pinocchio
     monitor_urdf_model_path: /home/developer/multipanda_ws/src/model_urdf/panda_ng.urdf
+    prediction_joint_armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
     async_safety_monitor: true
     # Pin the 200 Hz worker away from the main ROS/MuJoCo scheduling traffic on
     # this 24-core workstation. Affinity failure is non-fatal on other hosts.
@@ -279,8 +285,10 @@ reachable_cartesian_impedance_controller:
     mujoco_contact_sensor_topic: /panda_metal_ball_touch
     mujoco_contact_threshold: 1.0e-6
 
-    # Residual acceleration disturbance for the measured-state rollout.
+    # Certified fixed tracking-error bounds for all future rollout states.
+    tracking_position_error_bound: 0.0       # m
+    tracking_orientation_error_bound: 0.0    # rad
+    # Residual acceleration disturbance propagated over the rollout horizon.
     tracking_acc_error_bound: 0.2
-    joint_velocity_error_bound: 0.0
 
     use_dynamic_consistent_impedance: true

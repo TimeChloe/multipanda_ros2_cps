@@ -55,6 +55,12 @@ struct JointPredictionSample {
   double t{0.0};
   Vector7d q{Vector7d::Zero()};
   Vector7d dq{Vector7d::Zero()};
+  // Nominal predicted endpoint energies before adding the configured
+  // one-sided prediction-error bounds. These fields are for calibration and
+  // logging; verification adds the bounds separately.
+  bool energy_valid{false};
+  double joint_kinetic_energy{0.0};
+  double cartesian_potential_energy{0.0};
 };
 
 class JointDynamicsProvider {
@@ -103,7 +109,25 @@ struct MonitorResult {
   double current_total_control_energy{0.0};
   bool current_joint_energy_valid{false};
 
+  // Diagnostic comparison at exactly the same measured q/dq.  The runtime
+  // matrix comes from current_joint_dynamics, while the prediction matrix is
+  // evaluated by JointDynamicsProvider.  These values never affect the
+  // verification decision.
+  bool inertia_model_comparison_valid{false};
+  double runtime_model_joint_kinetic_energy{0.0};
+  double prediction_model_joint_kinetic_energy{0.0};
+  double inertia_model_kinetic_energy_error{0.0};
+  double inertia_model_difference_frobenius_norm{0.0};
+  double inertia_model_difference_relative_frobenius_norm{0.0};
+  double inertia_model_difference_max_abs{0.0};
+  int inertia_model_difference_max_abs_row{-1};
+  int inertia_model_difference_max_abs_col{-1};
+  bool inertia_model_energy_ratio_valid{false};
+  double inertia_model_min_energy_ratio{0.0};
+  double inertia_model_max_energy_ratio{0.0};
+
   double worst_case_pos_error_radius{0.0};
+  double worst_case_orientation_error_radius{0.0};
   double worst_case_vel_error_radius{0.0};
 
   bool collision_energy_unsafe{false};
@@ -175,13 +199,24 @@ struct SafetyMonitorConfig {
   // future predicted q/dq samples.
   JointDynamicsSample current_joint_dynamics;
   bool current_joint_dynamics_valid{false};
+  // Evaluate the prediction provider once at the measured q/dq and compare
+  // its inertia with current_joint_dynamics.inertia. Logging code enables
+  // this only when prediction diagnostics are requested.
+  bool enable_inertia_model_comparison{false};
 
   double wall_time_sec{0.0};
   double energy_budget_joule{0.05};
-  double energy_budget_margin_joule{0.005};
+  // Direct one-sided energy-model error bounds:
+  // K_real <= K_pred + kinetic_energy_error_bound_joule and
+  // V_real <= V_pred + potential_energy_error_bound_joule.
+  double kinetic_energy_error_bound_joule{0.0};
+  double potential_energy_error_bound_joule{0.0};
   double ee_collision_radius{0.04};
+  // Fixed certified bounds between a predicted Cartesian state and the state
+  // reached by the real robot after applying the verified command.
+  double tracking_position_error_bound{0.0};
+  double tracking_orientation_error_bound{0.0};
   double tracking_acc_error_bound{0.2};
-  double joint_velocity_error_bound{0.0};
   bool use_dynamic_consistent_impedance{true};
   Vector7d nullspace_reference{Vector7d::Zero()};
   double nullspace_stiffness{0.0};
