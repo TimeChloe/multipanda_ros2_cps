@@ -54,36 +54,19 @@ bool HumanWorkspace::configureFromConfigFile(
     };
 
     Parameters parameters;
-    if (root["workspace_direction"]) {
-      if (!read_vector3(root, "workspace_direction", &parameters.workspace_direction)) {
-        return false;
-      }
-    } else if (root["plane_normal"]) {
-      if (!read_vector3(root, "plane_normal", &parameters.workspace_direction)) {
-        return false;
-      }
-    } else {
-      RCLCPP_ERROR(
-          logger,
-          "workspace_direction must be a 3-element list in %s.",
-          config_path.c_str());
-      return false;
-    }
-
     if (!read_vector3(root, "sphere_center", &parameters.sphere_center)) {
       return false;
     }
 
-    if (!root["motion_radius"] || !root["hand_radius"]) {
+    if (!root["motion_radius"]) {
       RCLCPP_ERROR(
           logger,
-          "motion_radius and hand_radius must be set in %s.",
+          "motion_radius must be set in %s.",
           config_path.c_str());
       return false;
     }
 
     parameters.motion_radius = root["motion_radius"].as<double>();
-    parameters.hand_radius = root["hand_radius"].as<double>();
 
     const YAML::Node center_motion =
         root["center_motion"] ? root["center_motion"] : root["motion"];
@@ -142,16 +125,11 @@ bool HumanWorkspace::configureFromConfigFile(
       }
     }
 
-    if (parameters.motion_radius < 0.0 || parameters.hand_radius < 0.0 ||
+    if (parameters.motion_radius < 0.0 ||
         parameters.center_sinusoid_frequency_hz < 0.0) {
       RCLCPP_ERROR(
           logger,
-          "motion_radius, hand_radius, and center sinusoid frequency must be nonnegative.");
-      return false;
-    }
-
-    if (parameters.workspace_direction.norm() < 1e-8) {
-      RCLCPP_ERROR(logger, "workspace_direction norm too small.");
+          "motion_radius and center sinusoid frequency must be nonnegative.");
       return false;
     }
 
@@ -182,7 +160,6 @@ bool HumanWorkspace::configureFromParameters(
 
 void HumanWorkspace::setParameters(const Parameters& parameters) {
   parameters_ = parameters;
-  parameters_.workspace_direction.normalize();
 }
 
 Vector3d HumanWorkspace::centerAtTime(double time_sec) const {
@@ -209,14 +186,11 @@ bool HumanWorkspace::hasMovingCenter() const {
           parameters_.center_sinusoid_frequency_hz > 0.0);
 }
 
-double HumanWorkspace::inflatedHandRadius() const {
-  return parameters_.motion_radius + parameters_.hand_radius;
-}
-
 double HumanWorkspace::inflatedCollisionRadius(
     double ee_collision_radius,
     double position_error_radius) const {
-  return inflatedHandRadius() + ee_collision_radius + std::max(0.0, position_error_radius);
+  return parameters_.motion_radius + ee_collision_radius +
+         std::max(0.0, position_error_radius);
 }
 
 double HumanWorkspace::signedDistanceToInflatedSphere(
@@ -273,16 +247,6 @@ double HumanWorkspace::signedDistanceSegmentToInflatedSphere(
     *closest_human_center = human_center;
   }
   return (robot_point - human_center).norm() - inflated_radius;
-}
-
-double HumanWorkspace::normalStiffness(const Matrix6d& K) const {
-  const Vector3d& n = parameters_.workspace_direction;
-  return std::max((n.transpose() * K.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
-}
-
-double HumanWorkspace::normalDamping(const Matrix6d& D) const {
-  const Vector3d& n = parameters_.workspace_direction;
-  return std::max((n.transpose() * D.topLeftCorner<3, 3>() * n)(0, 0), 0.0);
 }
 
 Vector3d HumanWorkspace::closestPointOnSegment(

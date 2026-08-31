@@ -147,14 +147,7 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
 
     {
       Marker marker;
-      setupMarker(marker, 1, "human_workspace_direction", Marker::ARROW);
-      marker.action = Marker::DELETE;
-      array.markers.push_back(marker);
-    }
-
-    {
-      Marker marker;
-      setupMarker(marker, 2, "human_workspace_motion_sphere", Marker::SPHERE);
+      setupMarker(marker, 1, "human_workspace_motion_sphere", Marker::SPHERE);
       marker.pose.position = toPoint(center);
       marker.pose.orientation.w = 1.0;
       marker.scale.x = 2.0 * workspace_.motionRadius();
@@ -166,19 +159,7 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
 
     {
       Marker marker;
-      setupMarker(marker, 3, "human_workspace_hand_inflated_sphere", Marker::SPHERE);
-      marker.pose.position = toPoint(center);
-      marker.pose.orientation.w = 1.0;
-      marker.scale.x = 2.0 * workspace_.inflatedHandRadius();
-      marker.scale.y = 2.0 * workspace_.inflatedHandRadius();
-      marker.scale.z = 2.0 * workspace_.inflatedHandRadius();
-      marker.color = makeColor(1.0f, 0.3f, 0.2f, 0.12f);
-      array.markers.push_back(marker);
-    }
-
-    {
-      Marker marker;
-      setupMarker(marker, 4, "human_workspace_status", Marker::TEXT_VIEW_FACING);
+      setupMarker(marker, 2, "human_workspace_status", Marker::TEXT_VIEW_FACING);
       marker.action = Marker::DELETE;
       array.markers.push_back(marker);
     }
@@ -193,7 +174,6 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     HumanWorkspaceMsg msg;
     msg.header.stamp = now();
     msg.header.frame_id = frame_id_;
-    msg.workspace_direction = toVector3Msg(workspace_.direction());
     msg.sphere_center = toPoint(center);
     msg.center_velocity = toVector3Msg(workspace_.centerVelocityAtTime(elapsed_time_sec));
     msg.center_sinusoid_amplitude = toVector3Msg(Vector3d::Zero());
@@ -201,7 +181,6 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     msg.center_sinusoid_phase_rad = 0.0;
     msg.center_motion_time_offset_sec = elapsed_time_sec;
     msg.motion_radius = workspace_.motionRadius();
-    msg.hand_radius = workspace_.handRadius();
     state_pub_->publish(msg);
   }
 

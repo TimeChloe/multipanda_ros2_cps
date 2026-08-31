@@ -1,6 +1,5 @@
 std_msgs/Header header
 
-geometry_msgs/Vector3 workspace_direction
 geometry_msgs/Point sphere_center
 
 geometry_msgs/Vector3 center_velocity
@@ -9,5 +8,5 @@ float64 center_sinusoid_frequency_hz
 float64 center_sinusoid_phase_rad
 float64 center_motion_time_offset_sec
 
+# Complete human motion/occupancy area radius around sphere_center.
 float64 motion_radius
-float64 hand_radius

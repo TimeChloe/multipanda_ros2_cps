@@ -583,10 +583,6 @@ void ReachableCartesianImpedanceController::handleHumanWorkspaceState(
   }
 
   cps_human_workspace::HumanWorkspace::Parameters parameters;
-  parameters.workspace_direction = Vector3d(
-      msg->workspace_direction.x,
-      msg->workspace_direction.y,
-      msg->workspace_direction.z);
   parameters.sphere_center = Vector3d(
       msg->sphere_center.x,
       msg->sphere_center.y,
@@ -600,13 +596,9 @@ void ReachableCartesianImpedanceController::handleHumanWorkspaceState(
   parameters.center_sinusoid_phase_rad = 0.0;
   parameters.center_motion_time_offset_sec = 0.0;
   parameters.motion_radius = msg->motion_radius;
-  parameters.hand_radius = msg->hand_radius;
 
-  if (parameters.workspace_direction.norm() < 1.0e-8 ||
-      parameters.motion_radius < 0.0 ||
-      parameters.hand_radius < 0.0 ||
-      !std::isfinite(parameters.motion_radius) ||
-      !std::isfinite(parameters.hand_radius)) {
+  if (parameters.motion_radius < 0.0 ||
+      !std::isfinite(parameters.motion_radius)) {
     RCLCPP_WARN_THROTTLE(
         get_node()->get_logger(),
         *get_node()->get_clock(),
@@ -5152,10 +5144,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << desired_position_.x() << ", "
                     << desired_position_.y() << ", "
                     << desired_position_.z() << "]\n"
-                    << "human_workspace_direction: ["
-                    << human_workspace_.direction().x() << ", "
-                    << human_workspace_.direction().y() << ", "
-                    << human_workspace_.direction().z() << "]\n"
                     << "human_sphere_center: ["
                     << human_workspace_.center().x() << ", "
                     << human_workspace_.center().y() << ", "
@@ -5177,7 +5165,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "human_center_motion_time_offset_sec: "
                     << human_workspace_.centerMotionTimeOffsetSec() << "\n"
                     << "human_motion_radius: " << human_workspace_.motionRadius() << "\n"
-                    << "human_hand_radius: " << human_workspace_.handRadius() << "\n"
                     << "human_workspace_config_path: "
                     << human_workspace_config_path << "\n";
     }

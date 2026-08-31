@@ -16,10 +16,8 @@ reachability logic is kept apart from human, robot, and scenario config files.
 ## Config Format
 
 ```yaml
-workspace_direction: [0.0, 0.0, -1.0]
 sphere_center: [0.3, 0.0, 0.25]
-motion_radius: 0.08
-hand_radius: 0.04
+motion_radius: 0.12
 
 center_motion:
   velocity: [0.0, 0.0, 0.0]
@@ -29,15 +27,17 @@ center_motion:
   time_offset_sec: 0.0
 ```
 
-`center_motion` is optional. Without it, the human workspace sphere is static.
+`motion_radius` is the complete human motion/occupancy area radius around
+`sphere_center`. `center_motion` is optional. Without it, the human workspace
+sphere is static.
 
 ## Live Workspace State Topic
 
 Runtime providers publish `cps_human_workspace/msg/HumanWorkspace` on
 `human_workspace/state`. For camera or Vicon input, publish the current sphere
 center in the robot base frame, the current center velocity, the workspace
-direction, and the radii. The controller treats each message as a live snapshot
-and extrapolates it for short monitor horizons until
+radius. The controller treats each message as a live snapshot and extrapolates
+it for short monitor horizons until
 `human_workspace_timeout_sec` expires.
 
 ## Start The Visualizer

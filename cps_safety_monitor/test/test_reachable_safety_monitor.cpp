@@ -43,7 +43,6 @@ TEST(ReachableSafetyMonitor, RejectsTangentialAndRotationalCartesianEnergy) {
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d::Zero();
   workspace_parameters.motion_radius = 0.10;
-  workspace_parameters.hand_radius = 0.0;
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.12;
@@ -94,7 +93,6 @@ TEST(ReachableSafetyMonitor,
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d::Zero();
   workspace_parameters.motion_radius = 0.10;
-  workspace_parameters.hand_radius = 0.0;
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.01;
@@ -139,7 +137,6 @@ TEST(ReachableSafetyMonitor,
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d::Zero();
   workspace_parameters.motion_radius = 0.10;
-  workspace_parameters.hand_radius = 0.0;
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.01;
@@ -182,7 +179,6 @@ TEST(ReachableSafetyMonitor,
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d::Zero();
   workspace_parameters.motion_radius = 0.10;
-  workspace_parameters.hand_radius = 0.0;
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.01;
@@ -219,7 +215,6 @@ TEST(ReachableSafetyMonitor,
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d::Zero();
   workspace_parameters.motion_radius = 0.10;
-  workspace_parameters.hand_radius = 0.0;
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.01;
@@ -284,7 +279,6 @@ TEST(ReachableSafetyMonitor, JointEnergyIncludesNullspaceMotion) {
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d::Zero();
   workspace_parameters.motion_radius = 0.10;
-  workspace_parameters.hand_radius = 0.0;
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.current_energy_reference_valid = true;
@@ -337,7 +331,6 @@ TEST(ReachableSafetyMonitor, DisablesNullspaceTorqueDuringFailsafeWhenRequested)
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d(10.0, 0.0, 0.0);
   workspace_parameters.motion_radius = 0.10;
-  workspace_parameters.hand_radius = 0.0;
   config.human_workspace.setParameters(workspace_parameters);
   config.nullspace_reference(6) = 1.0;
   config.nullspace_stiffness = 100.0;
@@ -423,7 +416,6 @@ TEST(ReachableSafetyMonitor, ContactIntervalUsesMaximumEndpointEnergy) {
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d::Zero();
   workspace_parameters.motion_radius = 0.10;
-  workspace_parameters.hand_radius = 0.0;
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.10;
@@ -460,7 +452,6 @@ TEST(ReachableSafetyMonitor,
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d::Zero();
   workspace_parameters.motion_radius = 0.10;
-  workspace_parameters.hand_radius = 0.0;
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.collision_center_offset = Vector3d(0.10, 0.0, 0.0);
@@ -537,7 +528,6 @@ TEST(ReachableSafetyMonitor,
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d::Zero();
   workspace_parameters.motion_radius = 0.10;
-  workspace_parameters.hand_radius = 0.0;
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.05;
@@ -628,7 +618,6 @@ TEST(ReachableSafetyMonitor,
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d::Zero();
   workspace_parameters.motion_radius = 1.0;
-  workspace_parameters.hand_radius = 0.0;
   config.human_workspace.setParameters(workspace_parameters);
   config.assume_human_workspace_clear = true;
   config.energy_budget_joule = 0.01;

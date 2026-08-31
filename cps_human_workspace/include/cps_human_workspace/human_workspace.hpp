@@ -9,21 +9,19 @@
 
 namespace cps_human_workspace {
 
-using Matrix6d = Eigen::Matrix<double, 6, 6>;
 using Vector3d = Eigen::Matrix<double, 3, 1>;
 
 class HumanWorkspace {
  public:
   struct Parameters {
-    Vector3d workspace_direction{Vector3d(0.0, 0.0, 1.0)};
     Vector3d sphere_center{Vector3d(0.0, 0.0, 0.2)};
     Vector3d center_velocity{Vector3d::Zero()};
     Vector3d center_sinusoid_amplitude{Vector3d::Zero()};
     double center_sinusoid_frequency_hz{0.0};
     double center_sinusoid_phase_rad{0.0};
     double center_motion_time_offset_sec{0.0};
-    double motion_radius{0.10};
-    double hand_radius{0.04};
+    // Complete human motion/occupancy area radius around sphere_center.
+    double motion_radius{0.14};
   };
 
   static void declareParameters(
@@ -43,8 +41,6 @@ class HumanWorkspace {
   void setParameters(const Parameters& parameters);
 
   const Parameters& parameters() const { return parameters_; }
-  const Vector3d& direction() const { return parameters_.workspace_direction; }
-  const Vector3d& normal() const { return direction(); }
   const Vector3d& center() const { return parameters_.sphere_center; }
   Vector3d centerAtTime(double time_sec) const;
   Vector3d centerVelocityAtTime(double time_sec) const;
@@ -65,8 +61,6 @@ class HumanWorkspace {
     return parameters_.center_motion_time_offset_sec;
   }
   double motionRadius() const { return parameters_.motion_radius; }
-  double handRadius() const { return parameters_.hand_radius; }
-  double inflatedHandRadius() const;
   double inflatedCollisionRadius(double ee_collision_radius,
                                  double position_error_radius) const;
 
@@ -90,9 +84,6 @@ class HumanWorkspace {
       double end_time_sec,
       Vector3d* closest_robot_point = nullptr,
       Vector3d* closest_human_center = nullptr) const;
-
-  double normalStiffness(const Matrix6d& K) const;
-  double normalDamping(const Matrix6d& D) const;
 
   static Vector3d closestPointOnSegment(const Vector3d& a,
                                         const Vector3d& b,
