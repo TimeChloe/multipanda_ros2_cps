@@ -214,6 +214,16 @@ reachable_cartesian_impedance_controller:
     human_workspace_timeout_sec: 0.5
     startup_via_points_source: "action"
     cartesian_via_points_action_name: "~/follow_cartesian_via_points"
+    calibration_action_name: "~/calibrate_monitored_trajectory"
+    # Calibration-only: if the dedicated calibration action is active and no
+    # fresh human workspace is available, keep the dynamics/energy rollout
+    # running while treating human geometry as explicitly absent. Normal
+    # actions remain fail-closed when the workspace topic is missing or stale.
+    calibration_assume_no_human: false
+    # Action-relative path time. The calibration action follows the path
+    # normally until this time, then captures exactly the next monitor input.
+    # May be changed with `ros2 param set` before each calibration goal.
+    calibration_capture_path_time_sec: 0.0
     # cartesian_via_points: [0.306957, 0.000000, 0.099912, 0.923956, -0.382499, 0.000000, 0.000000]
     # Leave cartesian_via_points unset in action mode. ROS2 cannot infer the
     # type of an empty YAML sequence here.
@@ -239,13 +249,17 @@ reachable_cartesian_impedance_controller:
     enable_safety_monitor: true
 
     energy_budget_joule: 0.12
-    # One-sided prediction error bounds. Keep zero until calibration data has
-    # been matched by control-loop sequence and validated.
+    # Simulator-calibrated one-sided prediction error bounds. These values are
+    # based on exact control-sequence matches across five MuJoCo calibration
+    # runs and must not be reused for the real robot without recalibration.
     kinetic_energy_error_bound_joule: 0.0
-    potential_energy_error_bound_joule: 0.0
-    # Calibration mode: keep the impedance K/D command unchanged while the
-    # safety monitor and energy logging continue to run.
-    enable_runtime_energy_scaling: false
+    potential_energy_error_bound_joule: 0.027
+    # Normal safety-monitor mode applies runtime energy scaling when contact
+    # is currently relevant. Disable this only for calibration experiments.
+    enable_runtime_energy_scaling: true
+    # Dense prediction/provenance logging used by the separate calibration
+    # action. The ordinary follow_cartesian_via_points action is unchanged.
+    enable_calibration_logging: false
     cartesian_energy_min_pos_stiffness: 0.0
     cartesian_energy_lambda_update_period_sec: 0.001
     # Lachner Eq. (9a): modal Cartesian damping ratio used with the current

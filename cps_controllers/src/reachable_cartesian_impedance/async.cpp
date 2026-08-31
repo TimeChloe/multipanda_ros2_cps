@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -59,10 +60,14 @@ bool ReachableCartesianImpedanceController::takePendingCartesianViaPoints(
   std::vector<Vector3d> * points,
   std::vector<Quaterniond> * orientations,
   std::shared_ptr<CartesianViaMotionGoalHandle> * goal_handle,
-  std::uint64_t * sequence)
+  std::uint64_t * sequence,
+  bool * calibration_execution,
+  double * calibration_capture_path_time_sec)
 {
   if (points == nullptr || orientations == nullptr ||
-    goal_handle == nullptr || sequence == nullptr)
+    goal_handle == nullptr || sequence == nullptr ||
+    calibration_execution == nullptr ||
+    calibration_capture_path_time_sec == nullptr)
   {
     return false;
   }
@@ -76,7 +81,12 @@ bool ReachableCartesianImpedanceController::takePendingCartesianViaPoints(
   *orientations = pending_cartesian_via_point_quaternions_;
   *goal_handle = pending_cartesian_via_points_goal_handle_;
   *sequence = pending_cartesian_via_points_sequence_;
+  *calibration_execution = pending_cartesian_via_points_calibration_;
+  *calibration_capture_path_time_sec =
+    pending_calibration_capture_path_time_sec_;
   pending_cartesian_via_points_available_ = false;
+  pending_cartesian_via_points_calibration_ = false;
+  pending_calibration_capture_path_time_sec_ = 0.0;
   pending_cartesian_via_points_goal_handle_.reset();
   return true;
 }
@@ -158,8 +168,11 @@ void ReachableCartesianImpedanceController::acceptPendingCartesianViaPoints(
   std::vector<Quaterniond> via_orientations;
   std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle;
   std::uint64_t sequence = 0;
+  bool calibration_execution = false;
+  double calibration_capture_path_time_sec = 0.0;
   if (!takePendingCartesianViaPoints(
-      &via_points, &via_orientations, &goal_handle, &sequence))
+      &via_points, &via_orientations, &goal_handle, &sequence,
+      &calibration_execution, &calibration_capture_path_time_sec))
   {
     return;
   }
@@ -187,6 +200,25 @@ void ReachableCartesianImpedanceController::acceptPendingCartesianViaPoints(
     return;
   }
 
+  const double path_duration = path.back().t;
+  if (calibration_execution &&
+    calibration_capture_path_time_sec >= path_duration - kMinDt)
+  {
+    RCLCPP_WARN(
+      get_node()->get_logger(),
+      "Rejecting calibration action %lu because capture path time %.6f s is not before trajectory duration %.6f s.",
+      static_cast<unsigned long>(sequence),
+      calibration_capture_path_time_sec,
+      path_duration);
+    if (goal_handle && goal_handle->is_active()) {
+      goal_handle->abort(
+        makeCartesianViaMotionActionResult(
+          SimpleActionResult::REJECTED,
+          "calibration_capture_path_time_sec must be smaller than the generated trajectory duration."));
+    }
+    return;
+  }
+
   cartesian_via_points_ = std::move(via_points);
   cartesian_via_point_quaternions_ = std::move(via_orientations);
   {
@@ -196,12 +228,25 @@ void ReachableCartesianImpedanceController::acceptPendingCartesianViaPoints(
 
   resetViaPointExecutionState(current_position, current_orientation, wall_time);
   command_recording_active_ = true;
+  calibration_plan_latched_ = false;
+  calibration_plan_complete_ = false;
+  calibration_target_failed_ = false;
+  calibration_requested_capture_path_time_sec_ =
+    calibration_execution ? calibration_capture_path_time_sec : 0.0;
+  calibration_actual_capture_path_time_sec_ = -1.0;
+  calibration_failsafe_command_count_ = 0;
+  calibration_plan_generation_ = 0;
+  calibration_monitor_input_sequence_ = 0;
+  calibration_activation_control_sequence_ = 0;
+  calibration_activation_intended_index_ = 0;
+  calibration_activation_failsafe_index_ = 0;
 
   std::shared_ptr<CartesianViaMotionGoalHandle> previous_active_goal;
   {
     std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
     previous_active_goal = active_cartesian_via_points_goal_handle_;
     active_cartesian_via_points_goal_handle_ = goal_handle;
+    active_cartesian_via_points_calibration_ = calibration_execution;
     cartesian_via_points_action_last_feedback_wall_time_ = -1.0;
   }
   if (previous_active_goal &&
@@ -221,8 +266,10 @@ void ReachableCartesianImpedanceController::acceptPendingCartesianViaPoints(
   }
   RCLCPP_INFO(
     get_node()->get_logger(),
-    "Accepted cartesian_via_points message %lu: poses=%zu waypoints=%zu samples=%zu duration=%.3f s",
+    "Accepted cartesian_via_points message %lu: calibration=%d capture_path_time=%.6f s poses=%zu waypoints=%zu samples=%zu duration=%.3f s",
     static_cast<unsigned long>(sequence),
+    static_cast<int>(calibration_execution),
+    calibration_requested_capture_path_time_sec_,
     cartesian_via_points_.size(),
     waypoint_count,
     path_snapshot.size(),
@@ -292,9 +339,11 @@ void ReachableCartesianImpedanceController::updateCartesianViaPointsActionStatus
   double wall_time)
 {
   std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle;
+  bool calibration_action = false;
   {
     std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
     goal_handle = active_cartesian_via_points_goal_handle_;
+    calibration_action = active_cartesian_via_points_calibration_;
   }
 
   if (!goal_handle) {
@@ -309,6 +358,10 @@ void ReachableCartesianImpedanceController::updateCartesianViaPointsActionStatus
     cartesian_via_points_.clear();
     cartesian_via_point_quaternions_.clear();
     resetViaPointExecutionState(current_position, current_orientation, wall_time);
+    calibration_plan_latched_ = false;
+    calibration_plan_complete_ = false;
+    calibration_target_failed_ = false;
+    calibration_monitor_input_sequence_ = 0;
     goal_handle->canceled(
       makeCartesianViaMotionActionResult(
         SimpleActionResult::PREEMPTED,
@@ -317,6 +370,7 @@ void ReachableCartesianImpedanceController::updateCartesianViaPointsActionStatus
       std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
       if (active_cartesian_via_points_goal_handle_ == goal_handle) {
         active_cartesian_via_points_goal_handle_.reset();
+        active_cartesian_via_points_calibration_ = false;
       }
     }
     return;
@@ -326,6 +380,45 @@ void ReachableCartesianImpedanceController::updateCartesianViaPointsActionStatus
     std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
     if (active_cartesian_via_points_goal_handle_ == goal_handle) {
       active_cartesian_via_points_goal_handle_.reset();
+      active_cartesian_via_points_calibration_ = false;
+    }
+    return;
+  }
+
+  if (calibration_action && calibration_target_failed_) {
+    {
+      std::lock_guard<std::mutex> path_lock(cartesian_via_point_path_mutex_);
+      cartesian_via_point_path_.clear();
+    }
+    cartesian_via_points_.clear();
+    cartesian_via_point_quaternions_.clear();
+    resetViaPointExecutionState(
+      current_position, current_orientation, wall_time);
+    goal_handle->abort(
+      makeCartesianViaMotionActionResult(
+        SimpleActionResult::ABORTED,
+        "The next monitored trajectory after this calibration action was not safely executable; no later candidate was substituted."));
+    {
+      std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
+      if (active_cartesian_via_points_goal_handle_ == goal_handle) {
+        active_cartesian_via_points_goal_handle_.reset();
+        active_cartesian_via_points_calibration_ = false;
+      }
+    }
+    return;
+  }
+
+  if (calibration_action && calibration_plan_complete_) {
+    goal_handle->succeed(
+      makeCartesianViaMotionActionResult(
+        SimpleActionResult::SUCCESS,
+        "Calibration executed the action's next monitored trajectory through its final fail-safe sample."));
+    {
+      std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
+      if (active_cartesian_via_points_goal_handle_ == goal_handle) {
+        active_cartesian_via_points_goal_handle_.reset();
+        active_cartesian_via_points_calibration_ = false;
+      }
     }
     return;
   }
@@ -364,10 +457,29 @@ void ReachableCartesianImpedanceController::updateCartesianViaPointsActionStatus
     goal_handle->publish_feedback(feedback);
   }
 
+  if (calibration_action && calibration_plan_latched_) {
+    return;
+  }
+
   const bool path_finished =
     commanded_path_time_ >= path_duration - kMinDt &&
     isNominalSafetyMode(mode_);
   if (!path_finished) {
+    return;
+  }
+
+  if (calibration_action) {
+    goal_handle->abort(
+      makeCartesianViaMotionActionResult(
+        SimpleActionResult::ABORTED,
+        "Calibration path ended before its next monitored trajectory could be evaluated."));
+    {
+      std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
+      if (active_cartesian_via_points_goal_handle_ == goal_handle) {
+        active_cartesian_via_points_goal_handle_.reset();
+        active_cartesian_via_points_calibration_ = false;
+      }
+    }
     return;
   }
 
@@ -379,6 +491,7 @@ void ReachableCartesianImpedanceController::updateCartesianViaPointsActionStatus
     std::lock_guard<std::mutex> action_lock(cartesian_via_points_action_mutex_);
     if (active_cartesian_via_points_goal_handle_ == goal_handle) {
       active_cartesian_via_points_goal_handle_.reset();
+      active_cartesian_via_points_calibration_ = false;
     }
   }
 }
@@ -440,6 +553,51 @@ ReachableCartesianImpedanceController::handleCartesianViaPointsActionCancel(
 void ReachableCartesianImpedanceController::handleCartesianViaPointsActionAccepted(
   const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle)
 {
+  queueCartesianViaPointsActionGoal(goal_handle, false);
+}
+
+rclcpp_action::GoalResponse
+ReachableCartesianImpedanceController::handleCalibrationActionGoal(
+  const rclcpp_action::GoalUUID & uuid,
+  std::shared_ptr<const CartesianViaMotion::Goal> goal)
+{
+  if (!enable_calibration_logging_) {
+    RCLCPP_WARN(
+      get_node()->get_logger(),
+      "Rejecting calibration action because enable_calibration_logging is disabled.");
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+  const double capture_path_time_sec =
+    get_node()
+    ->get_parameter("calibration_capture_path_time_sec")
+    .as_double();
+  if (!std::isfinite(capture_path_time_sec) || capture_path_time_sec < 0.0) {
+    RCLCPP_WARN(
+      get_node()->get_logger(),
+      "Rejecting calibration action because calibration_capture_path_time_sec must be finite and nonnegative (got %.9f).",
+      capture_path_time_sec);
+    return rclcpp_action::GoalResponse::REJECT;
+  }
+  return handleCartesianViaPointsActionGoal(uuid, std::move(goal));
+}
+
+rclcpp_action::CancelResponse
+ReachableCartesianImpedanceController::handleCalibrationActionCancel(
+  const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle)
+{
+  return handleCartesianViaPointsActionCancel(goal_handle);
+}
+
+void ReachableCartesianImpedanceController::handleCalibrationActionAccepted(
+  const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle)
+{
+  queueCartesianViaPointsActionGoal(goal_handle, true);
+}
+
+void ReachableCartesianImpedanceController::queueCartesianViaPointsActionGoal(
+  const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle,
+  bool calibration_execution)
+{
   if (!goal_handle) {
     return;
   }
@@ -463,12 +621,31 @@ void ReachableCartesianImpedanceController::handleCartesianViaPointsActionAccept
 
   std::shared_ptr<CartesianViaMotionGoalHandle> previous_pending_goal;
   std::uint64_t sequence = 0;
+  double calibration_capture_path_time_sec = 0.0;
+  if (calibration_execution) {
+    calibration_capture_path_time_sec =
+      get_node()
+      ->get_parameter("calibration_capture_path_time_sec")
+      .as_double();
+    if (!std::isfinite(calibration_capture_path_time_sec) ||
+      calibration_capture_path_time_sec < 0.0)
+    {
+      goal_handle->abort(
+        makeCartesianViaMotionActionResult(
+          SimpleActionResult::REJECTED,
+          "calibration_capture_path_time_sec must be finite and nonnegative."));
+      return;
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(pending_cartesian_via_points_mutex_);
     previous_pending_goal = pending_cartesian_via_points_goal_handle_;
     pending_cartesian_via_points_ = std::move(points);
     pending_cartesian_via_point_quaternions_ = std::move(orientations);
     pending_cartesian_via_points_goal_handle_ = goal_handle;
+    pending_cartesian_via_points_calibration_ = calibration_execution;
+    pending_calibration_capture_path_time_sec_ =
+      calibration_capture_path_time_sec;
     sequence = ++pending_cartesian_via_points_sequence_;
     pending_cartesian_via_points_available_ = true;
   }
@@ -479,6 +656,7 @@ void ReachableCartesianImpedanceController::handleCartesianViaPointsActionAccept
     previous_active_goal = active_cartesian_via_points_goal_handle_;
     if (previous_active_goal && previous_active_goal != goal_handle) {
       active_cartesian_via_points_goal_handle_.reset();
+      active_cartesian_via_points_calibration_ = false;
     }
   }
 
@@ -503,9 +681,11 @@ void ReachableCartesianImpedanceController::handleCartesianViaPointsActionAccept
 
   RCLCPP_INFO(
     get_node()->get_logger(),
-    "Queued Cartesian via-point action goal %lu with %zu poses.",
+    "Queued Cartesian via-point action goal %lu with %zu poses (calibration=%d capture_path_time=%.6f s).",
     static_cast<unsigned long>(sequence),
-    goal->via_poses.size());
+    goal->via_poses.size(),
+    static_cast<int>(calibration_execution),
+    calibration_capture_path_time_sec);
 }
 
 void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop()

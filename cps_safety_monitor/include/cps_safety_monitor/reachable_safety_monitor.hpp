@@ -184,6 +184,13 @@ struct VerifiedPlan {
 struct SafetyMonitorConfig {
   cps_human_workspace::HumanWorkspace human_workspace;
 
+  // Calibration-only geometry policy. When true, the robot dynamics and
+  // energy rollout still run, but every human-workspace distance is treated
+  // as +infinity. Runtime controllers must enable this only through an
+  // explicit non-safety calibration mode; missing workspace data is not
+  // evidence that no human is present.
+  bool assume_human_workspace_clear{false};
+
   Matrix6d K_runtime{Matrix6d::Zero()};
   Matrix6d D_runtime{Matrix6d::Zero()};
 

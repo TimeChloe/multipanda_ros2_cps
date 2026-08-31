@@ -192,16 +192,19 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     out.current_cartesian_energy_valid = true;
   }
 
-  const double inflated_contact_radius_now =
-      config.human_workspace.inflatedCollisionRadius(
-          config.ee_collision_radius,
-          0.0);
-
-  out.workspace_distance_now =
-      config.human_workspace.signedDistanceToInflatedSphere(
-          current_position,
-          inflated_contact_radius_now,
-          config.wall_time_sec);
+  if (config.assume_human_workspace_clear) {
+    out.workspace_distance_now = std::numeric_limits<double>::infinity();
+  } else {
+    const double inflated_contact_radius_now =
+        config.human_workspace.inflatedCollisionRadius(
+            config.ee_collision_radius,
+            0.0);
+    out.workspace_distance_now =
+        config.human_workspace.signedDistanceToInflatedSphere(
+            current_position,
+            inflated_contact_radius_now,
+            config.wall_time_sec);
+  }
 
   out.workspace_distance_min = out.workspace_distance_now;
 
@@ -296,18 +299,20 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
         orientationInducedPositionError(
             config.collision_center_offset.norm(),
             segment_orientation_error_radius);
-    const double inflated_contact_radius_segment =
-        config.human_workspace.inflatedCollisionRadius(
-            config.ee_collision_radius,
-            rho_p_segment);
-
-    const double d_segment =
-        config.human_workspace.signedDistanceSegmentToInflatedSphere(
-            x_pred,
-            x_next,
-            inflated_contact_radius_segment,
-            segment_start_time_sec,
-            segment_end_time_sec);
+    double d_segment = std::numeric_limits<double>::infinity();
+    if (!config.assume_human_workspace_clear) {
+      const double inflated_contact_radius_segment =
+          config.human_workspace.inflatedCollisionRadius(
+              config.ee_collision_radius,
+              rho_p_segment);
+      d_segment =
+          config.human_workspace.signedDistanceSegmentToInflatedSphere(
+              x_pred,
+              x_next,
+              inflated_contact_radius_segment,
+              segment_start_time_sec,
+              segment_end_time_sec);
+    }
 
     out.workspace_distance_min = std::min(out.workspace_distance_min, d_segment);
 
@@ -574,15 +579,19 @@ MonitorResult verifyReachablePlanJointSpace(
     }
   }
 
-  const double inflated_contact_radius_now =
-      config.human_workspace.inflatedCollisionRadius(
-          config.ee_collision_radius, 0.0);
   const Vector3d collision_position_now = collisionPosition(state);
-  out.workspace_distance_now =
-      config.human_workspace.signedDistanceToInflatedSphere(
-          collision_position_now,
-          inflated_contact_radius_now,
-          config.wall_time_sec);
+  if (config.assume_human_workspace_clear) {
+    out.workspace_distance_now = std::numeric_limits<double>::infinity();
+  } else {
+    const double inflated_contact_radius_now =
+        config.human_workspace.inflatedCollisionRadius(
+            config.ee_collision_radius, 0.0);
+    out.workspace_distance_now =
+        config.human_workspace.signedDistanceToInflatedSphere(
+            collision_position_now,
+            inflated_contact_radius_now,
+            config.wall_time_sec);
+  }
   out.workspace_distance_min = out.workspace_distance_now;
 
   Matrix6d current_lambda = Matrix6d::Zero();
@@ -736,12 +745,13 @@ MonitorResult verifyReachablePlanJointSpace(
 
     Vector7d tau_nullspace = Vector7d::Zero();
     const Vector3d collision_start = collisionPosition(state);
-    const double start_distance =
-        config.human_workspace.signedDistanceToInflatedSphere(
-            collision_start,
-            config.human_workspace.inflatedCollisionRadius(
-                config.ee_collision_radius, 0.0),
-            config.wall_time_sec + t_prev);
+    const double start_distance = config.assume_human_workspace_clear
+        ? std::numeric_limits<double>::infinity()
+        : config.human_workspace.signedDistanceToInflatedSphere(
+              collision_start,
+              config.human_workspace.inflatedCollisionRadius(
+                  config.ee_collision_radius, 0.0),
+              config.wall_time_sec + t_prev);
     const bool nullspace_enabled_for_sample =
         config.nullspace_stiffness > 0.0 && start_distance > 0.0 &&
         !(desired.failsafe && config.disable_nullspace_in_failsafe);
@@ -817,14 +827,15 @@ MonitorResult verifyReachablePlanJointSpace(
             std::max(previous_orientation_error_radius,
                      next_orientation_error_radius));
     const Vector3d collision_end = collisionPosition(next_state);
-    const double segment_distance =
-        config.human_workspace.signedDistanceSegmentToInflatedSphere(
-            collision_start,
-            collision_end,
-            config.human_workspace.inflatedCollisionRadius(
-                config.ee_collision_radius, rho_p),
-            config.wall_time_sec + t_prev,
-            config.wall_time_sec + desired.t);
+    const double segment_distance = config.assume_human_workspace_clear
+        ? std::numeric_limits<double>::infinity()
+        : config.human_workspace.signedDistanceSegmentToInflatedSphere(
+              collision_start,
+              collision_end,
+              config.human_workspace.inflatedCollisionRadius(
+                  config.ee_collision_radius, rho_p),
+              config.wall_time_sec + t_prev,
+              config.wall_time_sec + desired.t);
     out.workspace_distance_min =
         std::min(out.workspace_distance_min, segment_distance);
 

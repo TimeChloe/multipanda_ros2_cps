@@ -125,6 +125,7 @@ class ReachableCartesianImpedanceController
                                       const Matrix6d& D_runtime,
                                       const cps_human_workspace::HumanWorkspace& human_workspace,
                                       bool human_workspace_active,
+                                      bool human_workspace_assumed_clear,
                                       const ImpedanceSample& current_command_reference,
                                       bool current_command_reference_valid,
                                       std::vector<JointPredictionSample>*
@@ -188,6 +189,7 @@ class ReachableCartesianImpedanceController
     Matrix6d D_runtime{Matrix6d::Zero()};
     cps_human_workspace::HumanWorkspace human_workspace;
     bool human_workspace_active{false};
+    bool human_workspace_assumed_clear{false};
 
     ImpedanceSample last_commanded_sample;
     bool last_commanded_sample_valid{false};
@@ -239,7 +241,9 @@ class ReachableCartesianImpedanceController
       std::vector<Vector3d>* points,
       std::vector<Quaterniond>* orientations,
       std::shared_ptr<CartesianViaMotionGoalHandle>* goal_handle,
-      std::uint64_t* sequence);
+      std::uint64_t* sequence,
+      bool* calibration_execution,
+      double* calibration_capture_path_time_sec);
   std::vector<cps_trajectory_generators::CartesianTrajectorySample>
   buildCartesianViaPointPath(
       const Vector3d& start_position,
@@ -265,6 +269,16 @@ class ReachableCartesianImpedanceController
       const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle);
   void handleCartesianViaPointsActionAccepted(
       const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle);
+  rclcpp_action::GoalResponse handleCalibrationActionGoal(
+      const rclcpp_action::GoalUUID& uuid,
+      std::shared_ptr<const CartesianViaMotion::Goal> goal);
+  rclcpp_action::CancelResponse handleCalibrationActionCancel(
+      const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle);
+  void handleCalibrationActionAccepted(
+      const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle);
+  void queueCartesianViaPointsActionGoal(
+      const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle,
+      bool calibration_execution);
   void safetyMonitorWorkerLoop();
   void startSafetyMonitorWorker();
   void stopSafetyMonitorWorker();
@@ -285,12 +299,15 @@ class ReachableCartesianImpedanceController
       const Matrix6d& K_runtime,
       const Matrix6d& D_runtime,
       const cps_human_workspace::HumanWorkspace& human_workspace,
+      bool human_workspace_active,
+      bool human_workspace_assumed_clear,
       const VerifiedPlan& evaluated_plan,
       const std::vector<JointPredictionSample>& joint_prediction_trace,
       const AsyncMonitorTiming& async_timing,
       const MonitorResult& monitor,
       int mode,
       bool candidate_verified,
+      std::uint64_t accepted_plan_generation,
       bool executing_last_verified_monitored,
       double monitor_total_ms,
       double planner_ms,
@@ -311,12 +328,15 @@ class ReachableCartesianImpedanceController
     Matrix6d K_runtime{Matrix6d::Zero()};
     Matrix6d D_runtime{Matrix6d::Zero()};
     cps_human_workspace::HumanWorkspace human_workspace;
+    bool human_workspace_active{false};
+    bool human_workspace_assumed_clear{false};
     VerifiedPlan evaluated_plan{};
     std::vector<JointPredictionSample> joint_prediction_trace;
     AsyncMonitorTiming async_timing{};
     MonitorResult monitor{};
     int mode{0};
     bool candidate_verified{false};
+    std::uint64_t accepted_plan_generation{0};
     bool executing_last_verified_monitored{false};
     double monitor_total_ms{0.0};
     double planner_ms{0.0};
@@ -339,12 +359,15 @@ class ReachableCartesianImpedanceController
       const Matrix6d& K_runtime,
       const Matrix6d& D_runtime,
       const cps_human_workspace::HumanWorkspace& human_workspace,
+      bool human_workspace_active,
+      bool human_workspace_assumed_clear,
       const VerifiedPlan& evaluated_plan,
       const std::vector<JointPredictionSample>& joint_prediction_trace,
       const AsyncMonitorTiming& async_timing,
       const MonitorResult& monitor,
       int mode,
       bool candidate_verified,
+      std::uint64_t accepted_plan_generation,
       bool executing_last_verified_monitored,
       double monitor_total_ms,
       double planner_ms,
@@ -353,7 +376,7 @@ class ReachableCartesianImpedanceController
       const char* source);
 
   struct ControlLogRecord {
-    static constexpr std::size_t kMaxValues = 160;
+    static constexpr std::size_t kMaxValues = 176;
     std::array<double, kMaxValues> values{};
     std::size_t value_count{0};
   };
@@ -390,6 +413,12 @@ class ReachableCartesianImpedanceController
       VerifiedPlan* plan,
       std::size_t elapsed_control_steps) const;
 
+  std::size_t failsafeCommandCount(const VerifiedPlan& plan) const;
+
+  VerifiedPlan planForExecutionLogging(const VerifiedPlan& plan) const;
+
+  bool calibrationExecutionComplete() const;
+
   struct CartesianEnergyBudgetInfo {
     bool active{false};
     bool lambda_valid{false};
@@ -403,7 +432,7 @@ class ReachableCartesianImpedanceController
 
   bool shouldRejectCandidateWithMonitor(const MonitorResult& monitor) const;
   bool shouldRejectCandidateWithMonitor(const MonitorResult& monitor,
-                                        bool human_workspace_active) const;
+                                        bool human_workspace_available) const;
 
   bool shouldApplyCartesianEnergyBudget(
       const MonitorResult& monitor) const;
@@ -453,8 +482,11 @@ class ReachableCartesianImpedanceController
       cartesian_via_points_sub_;
   std::string startup_via_points_source_{"yaml"};
   std::string cartesian_via_points_action_name_{"~/follow_cartesian_via_points"};
+  std::string calibration_action_name_{"~/calibrate_monitored_trajectory"};
   rclcpp_action::Server<CartesianViaMotion>::SharedPtr
       cartesian_via_points_action_server_;
+  rclcpp_action::Server<CartesianViaMotion>::SharedPtr
+      calibration_action_server_;
   std::mutex pending_cartesian_via_points_mutex_;
   std::vector<Vector3d> pending_cartesian_via_points_;
   std::vector<Quaterniond> pending_cartesian_via_point_quaternions_;
@@ -462,9 +494,12 @@ class ReachableCartesianImpedanceController
       pending_cartesian_via_points_goal_handle_;
   std::uint64_t pending_cartesian_via_points_sequence_{0};
   bool pending_cartesian_via_points_available_{false};
+  bool pending_cartesian_via_points_calibration_{false};
+  double pending_calibration_capture_path_time_sec_{0.0};
   std::mutex cartesian_via_points_action_mutex_;
   std::shared_ptr<CartesianViaMotionGoalHandle>
       active_cartesian_via_points_goal_handle_;
+  bool active_cartesian_via_points_calibration_{false};
   double cartesian_via_points_action_last_feedback_wall_time_{-1.0};
   double cartesian_via_points_action_feedback_period_sec_{0.1};
 
@@ -513,6 +548,23 @@ class ReachableCartesianImpedanceController
   double kinetic_energy_error_bound_joule_{0.0};
   double potential_energy_error_bound_joule_{0.0};
   bool enable_runtime_energy_scaling_{true};
+  // Passive calibration logging only. This never changes scheduling, plan
+  // acceptance, command selection, gains, or the normal safety state machine.
+  bool enable_calibration_logging_{false};
+  // Explicit calibration-only override. Missing/stale human data remains a
+  // fail-closed condition in normal operation.
+  bool calibration_assume_no_human_{false};
+  bool calibration_plan_latched_{false};
+  bool calibration_plan_complete_{false};
+  bool calibration_target_failed_{false};
+  double calibration_requested_capture_path_time_sec_{0.0};
+  double calibration_actual_capture_path_time_sec_{-1.0};
+  std::size_t calibration_failsafe_command_count_{0};
+  std::uint64_t calibration_plan_generation_{0};
+  std::uint64_t calibration_monitor_input_sequence_{0};
+  std::uint64_t calibration_activation_control_sequence_{0};
+  std::size_t calibration_activation_intended_index_{0};
+  std::size_t calibration_activation_failsafe_index_{0};
   double ee_collision_radius_{0.04};
   Vector3d tcp_offset_{Vector3d::Zero()};
   Vector3d ee_collision_center_offset_{Vector3d::Zero()};
@@ -628,6 +680,11 @@ class ReachableCartesianImpedanceController
   std::uint64_t last_verified_plan_generation_{0};
   int last_verified_command_stage_{0};
   std::size_t last_verified_command_index_{0};
+  bool verified_command_selected_this_cycle_{false};
+  bool last_commanded_verified_plan_valid_{false};
+  std::uint64_t last_commanded_verified_plan_generation_{0};
+  int last_commanded_verified_command_stage_{0};
+  std::size_t last_commanded_verified_command_index_{0};
 
   // Last command actually sent to impedance controller.
   // Used as replanning start position to avoid discontinuous replans

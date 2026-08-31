@@ -85,8 +85,38 @@ Matrix6d propagateTrackingTube(
   return 0.5 * (propagated + propagated.transpose());
 }
 
-
 }  // namespace
+
+VerifiedPlan
+ReachableCartesianImpedanceController::planForExecutionLogging(
+  const VerifiedPlan & plan) const
+{
+  VerifiedPlan source = plan;
+  source.intended_exec_index = 0;
+  source.failsafe_exec_index = 0;
+
+  VerifiedPlan execution = source;
+  execution.failsafe.clear();
+  const std::size_t command_count = failsafeCommandCount(source);
+  execution.failsafe.reserve(command_count);
+  for (std::size_t command_index = 0;
+    command_index < command_count; ++command_index)
+  {
+    ImpedanceSample command;
+    const std::size_t offset = source.intended.size() + command_index;
+    if (!getVerifiedTrajectoryCommandAtOffset(source, offset, &command)) {
+      execution.valid = false;
+      execution.failsafe.clear();
+      return execution;
+    }
+    // Its vector index now has exactly the same meaning as
+    // last_verified_command_index_ in the 1 kHz runtime executor.
+    execution.failsafe.push_back(command);
+  }
+  execution.valid = source.valid && !execution.intended.empty() &&
+    !execution.failsafe.empty();
+  return execution;
+}
 
 void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
   double wall_time,
@@ -101,12 +131,15 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
   const Matrix6d & K_runtime,
   const Matrix6d & D_runtime,
   const cps_human_workspace::HumanWorkspace & human_workspace,
+  bool human_workspace_active,
+  bool human_workspace_assumed_clear,
   const VerifiedPlan & evaluated_plan,
   const std::vector<JointPredictionSample> & joint_prediction_trace,
   const AsyncMonitorTiming & async_timing,
   const MonitorResult & monitor,
   int mode,
   bool candidate_verified,
+  std::uint64_t accepted_plan_generation,
   bool executing_last_verified_monitored,
   double monitor_total_ms,
   double planner_ms,
@@ -135,12 +168,16 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
       record.K_runtime = K_runtime;
       record.D_runtime = D_runtime;
       record.human_workspace = human_workspace;
+      record.human_workspace_active = human_workspace_active;
+      record.human_workspace_assumed_clear =
+        human_workspace_assumed_clear;
       record.evaluated_plan = evaluated_plan;
       record.joint_prediction_trace = joint_prediction_trace;
       record.async_timing = async_timing;
       record.monitor = monitor;
       record.mode = mode;
       record.candidate_verified = candidate_verified;
+      record.accepted_plan_generation = accepted_plan_generation;
       record.executing_last_verified_monitored =
       executing_last_verified_monitored;
       record.monitor_total_ms = monitor_total_ms;
@@ -165,12 +202,15 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   const Matrix6d & K_runtime,
   const Matrix6d & D_runtime,
   const cps_human_workspace::HumanWorkspace & human_workspace,
+  bool human_workspace_active,
+  bool human_workspace_assumed_clear,
   const VerifiedPlan & evaluated_plan,
   const std::vector<JointPredictionSample> & joint_prediction_trace,
   const AsyncMonitorTiming & async_timing,
   const MonitorResult & monitor,
   int mode,
   bool candidate_verified,
+  std::uint64_t accepted_plan_generation,
   bool executing_last_verified_monitored,
   double monitor_total_ms,
   double planner_ms,
@@ -219,7 +259,13 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     double Dz{0.0};
   };
 
-  const VerifiedPlan monitor_plan = makeSparsePlanForMonitor(evaluated_plan);
+  // Passive calibration keeps normal command selection unchanged.  Build the
+  // logging view through the runtime offset accessor so fail-safe time stamps,
+  // interpolation, and indices are identical to the commands actually sent.
+  const VerifiedPlan monitor_plan =
+    enable_calibration_logging_ ?
+    planForExecutionLogging(evaluated_plan) :
+    makeSparsePlanForMonitor(evaluated_plan);
   const VerifiedPlan collision_plan =
     makeCollisionCenterPlanForMonitor(monitor_plan);
   const Vector3d collision_center =
@@ -294,11 +340,6 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         std::max(
         previous_orientation_error_radius,
         next_orientation_error_radius));
-      const double inflated_contact_radius_segment =
-        human_workspace.inflatedCollisionRadius(
-        ee_collision_radius_,
-        rho_p_segment);
-
       PredictionRow row;
       row.stage = stage;
       row.index = index;
@@ -352,13 +393,21 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         }
       }
       row.human_center_end = human_workspace.centerAtTime(segment_end_time_sec);
-      row.d_segment =
-        human_workspace.signedDistanceSegmentToInflatedSphere(
-        x_pred,
-        x_next,
-        inflated_contact_radius_segment,
-        segment_start_time_sec,
-        segment_end_time_sec);
+      if (human_workspace_assumed_clear) {
+        row.d_segment = std::numeric_limits<double>::infinity();
+      } else {
+        const double inflated_contact_radius_segment =
+          human_workspace.inflatedCollisionRadius(
+          ee_collision_radius_,
+          rho_p_segment);
+        row.d_segment =
+          human_workspace.signedDistanceSegmentToInflatedSphere(
+          x_pred,
+          x_next,
+          inflated_contact_radius_segment,
+          segment_start_time_sec,
+          segment_end_time_sec);
+      }
       row.contact_possible = row.d_segment <= 0.0;
       row.Kx = K_exec(0, 0);
       row.Ky = K_exec(1, 1);
@@ -391,13 +440,16 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   append_samples("intended", collision_plan.intended);
   append_samples("failsafe", collision_plan.failsafe);
 
-  const double actual_collision_distance =
-    human_workspace.signedDistanceToInflatedSphere(
-    collision_center,
-    human_workspace.inflatedCollisionRadius(
-      ee_collision_radius_,
-      0.0),
-    wall_time);
+  const double actual_collision_distance = human_workspace_active
+    ? human_workspace.signedDistanceToInflatedSphere(
+      collision_center,
+      human_workspace.inflatedCollisionRadius(
+        ee_collision_radius_,
+        0.0),
+      wall_time)
+    : human_workspace_assumed_clear
+      ? std::numeric_limits<double>::infinity()
+      : std::numeric_limits<double>::quiet_NaN();
   const Vector3d actual_human_center = human_workspace.centerAtTime(wall_time);
 
   output << std::fixed << std::setprecision(9);
@@ -405,6 +457,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     output
       << wall_time << "," << nominal_guess_time << ","
       << (source == nullptr ? "" : source) << ","
+      << static_cast<int>(human_workspace_active) << ","
+      << static_cast<int>(human_workspace_assumed_clear) << ","
       << static_cast<int>(async_timing.valid) << ","
       << async_timing.input_sequence << ","
       << async_timing.input_control_loop_sequence << ","
@@ -425,6 +479,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << monitor_eval_ms << ","
       << mode << ","
       << static_cast<int>(candidate_verified) << ","
+      << accepted_plan_generation << ","
       << static_cast<int>(executing_last_verified_monitored) << ","
       << static_cast<int>(monitor.predicted_trigger) << ","
       << static_cast<int>(monitor.monitored_contact_possible) << ","
@@ -523,7 +578,8 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "measured_path_acceleration_valid,mode,execution_stage,fallback_reason,"
     "plan_failure_reason,candidate_verified,monitor_prediction_valid,"
     "predicted_trigger,predicted_contact_possible,"
-    "monitored_contact_possible,contact_relevant_for_energy,"
+    "monitored_contact_possible,human_workspace_active,"
+    "human_workspace_assumed_clear,contact_relevant_for_energy,"
     "collision_energy_unsafe,monitored_unsafe,joint_limit_unsafe,"
     "joint_limit_index,joint_position_violation,joint_velocity_violation,"
     "joint_acceleration_violation,joint_torque_violation,workspace_distance_now,"
@@ -567,6 +623,21 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "async_monitor_outputs_consumed,async_monitor_schedule_late_cycles,"
     "async_monitor_schedule_skipped_slots,verified_plan_age_sec,"
     "verified_next_intended_exec_index,verified_next_failsafe_exec_index,"
+    "executed_verified_command_stage,executed_verified_command_index,"
+    "executed_verified_plan_valid,executed_verified_plan_generation,"
+    "previous_applied_verified_plan_valid,"
+    "previous_applied_verified_plan_generation,"
+    "previous_applied_verified_command_stage,"
+    "previous_applied_verified_command_index,"
+    "calibration_execution_active,calibration_plan_latched,"
+    "calibration_plan_complete,calibration_target_failed,"
+    "calibration_requested_capture_path_time_sec,"
+    "calibration_actual_capture_path_time_sec,"
+    "calibration_plan_generation,"
+    "calibration_monitor_input_sequence,"
+    "calibration_activation_control_sequence,"
+    "calibration_activation_intended_index,"
+    "calibration_activation_failsafe_index,"
     "runtime_energy_scaling_enabled,"
     "cartesian_energy_budget_active,cartesian_effective_time_frozen,"
     "cartesian_energy_lambda_valid,cartesian_energy_scale,"
@@ -627,7 +698,8 @@ bool ReachableCartesianImpedanceController::startLogWriters()
 
   if (enable_prediction_logging_) {
     const std::string prediction_header =
-      "wall_time_sec,nominal_time_sec,source,async_timing_valid,"
+      "wall_time_sec,nominal_time_sec,source,human_workspace_active,"
+      "human_workspace_assumed_clear,async_timing_valid,"
       "monitor_input_sequence,monitor_input_control_loop_sequence,"
       "monitor_source_plan_generation,committed_prefix_steps,"
       "source_plan_matches_at_handoff,async_output_usable,"
@@ -635,6 +707,7 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "worker_queue_wait_ms,worker_compute_ms,output_handoff_ms,"
       "monitor_end_to_end_ms,monitor_total_ms,planner_ms,"
       "plan_build_ms,monitor_eval_ms,mode,candidate_verified,"
+      "accepted_plan_generation,"
       "executing_last_verified_monitored,predicted_trigger,"
       "monitored_contact_possible,plan_intended_steps,plan_failsafe_steps,"
       "stage,index,is_failsafe_sample,sample_t,dt,actual_collision_px,actual_collision_py,"
@@ -711,12 +784,15 @@ bool ReachableCartesianImpedanceController::startLogWriters()
             record.K_runtime,
             record.D_runtime,
             record.human_workspace,
+            record.human_workspace_active,
+            record.human_workspace_assumed_clear,
             record.evaluated_plan,
             record.joint_prediction_trace,
             record.async_timing,
             record.monitor,
             record.mode,
             record.candidate_verified,
+            record.accepted_plan_generation,
             record.executing_last_verified_monitored,
             record.monitor_total_ms,
             record.planner_ms,

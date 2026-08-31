@@ -55,7 +55,8 @@ enum class FallbackReason
   kNone = 0,
   kNoVerifiedPlanAvailable = 1,
   kCandidatePredictionRejected = 2,
-  kAsyncOutputUnavailable = 3
+  kAsyncOutputUnavailable = 3,
+  kHumanWorkspaceUnavailable = 4
 };
 
 enum class PlanFailureReason

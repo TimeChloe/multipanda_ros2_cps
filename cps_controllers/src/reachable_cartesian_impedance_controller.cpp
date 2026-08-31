@@ -649,7 +649,8 @@ bool ReachableCartesianImpedanceController::refreshHumanWorkspaceForMonitor(
           *get_node()->get_clock(),
           1000,
           "Human workspace state on '%s' is stale or unavailable. "
-          "Safety monitor is waiting for fresh workspace data.",
+          "Safety monitor is fail-closed and will reject new plans until "
+          "fresh workspace data arrives.",
           human_workspace_topic_.c_str());
     }
     return human_workspace_active_;
@@ -662,7 +663,8 @@ bool ReachableCartesianImpedanceController::refreshHumanWorkspaceForMonitor(
         *get_node()->get_clock(),
         1000,
         "No human workspace state received on '%s'. "
-        "Safety monitor is waiting for the human workspace provider.",
+        "Safety monitor is fail-closed and will reject new plans until the "
+        "workspace provider is available.",
         human_workspace_topic_.c_str());
   }
   return human_workspace_active_;
@@ -670,9 +672,15 @@ bool ReachableCartesianImpedanceController::refreshHumanWorkspaceForMonitor(
 
 bool ReachableCartesianImpedanceController::shouldRejectCandidateWithMonitor(
     const MonitorResult& monitor,
-    bool human_workspace_active) const {
-  if (!enable_safety_monitor_ || !human_workspace_active) {
+    bool human_workspace_available) const {
+  if (!enable_safety_monitor_) {
     return false;
+  }
+
+  // Missing or stale workspace data means that human occupancy is unknown.
+  // Do not interpret a provider failure as an empty workspace.
+  if (!human_workspace_available) {
+    return true;
   }
 
   // A predicted collision possibility alone is allowed. Reject the candidate
@@ -917,6 +925,7 @@ ImpedanceSample ReachableCartesianImpedanceController::getNextFailsafeCommandFro
           command_dt;
   last_verified_command_stage_ = 2;
   last_verified_command_index_ = last_verified_plan_.failsafe_exec_index;
+  verified_command_selected_this_cycle_ = true;
 
   ImpedanceSample cmd;
   const auto& failsafe = last_verified_plan_.failsafe;
@@ -958,6 +967,7 @@ ImpedanceSample ReachableCartesianImpedanceController::getNextVerifiedTrajectory
     const std::size_t idx = last_verified_plan_.intended_exec_index;
     last_verified_command_stage_ = 1;
     last_verified_command_index_ = idx;
+    verified_command_selected_this_cycle_ = true;
     ImpedanceSample cmd = last_verified_plan_.intended[idx];
     if (advance_index) {
       ++last_verified_plan_.intended_exec_index;
@@ -1084,6 +1094,30 @@ void ReachableCartesianImpedanceController::alignVerifiedPlanExecutionIndex(
       elapsed_control_steps > intended_size
           ? elapsed_control_steps - intended_size
           : 0;
+}
+
+std::size_t ReachableCartesianImpedanceController::failsafeCommandCount(
+    const VerifiedPlan& plan) const {
+  if (!plan.valid || plan.failsafe.empty()) {
+    return 0;
+  }
+  const ImpedanceSample& failsafe_start =
+      plan.intended.empty() ? plan.anchor : plan.intended.back();
+  const double duration =
+      std::max(0.0, plan.failsafe.back().t - failsafe_start.t);
+  return static_cast<std::size_t>(std::max(
+      1.0,
+      std::ceil(duration / std::max(local_replan_dt_, kMinDt) - 1.0e-9)));
+}
+
+bool ReachableCartesianImpedanceController::calibrationExecutionComplete()
+    const {
+  return calibration_plan_latched_ &&
+         last_verified_plan_.valid &&
+         last_verified_plan_.intended_exec_index >=
+             last_verified_plan_.intended.size() &&
+         last_verified_plan_.failsafe_exec_index >=
+             calibration_failsafe_command_count_;
 }
 
 // ============================================================================
@@ -1862,13 +1896,16 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
     const Matrix6d& D_runtime,
     const cps_human_workspace::HumanWorkspace& human_workspace,
     bool human_workspace_active,
+    bool human_workspace_assumed_clear,
     const ImpedanceSample& current_command_reference,
     bool current_command_reference_valid,
     std::vector<JointPredictionSample>* joint_prediction_trace) const {
   if (joint_prediction_trace != nullptr) {
     joint_prediction_trace->clear();
   }
-  if (!enable_safety_monitor_ || !human_workspace_active) {
+  const bool human_workspace_available =
+      human_workspace_active || human_workspace_assumed_clear;
+  if (!enable_safety_monitor_ || !human_workspace_available) {
     return MonitorResult{};
   }
 
@@ -1879,6 +1916,7 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
       K_runtime,
       D_runtime,
       plan.generated_wall_time);
+  config.assume_human_workspace_clear = human_workspace_assumed_clear;
   config.current_energy_reference_valid = current_command_reference_valid;
   if (current_command_reference_valid) {
     config.current_energy_reference = current_command_reference;
@@ -1984,6 +2022,7 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
         D_runtime_,
         human_workspace_,
         human_workspace_active_,
+        false,
         last_commanded_sample_,
         last_commanded_sample_valid_,
         enable_prediction_logging_ ? &dec.joint_prediction_trace : nullptr);
@@ -2134,7 +2173,10 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
   }
 
   mode_ = lastVerifiedSafetyModeForMonitor(dec.monitor);
-  execute_last_verified_monitored(FallbackReason::kCandidatePredictionRejected);
+  execute_last_verified_monitored(
+      human_workspace_active_
+          ? FallbackReason::kCandidatePredictionRejected
+          : FallbackReason::kHumanWorkspaceUnavailable);
   stamp_timing();
   return dec;
 }
@@ -2365,6 +2407,7 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
         input.D_runtime,
         input.human_workspace,
         input.human_workspace_active,
+        input.human_workspace_assumed_clear,
         input.last_commanded_sample,
         input.last_commanded_sample_valid,
         enable_prediction_logging_ ? &dec.joint_prediction_trace : nullptr);
@@ -2376,7 +2419,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
     dec.candidate_verified =
         !shouldRejectCandidateWithMonitor(
             dec.monitor,
-            input.human_workspace_active);
+            input.human_workspace_active ||
+                input.human_workspace_assumed_clear);
 
     if (!dec.candidate_verified) {
       return true;
@@ -2410,7 +2454,10 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
     return dec;
   }
 
-  execute_last_verified_monitored(FallbackReason::kCandidatePredictionRejected);
+  execute_last_verified_monitored(
+      input.human_workspace_active || input.human_workspace_assumed_clear
+          ? FallbackReason::kCandidatePredictionRejected
+          : FallbackReason::kHumanWorkspaceUnavailable);
   stamp_timing();
   return dec;
 }
@@ -2620,6 +2667,15 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& period) {
   const auto tic_total = SteadyClock::now();
   const std::uint64_t control_loop_sequence = ++control_update_sequence_;
+  const bool previous_applied_verified_plan_valid =
+      last_commanded_verified_plan_valid_;
+  const std::uint64_t previous_applied_verified_plan_generation =
+      last_commanded_verified_plan_generation_;
+  const int previous_applied_verified_command_stage =
+      last_commanded_verified_command_stage_;
+  const std::size_t previous_applied_verified_command_index =
+      last_commanded_verified_command_index_;
+  verified_command_selected_this_cycle_ = false;
   last_verified_command_stage_ = 0;
   last_verified_command_index_ = 0;
   execution_stage_ = ExecutionStage::kCurrentVerified;
@@ -2657,6 +2713,26 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       Jv - skewSymmetric(collisionCenterOffsetWorld(current_orientation)) * Jw;
   Matrix67d J_collision_geo = J_geo;
   J_collision_geo.topRows<3>() = Jv_collision;
+
+  acceptPendingCartesianViaPoints(
+      current_position, current_orientation, wall_time);
+
+  const bool human_workspace_assumed_clear =
+      enable_safety_monitor_ &&
+      active_cartesian_via_points_calibration_ &&
+      calibration_assume_no_human_ &&
+      !human_workspace_active_;
+  const bool human_workspace_available =
+      human_workspace_active_ || human_workspace_assumed_clear;
+  if (human_workspace_assumed_clear) {
+    RCLCPP_WARN_THROTTLE(
+        get_node()->get_logger(),
+        *get_node()->get_clock(),
+        2000,
+        "CALIBRATION ONLY: no fresh human workspace is available; treating "
+        "human distance as +infinity while continuing dynamics and energy "
+        "prediction.");
+  }
   const double current_workspace_distance_now =
       human_workspace_active_
           ? human_workspace_.signedDistanceToInflatedSphere(
@@ -2664,10 +2740,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                 human_workspace_.inflatedCollisionRadius(
                     ee_collision_radius_, 0.0),
                 wall_time)
-          : std::numeric_limits<double>::infinity();
+          : human_workspace_assumed_clear
+              ? std::numeric_limits<double>::infinity()
+              : std::numeric_limits<double>::quiet_NaN();
   const auto toc_model = SteadyClock::now();
-
-  acceptPendingCartesianViaPoints(current_position, current_orientation, wall_time);
 
   double paused_total = paused_nominal_time_sec_;
   if (failsafe_enter_wall_time_sec_ >= 0.0)
@@ -2677,7 +2753,42 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   ShieldDecision shield_dec;
   FallbackReason async_output_rejection_reason = FallbackReason::kNone;
 
-  if (async_safety_monitor_) {
+  if (calibration_plan_latched_) {
+    // This branch is reachable only through the dedicated calibration action.
+    // It executes the already accepted normal-mode plan without replacement;
+    // command generation and the runtime impedance controller are unchanged.
+    shield_dec = last_shield_decision_;
+    shield_dec.candidate_verified = true;
+    shield_dec.executing_last_verified_monitored = true;
+    shield_dec.fallback_reason = FallbackReason::kNone;
+    shield_dec.plan_failure_reason = PlanFailureReason::kNone;
+
+    if (!calibration_plan_complete_ && calibrationExecutionComplete()) {
+      calibration_plan_complete_ = true;
+      RCLCPP_INFO(
+          get_node()->get_logger(),
+          "Calibration completed monitored plan generation %lu.",
+          static_cast<unsigned long>(calibration_plan_generation_));
+    }
+
+    if (calibration_plan_complete_) {
+      if (last_commanded_sample_valid_) {
+        shield_dec.command = last_commanded_sample_;
+        shield_dec.command.t = wall_time;
+        shield_dec.command.dp.setZero();
+        shield_dec.command.ddp.setZero();
+        shield_dec.command.w.setZero();
+        shield_dec.command.dw.setZero();
+        shield_dec.command.failsafe = true;
+      } else {
+        shield_dec.command = makeEmergencyStopCommand(
+            current_position, current_orientation, wall_time);
+      }
+    } else {
+      shield_dec.command =
+          getNextVerifiedTrajectoryCommandFromCache(true);
+    }
+  } else if (async_safety_monitor_) {
     // Consume a completed result before constructing and publishing the next
     // monitor input. The worker can finish a short rollout while this control
     // cycle is still building its input; taking the previous result first
@@ -2686,8 +2797,17 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     bool async_output_available =
         takeAsyncMonitorOutput(&async_output);
 
+    // A calibration action is a one-shot experiment: after arming its first
+    // post-action monitor input, do not overwrite that input with newer ones
+    // while the worker is still evaluating it.
+    const bool calibration_waiting_for_target_output =
+        active_cartesian_via_points_calibration_ &&
+        !calibration_plan_latched_ &&
+        !calibration_target_failed_ &&
+        calibration_monitor_input_sequence_ != 0;
     const bool publish_monitor_input =
-        control_loop_sequence >= next_async_monitor_control_sequence_;
+        control_loop_sequence >= next_async_monitor_control_sequence_ &&
+        !calibration_waiting_for_target_output;
 
     if (publish_monitor_input) {
       AsyncMonitorInput async_input;
@@ -2717,6 +2837,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       async_input.D_runtime = D_runtime_;
       async_input.human_workspace = human_workspace_;
       async_input.human_workspace_active = human_workspace_active_;
+      async_input.human_workspace_assumed_clear =
+          human_workspace_assumed_clear;
       async_input.last_commanded_sample = last_commanded_sample_;
       async_input.last_commanded_sample_valid = last_commanded_sample_valid_;
       async_input.commanded_path_time = commanded_path_time_;
@@ -2847,8 +2969,33 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       // monitor slot. Leave the absolute sequence deadline unchanged so the
       // 1 kHz loop retries with a newer state snapshot on its next cycle.
       async_input.publish_steady_time_ns = steadyNowNanoseconds();
+      const std::uint64_t published_monitor_input_sequence =
+          async_input.sequence;
+      const double published_commanded_path_time =
+          commanded_path_time_;
       if (publishAsyncMonitorInput(std::move(async_input))) {
         last_async_input_publish_control_sequence_ = control_loop_sequence;
+        if (active_cartesian_via_points_calibration_ &&
+            !calibration_plan_latched_ &&
+            !calibration_target_failed_ &&
+            calibration_monitor_input_sequence_ == 0 &&
+            published_commanded_path_time >=
+                calibration_requested_capture_path_time_sec_) {
+          calibration_monitor_input_sequence_ =
+              published_monitor_input_sequence;
+          calibration_actual_capture_path_time_sec_ =
+              published_commanded_path_time;
+          RCLCPP_INFO(
+              get_node()->get_logger(),
+              "Calibration armed next monitored trajectory at "
+              "requested_path_time=%.6f actual_path_time=%.6f "
+              "monitor_input=%lu control_sequence=%lu.",
+              calibration_requested_capture_path_time_sec_,
+              calibration_actual_capture_path_time_sec_,
+              static_cast<unsigned long>(
+                  calibration_monitor_input_sequence_),
+              static_cast<unsigned long>(control_loop_sequence));
+        }
         async_monitor_schedule_late_cycles_ +=
             control_loop_sequence - next_async_monitor_control_sequence_;
         const std::uint64_t period_cycles =
@@ -2914,6 +3061,18 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           async_plan_elapsed_steps <=
               async_output.input.committed_prefix.size();
 
+      const bool calibration_target_armed =
+          active_cartesian_via_points_calibration_ &&
+          !calibration_plan_latched_ &&
+          !calibration_target_failed_ &&
+          calibration_monitor_input_sequence_ != 0;
+      const bool calibration_target_output =
+          calibration_target_armed &&
+          async_output.input.sequence ==
+              calibration_monitor_input_sequence_;
+      const bool async_output_matches_calibration_target =
+          !calibration_target_armed || calibration_target_output;
+
       // A scheduling spike can make a fully verified worker result arrive
       // after its committed prefix while it still contains a fresh intended
       // tail. Allow such a result to catch up only when its next command is a
@@ -2940,8 +3099,17 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                 next,
                 false);
       }
+      // Never carry an assume-clear calibration result into normal mode, or
+      // reuse a live-workspace result after the provider has become stale.
+      const bool async_output_workspace_policy_matches =
+          (async_output.input.human_workspace_assumed_clear &&
+           human_workspace_assumed_clear) ||
+          (async_output.input.human_workspace_active &&
+           human_workspace_active_);
       const bool async_output_usable =
           async_output_matches_source_plan &&
+          async_output_workspace_policy_matches &&
+          async_output_matches_calibration_target &&
           (async_output_before_activation ||
            async_output_late_catchup_continuous);
       async_timing.source_plan_matches_at_handoff =
@@ -2949,6 +3117,12 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       async_timing.output_usable = async_output_usable;
       last_async_monitor_timing_ = async_timing;
       if (!async_output_matches_source_plan) {
+        async_output_rejection_reason =
+            FallbackReason::kAsyncOutputUnavailable;
+      } else if (!async_output_workspace_policy_matches) {
+        async_output_rejection_reason =
+            FallbackReason::kAsyncOutputUnavailable;
+      } else if (!async_output_matches_calibration_target) {
         async_output_rejection_reason =
             FallbackReason::kAsyncOutputUnavailable;
       } else if (!async_output_before_activation &&
@@ -2959,6 +3133,15 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       } else if (async_output_late_catchup_continuous) {
         ++async_late_activation_accept_count_;
       }
+      const bool verified_output_acceptable_now =
+          human_workspace_available &&
+          async_output.decision.candidate_verified;
+      const std::uint64_t accepted_plan_generation =
+          async_output_usable &&
+                  verified_output_acceptable_now &&
+                  async_output.decision.evaluated_plan.valid
+              ? last_verified_plan_generation_ + 1
+              : 0;
       if (async_output.decision.has_evaluated_plan) {
         logShieldPredictionTrajectory(
             async_output.input.wall_time,
@@ -2973,6 +3156,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             async_output.input.K_runtime,
             async_output.input.D_runtime,
             async_output.input.human_workspace,
+            async_output.input.human_workspace_active,
+            async_output.input.human_workspace_assumed_clear,
             async_output.decision.evaluated_plan,
             async_output.decision.joint_prediction_trace,
             async_timing,
@@ -2981,6 +3166,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                 async_output.decision.executing_last_verified_monitored ||
                 async_output.decision.command.failsafe),
             async_output.decision.candidate_verified,
+            accepted_plan_generation,
             async_output.decision.executing_last_verified_monitored,
             async_output.decision.monitor_total_ms,
             async_output.decision.planner_ms,
@@ -2993,7 +3179,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         last_shield_decision_valid_ = true;
         last_async_output_wall_time_ = async_output.input_wall_time;
         last_async_output_valid_ = true;
-        if (async_output.decision.candidate_verified &&
+        if (verified_output_acceptable_now &&
             async_output.decision.evaluated_plan.valid) {
           last_verified_plan_ = async_output.decision.evaluated_plan;
           last_verified_plan_.valid = true;
@@ -3001,7 +3187,55 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
               &last_verified_plan_,
               async_plan_elapsed_steps);
           ++last_verified_plan_generation_;
+          if (active_cartesian_via_points_calibration_ &&
+              !calibration_plan_latched_ &&
+              async_output.input.sequence ==
+                  calibration_monitor_input_sequence_ &&
+              last_verified_plan_.intended_exec_index <
+                  last_verified_plan_.intended.size() &&
+              !last_verified_plan_.failsafe.empty()) {
+            calibration_plan_latched_ = true;
+            calibration_plan_complete_ = false;
+            calibration_failsafe_command_count_ =
+                failsafeCommandCount(last_verified_plan_);
+            calibration_plan_generation_ =
+                last_verified_plan_generation_;
+            calibration_activation_control_sequence_ =
+                control_loop_sequence;
+            calibration_activation_intended_index_ =
+                last_verified_plan_.intended_exec_index;
+            calibration_activation_failsafe_index_ =
+                last_verified_plan_.failsafe_exec_index;
+            RCLCPP_INFO(
+                get_node()->get_logger(),
+                "Calibration captured next monitored plan generation=%lu "
+                "monitor_input=%lu activation_control=%lu "
+                "intended_index=%zu/%zu failsafe_index=%zu/%zu.",
+                static_cast<unsigned long>(calibration_plan_generation_),
+                static_cast<unsigned long>(
+                    calibration_monitor_input_sequence_),
+                static_cast<unsigned long>(
+                    calibration_activation_control_sequence_),
+                calibration_activation_intended_index_,
+                last_verified_plan_.intended.size(),
+                calibration_activation_failsafe_index_,
+                calibration_failsafe_command_count_);
+          }
         }
+      }
+      if (calibration_target_output && !calibration_plan_latched_) {
+        calibration_target_failed_ = true;
+        RCLCPP_WARN(
+            get_node()->get_logger(),
+            "Calibration target monitor_input=%lu was not executable "
+            "(output_usable=%d candidate_verified=%d plan_valid=%d); no "
+            "later candidate will be substituted.",
+            static_cast<unsigned long>(
+                calibration_monitor_input_sequence_),
+            static_cast<int>(async_output_usable),
+            static_cast<int>(async_output.decision.candidate_verified),
+            static_cast<int>(
+                async_output.decision.evaluated_plan.valid));
       }
     }
 
@@ -3014,8 +3248,13 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     if (output_is_fresh) {
       shield_dec = last_shield_decision_;
       if (shield_dec.executing_last_verified_monitored ||
-          shouldRejectCandidateWithMonitor(shield_dec.monitor)) {
+          shouldRejectCandidateWithMonitor(
+              shield_dec.monitor, human_workspace_available)) {
         shield_dec.executing_last_verified_monitored = true;
+        if (!human_workspace_available) {
+          shield_dec.fallback_reason =
+              FallbackReason::kHumanWorkspaceUnavailable;
+        }
         if (last_verified_plan_.valid &&
             (!last_verified_plan_.intended.empty() ||
              !last_verified_plan_.failsafe.empty())) {
@@ -3062,12 +3301,15 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       } else {
         shield_dec = last_shield_decision_;
         shield_dec.fallback_reason =
-            async_output_rejection_reason != FallbackReason::kNone
+            !human_workspace_available
+                ? FallbackReason::kHumanWorkspaceUnavailable
+                : async_output_rejection_reason != FallbackReason::kNone
                 ? async_output_rejection_reason
                 : FallbackReason::kAsyncOutputUnavailable;
         if (isLastVerifiedSafetyMode(mode_) ||
             shield_dec.executing_last_verified_monitored ||
-            shouldRejectCandidateWithMonitor(shield_dec.monitor)) {
+            shouldRejectCandidateWithMonitor(
+                shield_dec.monitor, human_workspace_available)) {
           shield_dec.executing_last_verified_monitored = true;
           if (last_verified_plan_.valid &&
               (!last_verified_plan_.intended.empty() ||
@@ -3095,6 +3337,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         ((monitor_counter_++ % std::max(1, monitor_decimation_)) == 0);
 
     if (do_monitor) {
+      const std::uint64_t generation_before_monitor =
+          last_verified_plan_generation_;
       shield_dec = computeShieldDecision(wall_time, nominal_guess_time,
                                          q, dq,
                                          current_position, current_orientation,
@@ -3102,6 +3346,11 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                                          coriolis, Jdot_dq_filtered_);
       last_shield_decision_ = shield_dec;
       last_shield_decision_valid_ = true;
+      const std::uint64_t accepted_plan_generation =
+          shield_dec.candidate_verified &&
+                  last_verified_plan_generation_ > generation_before_monitor
+              ? last_verified_plan_generation_
+              : 0;
       if (shield_dec.has_evaluated_plan) {
         const AsyncMonitorTiming sync_timing;
         logShieldPredictionTrajectory(
@@ -3117,6 +3366,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             K_runtime_,
             D_runtime_,
             human_workspace_,
+            human_workspace_active_,
+            false,
             shield_dec.evaluated_plan,
             shield_dec.joint_prediction_trace,
             sync_timing,
@@ -3125,6 +3376,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
                 shield_dec.executing_last_verified_monitored ||
                 shield_dec.command.failsafe),
             shield_dec.candidate_verified,
+            accepted_plan_generation,
             shield_dec.executing_last_verified_monitored,
             shield_dec.monitor_total_ms,
             shield_dec.planner_ms,
@@ -3239,9 +3491,13 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       shouldApplyCartesianEnergyBudget(monitor);
   const bool apply_runtime_energy_scaling =
       enable_runtime_energy_scaling_ && contact_energy_budget_active;
-  const bool track_cartesian_energy_budget =
+  // Energy calibration is independent of whether contact geometry is
+  // available.  In the dedicated assume-clear experiment, keep calculating
+  // measured-state K/V while leaving contact activation and runtime stiffness
+  // scaling unchanged.
+  const bool track_control_energy =
       enable_safety_monitor_ &&
-      human_workspace_active_;
+      (human_workspace_active_ || human_workspace_assumed_clear);
 
   struct ContactEnergyTerms {
     bool valid{false};
@@ -3309,7 +3565,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
   auto compute_contact_energy_terms = [&](const ImpedanceSample& command) {
     ContactEnergyTerms terms;
-    if (!track_cartesian_energy_budget || !inertia.allFinite() ||
+    if (!track_control_energy || !inertia.allFinite() ||
         !dq.allFinite()) {
       return terms;
     }
@@ -3380,7 +3636,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   // Runtime "current" energy always describes the command actually applied
   // in this loop, after stiffness scaling. The pre-scaling candidate energy is
   // retained separately in CartesianEnergyBudgetInfo for diagnostics.
-  if (track_cartesian_energy_budget) {
+  if (track_control_energy) {
     monitor.current_joint_energy_valid = energy_budget_terms.valid;
     monitor.current_joint_kinetic_energy =
         cartesian_energy_info.kinetic_energy;
@@ -3438,6 +3694,20 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   const Vector3d desired_position_cur = shield_dec.command.p;
   const Vector3d desired_linear_velocity_cur = shield_dec.command.dp;
 
+  last_commanded_verified_plan_valid_ =
+      verified_command_selected_this_cycle_;
+  last_commanded_verified_plan_generation_ =
+      verified_command_selected_this_cycle_
+          ? last_verified_plan_generation_
+          : 0;
+  last_commanded_verified_command_stage_ =
+      verified_command_selected_this_cycle_
+          ? last_verified_command_stage_
+          : 0;
+  last_commanded_verified_command_index_ =
+      verified_command_selected_this_cycle_
+          ? last_verified_command_index_
+          : 0;
   last_commanded_sample_ = shield_dec.command;
   last_commanded_sample_valid_ = true;
 
@@ -3501,6 +3771,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(static_cast<double>(monitor.predicted_trigger));
           add(static_cast<double>(predicted_contact_possible));
           add(static_cast<double>(monitor.monitored_contact_possible));
+          add(static_cast<double>(human_workspace_active_));
+          add(static_cast<double>(human_workspace_assumed_clear));
           add(static_cast<double>(monitor.contact_relevant_for_energy));
           add(static_cast<double>(monitor.collision_energy_unsafe));
           add(static_cast<double>(monitor.monitored_unsafe));
@@ -3588,6 +3860,28 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(verified_plan_age_sec);
           add(static_cast<double>(last_verified_plan_.intended_exec_index));
           add(static_cast<double>(last_verified_plan_.failsafe_exec_index));
+          add(static_cast<double>(last_verified_command_stage_));
+          add(static_cast<double>(last_verified_command_index_));
+          add(static_cast<double>(verified_command_selected_this_cycle_));
+          add(static_cast<double>(
+              verified_command_selected_this_cycle_
+                  ? last_verified_plan_generation_
+                  : 0));
+          add(static_cast<double>(previous_applied_verified_plan_valid));
+          add(static_cast<double>(previous_applied_verified_plan_generation));
+          add(static_cast<double>(previous_applied_verified_command_stage));
+          add(static_cast<double>(previous_applied_verified_command_index));
+          add(static_cast<double>(active_cartesian_via_points_calibration_));
+          add(static_cast<double>(calibration_plan_latched_));
+          add(static_cast<double>(calibration_plan_complete_));
+          add(static_cast<double>(calibration_target_failed_));
+          add(calibration_requested_capture_path_time_sec_);
+          add(calibration_actual_capture_path_time_sec_);
+          add(static_cast<double>(calibration_plan_generation_));
+          add(static_cast<double>(calibration_monitor_input_sequence_));
+          add(static_cast<double>(calibration_activation_control_sequence_));
+          add(static_cast<double>(calibration_activation_intended_index_));
+          add(static_cast<double>(calibration_activation_failsafe_index_));
           add(static_cast<double>(enable_runtime_energy_scaling_));
           add(static_cast<double>(last_cartesian_energy_budget_active_));
           add(0.0);
@@ -3728,6 +4022,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<std::string>(
         "cartesian_via_points_action_name",
         "~/follow_cartesian_via_points");
+    auto_declare<std::string>(
+        "calibration_action_name",
+        "~/calibrate_monitored_trajectory");
     auto_declare<double>(
         "cartesian_via_points_action_feedback_period_sec",
         0.1);
@@ -3754,6 +4051,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>("kinetic_energy_error_bound_joule", 0.0);
     auto_declare<double>("potential_energy_error_bound_joule", 0.0);
     auto_declare<bool>("enable_runtime_energy_scaling", true);
+    auto_declare<bool>("enable_calibration_logging", false);
+    auto_declare<bool>("calibration_assume_no_human", false);
+    auto_declare<double>("calibration_capture_path_time_sec", 0.0);
     auto_declare<double>("cartesian_energy_min_pos_stiffness", 0.0);
     auto_declare<double>("cartesian_energy_lambda_update_period_sec", 0.001);
     auto_declare<double>("cartesian_energy_damping_ratio", 0.8);
@@ -3853,6 +4153,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     }
     cartesian_via_points_action_name_ =
         get_node()->get_parameter("cartesian_via_points_action_name").as_string();
+    calibration_action_name_ =
+        get_node()->get_parameter("calibration_action_name").as_string();
     cartesian_via_points_action_feedback_period_sec_ =
         std::max(
             0.0,
@@ -4025,6 +4327,14 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
             "potential_energy_error_bound_joule").as_double());
     enable_runtime_energy_scaling_ =
         get_node()->get_parameter("enable_runtime_energy_scaling").as_bool();
+    enable_calibration_logging_ =
+        get_node()
+            ->get_parameter("enable_calibration_logging")
+            .as_bool();
+    calibration_assume_no_human_ =
+        get_node()
+            ->get_parameter("calibration_assume_no_human")
+            .as_bool();
 
     cartesian_energy_min_pos_stiffness_ =
         std::max(0.0, get_node()->get_parameter("cartesian_energy_min_pos_stiffness").as_double());
@@ -4109,6 +4419,26 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
       ee_collision_center_offset_.setZero();
     }
     async_safety_monitor_ = get_node()->get_parameter("async_safety_monitor").as_bool();
+    if (enable_calibration_logging_) {
+      if (!async_safety_monitor_) {
+        RCLCPP_ERROR(
+            get_node()->get_logger(),
+            "enable_calibration_logging requires async_safety_monitor=true so prediction endpoints have exact control-loop sequences");
+        return CallbackReturn::ERROR;
+      }
+      if (!enable_error_logging_ || !enable_prediction_logging_) {
+        RCLCPP_ERROR(
+            get_node()->get_logger(),
+            "enable_calibration_logging requires both enable_error_logging=true and enable_prediction_logging=true");
+        return CallbackReturn::ERROR;
+      }
+    }
+    if (calibration_assume_no_human_ && !enable_calibration_logging_) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "calibration_assume_no_human is enabled, but calibration logging "
+          "is disabled; the override cannot become active.");
+    }
     monitor_worker_cpu_affinity_ = static_cast<int>(
         get_node()->get_parameter("monitor_worker_cpu_affinity").as_int());
     if (monitor_worker_cpu_affinity_ < -1) {
@@ -4333,6 +4663,35 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
       cartesian_via_points_action_server_.reset();
     }
 
+    if (!calibration_action_name_.empty()) {
+      calibration_action_server_ =
+          rclcpp_action::create_server<CartesianViaMotion>(
+              get_node(),
+              calibration_action_name_,
+              std::bind(
+                  &ReachableCartesianImpedanceController::
+                      handleCalibrationActionGoal,
+                  this,
+                  std::placeholders::_1,
+                  std::placeholders::_2),
+              std::bind(
+                  &ReachableCartesianImpedanceController::
+                      handleCalibrationActionCancel,
+                  this,
+                  std::placeholders::_1),
+              std::bind(
+                  &ReachableCartesianImpedanceController::
+                      handleCalibrationActionAccepted,
+                  this,
+                  std::placeholders::_1));
+      RCLCPP_INFO(
+          get_node()->get_logger(),
+          "Listening for monitored-trajectory calibration goals on '%s'.",
+          calibration_action_name_.c_str());
+    } else {
+      calibration_action_server_.reset();
+    }
+
     K_base_.setZero(); D_base_.setZero();
     K_base_.topLeftCorner<3, 3>() =
         pos_stiffness * Matrix3d::Identity();
@@ -4538,6 +4897,23 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   last_verified_plan_generation_ = 0;
   last_verified_command_stage_ = 0;
   last_verified_command_index_ = 0;
+  verified_command_selected_this_cycle_ = false;
+  last_commanded_verified_plan_valid_ = false;
+  last_commanded_verified_plan_generation_ = 0;
+  last_commanded_verified_command_stage_ = 0;
+  last_commanded_verified_command_index_ = 0;
+  calibration_plan_latched_ = false;
+  calibration_plan_complete_ = false;
+  calibration_target_failed_ = false;
+  calibration_requested_capture_path_time_sec_ = 0.0;
+  calibration_actual_capture_path_time_sec_ = -1.0;
+  calibration_failsafe_command_count_ = 0;
+  calibration_plan_generation_ = 0;
+  calibration_monitor_input_sequence_ = 0;
+  calibration_activation_control_sequence_ = 0;
+  calibration_activation_intended_index_ = 0;
+  calibration_activation_failsafe_index_ = 0;
+  active_cartesian_via_points_calibration_ = false;
   commanded_path_time_ = 0.0;
 
   tau_cmd_prev_.setZero();
@@ -4607,7 +4983,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << log_flush_period_sec_ << "\n"
                     << "recording_start: first_valid_via_points_command\n"
                     << "arm_id: " << arm_id_ << "\n"
-                    << "state_log_schema: orthogonal_execution_v4\n"
+                    << "state_log_schema: orthogonal_execution_v5\n"
                     << "mode_legend: 0=current_verified_execution, "
                        "1=fallback_execution\n"
                     << "execution_stage_legend: 0=current_verified, "
@@ -4617,7 +4993,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "fallback_reason_legend: 0=none, "
                        "1=no_verified_plan_available, "
                        "2=candidate_prediction_rejected, "
-                       "3=async_output_unavailable\n"
+                       "3=async_output_unavailable, "
+                       "4=human_workspace_unavailable\n"
                     << "reason_invariant: at_most_one_of_fallback_reason_"
                        "and_plan_failure_reason_is_nonzero\n"
                     << "plan_failure_reason_legend: 0=none, "
@@ -4703,6 +5080,31 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "enable_runtime_energy_scaling: "
                     << static_cast<int>(enable_runtime_energy_scaling_)
                     << "\n"
+                    << "enable_calibration_logging: "
+                    << static_cast<int>(
+                           enable_calibration_logging_)
+                    << "\n"
+                    << "calibration_assume_no_human: "
+                    << static_cast<int>(calibration_assume_no_human_)
+                    << "\n"
+                    << "calibration_capture_path_time_sec_default: "
+                    << get_node()
+                           ->get_parameter(
+                               "calibration_capture_path_time_sec")
+                           .as_double()
+                    << "\n"
+                    << "calibration_action_name: "
+                    << calibration_action_name_ << "\n"
+                    << "calibration_plan_policy: "
+                       "dedicated_action_capture_exactly_next_monitor_input_"
+                       "at_or_after_requested_path_time_"
+                       "abort_if_not_executable_no_candidate_substitution_"
+                       "then_execute_remaining_intended_and_failsafe\n"
+                    << "calibration_prediction_sampling: "
+                       "exact_runtime_command_grid_and_indices\n"
+                    << "measured_energy_tracking_policy: "
+                       "fresh_human_workspace_or_calibration_assume_clear\n"
+                    << "measured_energy_tracking_changes_runtime_scaling: 0\n"
                     << "cartesian_energy_min_pos_stiffness: "
                     << cartesian_energy_min_pos_stiffness_ << "\n"
                     << "cartesian_energy_lambda_update_period_sec: "
@@ -4804,6 +5206,14 @@ CallbackReturn ReachableCartesianImpedanceController::on_deactivate(
   stopLogWriters();
   plan_failure_reason_ = PlanFailureReason::kNone;
   human_workspace_active_ = false;
+  verified_command_selected_this_cycle_ = false;
+  last_commanded_verified_plan_valid_ = false;
+  calibration_plan_latched_ = false;
+  calibration_plan_complete_ = false;
+  calibration_target_failed_ = false;
+  calibration_requested_capture_path_time_sec_ = 0.0;
+  calibration_actual_capture_path_time_sec_ = -1.0;
+  active_cartesian_via_points_calibration_ = false;
   J_geo_prev_.setZero();
   Jdot_dq_filtered_.setZero();
   J_geo_prev_valid_ = false;

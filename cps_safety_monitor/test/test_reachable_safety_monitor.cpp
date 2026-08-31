@@ -621,5 +621,50 @@ TEST(ReachableSafetyMonitor,
   EXPECT_NEAR(result.inertia_model_max_energy_ratio, 2.0, 1.0e-12);
 }
 
+TEST(ReachableSafetyMonitor,
+     AssumeClearStillRunsJointAndEnergyPrediction) {
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
+  workspace_parameters.sphere_center = Vector3d::Zero();
+  workspace_parameters.motion_radius = 1.0;
+  workspace_parameters.hand_radius = 0.0;
+  config.human_workspace.setParameters(workspace_parameters);
+  config.assume_human_workspace_clear = true;
+  config.energy_budget_joule = 0.01;
+  config.tracking_acc_error_bound = 0.0;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.t = 0.001;
+  sample.q = Quaterniond::Identity();
+  plan.intended.push_back(sample);
+
+  Vector7d dq = Vector7d::Zero();
+  dq(0) = 1.0;
+  std::vector<JointPredictionSample> prediction_trace;
+  const MonitorResult result = verifyReachablePlanJointSpace(
+      plan,
+      Vector7d::Zero(),
+      dq,
+      dynamics,
+      config,
+      &prediction_trace);
+
+  EXPECT_TRUE(std::isinf(result.workspace_distance_now));
+  EXPECT_GT(result.workspace_distance_now, 0.0);
+  EXPECT_TRUE(std::isinf(result.workspace_distance_min));
+  EXPECT_FALSE(result.monitored_contact_possible);
+  EXPECT_FALSE(result.contact_relevant_for_energy);
+  EXPECT_FALSE(result.collision_energy_unsafe);
+  EXPECT_FALSE(result.predicted_trigger);
+  ASSERT_EQ(prediction_trace.size(), 2U);
+  EXPECT_TRUE(prediction_trace.back().energy_valid);
+  EXPECT_GT(prediction_trace.back().joint_kinetic_energy, 0.0);
+  EXPECT_GT(dynamics.evaluate_count_, 0);
+}
+
 }  // namespace
 }  // namespace cps_safety_monitor

@@ -47,3 +47,37 @@ ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian
   panda_motion_generator_msgs/action/CartesianViaMotion \
   "$(cat src/cps_trajectory_generators/config/examples/reachable_via_points_table_center_high_action_goal.yaml)"
   
+  
+ Calibration Mode:
+enable_safety_monitor: true
+async_safety_monitor: true
+
+energy_budget_joule: 0.12
+kinetic_energy_error_bound_joule: 0.0
+potential_energy_error_bound_joule: 0.027
+
+enable_runtime_energy_scaling: false
+enable_calibration_logging: true
+enable_error_logging: true
+enable_prediction_logging: true
+
+calibration_assume_no_human: true
+calibration_capture_path_time_sec: 0.0
+
+
+ros2 param set \
+  /reachable_cartesian_impedance_controller \
+  calibration_capture_path_time_sec 5.0
+
+Normal safety-monitor mode:
+enable_safety_monitor: true
+async_safety_monitor: true
+
+energy_budget_joule: 0.12
+kinetic_energy_error_bound_joule: 0.0
+potential_energy_error_bound_joule: 0.027
+
+enable_runtime_energy_scaling: true
+enable_calibration_logging: false
+calibration_assume_no_human: false
+  
