@@ -1727,12 +1727,8 @@ SafetyMonitorConfig ReachableCartesianImpedanceController::makeSafetyMonitorConf
       kinetic_energy_error_bound_joule_;
   config.potential_energy_error_bound_joule =
       potential_energy_error_bound_joule_;
+  config.robot_reachability_provider = robot_reachability_provider_;
   config.ee_collision_radius = ee_collision_radius_;
-  config.tracking_position_error_bound =
-      tracking_position_error_bound_;
-  config.tracking_orientation_error_bound =
-      tracking_orientation_error_bound_;
-  config.tracking_acc_error_bound = tracking_acc_error_bound_;
   config.use_dynamic_consistent_impedance = use_dynamic_consistent_impedance_;
   return config;
 }
@@ -2017,7 +2013,9 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
         false,
         last_commanded_sample_,
         last_commanded_sample_valid_,
-        enable_prediction_logging_ ? &dec.joint_prediction_trace : nullptr);
+        (enable_prediction_logging_ || enable_reachable_set_visualization_)
+            ? &dec.joint_prediction_trace
+            : nullptr);
   };
 
   auto execute_last_verified_monitored = [&](FallbackReason reason) {
@@ -2402,7 +2400,9 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
         input.human_workspace_assumed_clear,
         input.last_commanded_sample,
         input.last_commanded_sample_valid,
-        enable_prediction_logging_ ? &dec.joint_prediction_trace : nullptr);
+        (enable_prediction_logging_ || enable_reachable_set_visualization_)
+            ? &dec.joint_prediction_trace
+            : nullptr);
     monitor_eval_ms +=
         std::chrono::duration<double, std::milli>(SteadyClock::now() - eval_tic).count();
     dec.evaluated_plan = candidate_plan;
@@ -2725,16 +2725,38 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         "human distance as +infinity while continuing dynamics and energy "
         "prediction.");
   }
-  const double current_workspace_distance_now =
-      human_workspace_active_
-          ? human_workspace_.signedDistanceToInflatedSphere(
-                collision_center,
-                human_workspace_.inflatedCollisionRadius(
-                    ee_collision_radius_, 0.0),
-                wall_time)
-          : human_workspace_assumed_clear
-              ? std::numeric_limits<double>::infinity()
-              : std::numeric_limits<double>::quiet_NaN();
+  double current_workspace_distance_now =
+      human_workspace_assumed_clear
+          ? std::numeric_limits<double>::infinity()
+          : std::numeric_limits<double>::quiet_NaN();
+  int current_robot_link_index = -1;
+  if (human_workspace_active_ && robot_reachability_provider_) {
+    std::vector<cps_safety_monitor::RobotReachCapsule> current_capsules;
+    const std::vector<double> zero_alpha(7, 0.0);
+    if (robot_reachability_provider_->reachInterval(
+            q, q, 0.0, zero_alpha, &current_capsules)) {
+      const Vector3d human_center =
+          human_workspace_.centerAtTime(wall_time);
+      current_workspace_distance_now =
+          robot_reachability_provider_->minimumSignedDistance(
+              current_capsules,
+              human_center,
+              human_center,
+              human_workspace_.motionRadius(),
+              &current_robot_link_index);
+    } else {
+      // Invalid geometry is treated as contact, never as free space.
+      current_workspace_distance_now =
+          -std::numeric_limits<double>::infinity();
+    }
+  } else if (human_workspace_active_) {
+    current_workspace_distance_now =
+        human_workspace_.signedDistanceToInflatedSphere(
+            collision_center,
+            human_workspace_.inflatedCollisionRadius(
+                ee_collision_radius_, 0.0),
+            wall_time);
+  }
   const auto toc_model = SteadyClock::now();
 
   double paused_total = paused_nominal_time_sec_;
@@ -3466,6 +3488,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   // stiffness adaptation is deliberately separate and starts only when the
   // current measured collision geometry overlaps the human workspace.
   monitor.workspace_distance_now = current_workspace_distance_now;
+  monitor.current_robot_link_index = current_robot_link_index;
+  monitor.robot_secure_radius = robot_reachability_provider_
+      ? robot_reachability_provider_->secureRadius()
+      : 0.0;
   if (!monitor_prediction_valid) {
     monitor.workspace_distance_min = current_workspace_distance_now;
   }
@@ -3761,6 +3787,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(static_cast<double>(shield_dec.candidate_verified));
           add(static_cast<double>(monitor_prediction_valid));
           add(static_cast<double>(monitor.predicted_trigger));
+          add(static_cast<double>(monitor.collision_interval_index));
           add(static_cast<double>(predicted_contact_possible));
           add(static_cast<double>(monitor.monitored_contact_possible));
           add(static_cast<double>(human_workspace_active_));
@@ -3799,9 +3826,11 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(monitor.worst_case_cartesian_potential_energy_ub);
           add(monitor.worst_case_total_control_energy_ub);
           add(monitor.terminal_energy_ub);
-          add(monitor.worst_case_pos_error_radius);
-          add(monitor.worst_case_orientation_error_radius);
-          add(monitor.worst_case_vel_error_radius);
+          add(monitor.robot_secure_radius);
+          add(static_cast<double>(monitor.robot_reach_alpha_valid));
+          for (int i = 0; i < 7; ++i) add(monitor.robot_reach_alpha(i));
+          add(static_cast<double>(monitor.current_robot_link_index));
+          add(static_cast<double>(monitor.worst_case_robot_link_index));
           add(static_cast<double>(monitor.current_cartesian_energy_valid));
           add(monitor.current_cartesian_kinetic_energy);
           add(static_cast<double>(monitor.current_joint_energy_valid));
@@ -4059,6 +4088,16 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<std::vector<double>>(
         "prediction_joint_armature",
         std::vector<double>(7, 0.0));
+    auto_declare<std::string>(
+        "sara_robot_config_path",
+        cps_safety_monitor::defaultSaraPandaRobotConfigPath());
+    auto_declare<double>("sara_secure_radius", 0.02);
+    auto_declare<bool>("enable_reachable_set_visualization", true);
+    auto_declare<std::string>(
+        "reachable_set_visualization_topic", "~/robot_reachable_sets");
+    auto_declare<std::string>("reachable_set_visualization_frame_id", "");
+    auto_declare<double>("reachable_set_visualization_period_sec", 0.1);
+    auto_declare<double>("reachable_set_visualization_alpha", 0.3);
     auto_declare<std::vector<double>>(
         "ee_collision_center_offset", std::vector<double>{0.0, 0.0, 0.0});
     auto_declare<bool>("async_safety_monitor", true);
@@ -4071,10 +4110,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     cps_human_workspace::HumanWorkspace::declareParameters(get_node());
     auto_declare<std::string>("human_workspace_topic", "human_workspace/state");
     auto_declare<double>("human_workspace_timeout_sec", 0.5);
-
-    auto_declare<double>("tracking_position_error_bound", 0.0);
-    auto_declare<double>("tracking_orientation_error_bound", 0.0);
-    auto_declare<double>("tracking_acc_error_bound", 0.2);
 
     auto_declare<bool>("use_dynamic_consistent_impedance", true);
 
@@ -4352,6 +4387,64 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         get_node()->get_parameter("monitor_urdf_model_path").as_string();
     monitor_joint_dynamics_source_ =
         get_node()->get_parameter("monitor_joint_dynamics_source").as_string();
+    robot_reach_config_path_ =
+        get_node()->get_parameter("sara_robot_config_path").as_string();
+    robot_secure_radius_ =
+        get_node()->get_parameter("sara_secure_radius").as_double();
+    enable_reachable_set_visualization_ =
+        get_node()->get_parameter(
+            "enable_reachable_set_visualization").as_bool();
+    reachable_set_visualization_topic_ =
+        get_node()->get_parameter(
+            "reachable_set_visualization_topic").as_string();
+    reachable_set_visualization_frame_id_ =
+        get_node()->get_parameter(
+            "reachable_set_visualization_frame_id").as_string();
+    if (reachable_set_visualization_frame_id_.empty()) {
+      reachable_set_visualization_frame_id_ = arm_id_ + "_link0";
+    }
+    reachable_set_visualization_period_sec_ = std::max(
+        0.02,
+        get_node()->get_parameter(
+            "reachable_set_visualization_period_sec").as_double());
+    reachable_set_visualization_alpha_ = std::clamp(
+        get_node()->get_parameter(
+            "reachable_set_visualization_alpha").as_double(),
+        0.01,
+        1.0);
+    if (enable_reachable_set_visualization_ &&
+        reachable_set_visualization_topic_.empty()) {
+      RCLCPP_ERROR(
+          get_node()->get_logger(),
+          "reachable_set_visualization_topic must not be empty when "
+          "visualization is enabled");
+      return CallbackReturn::ERROR;
+    }
+    if (robot_reach_config_path_.empty()) {
+      RCLCPP_ERROR(
+          get_node()->get_logger(),
+          "sara_robot_config_path must not be empty");
+      return CallbackReturn::ERROR;
+    }
+    if (!std::isfinite(robot_secure_radius_) ||
+        robot_secure_radius_ < 0.0) {
+      RCLCPP_ERROR(
+          get_node()->get_logger(),
+          "sara_secure_radius must be finite and nonnegative");
+      return CallbackReturn::ERROR;
+    }
+    try {
+      robot_reachability_provider_ =
+          cps_safety_monitor::makeSaraRobotReachabilityProvider(
+              robot_reach_config_path_,
+              robot_secure_radius_);
+    } catch (const std::exception& error) {
+      RCLCPP_ERROR(
+          get_node()->get_logger(),
+          "Failed to initialize SaRA robot reachable-set provider: %s",
+          error.what());
+      return CallbackReturn::ERROR;
+    }
     const auto prediction_joint_armature =
         get_node()->get_parameter(
             "prediction_joint_armature").as_double_array();
@@ -4411,6 +4504,14 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
       ee_collision_center_offset_.setZero();
     }
     async_safety_monitor_ = get_node()->get_parameter("async_safety_monitor").as_bool();
+    if (enable_reachable_set_visualization_ && !async_safety_monitor_) {
+      RCLCPP_WARN(
+          get_node()->get_logger(),
+          "Reachable-set visualization requires async_safety_monitor=true "
+          "to keep Marker construction out of the 1 kHz control thread. "
+          "Visualization is disabled for this configuration.");
+      enable_reachable_set_visualization_ = false;
+    }
     if (enable_calibration_logging_) {
       if (!async_safety_monitor_) {
         RCLCPP_ERROR(
@@ -4450,19 +4551,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         max_realtime_priority);
     async_plan_max_age_sec_ =
         std::max(0.0, get_node()->get_parameter("async_plan_max_age_sec").as_double());
-
-    tracking_position_error_bound_ = std::max(
-        0.0,
-        get_node()->get_parameter(
-            "tracking_position_error_bound").as_double());
-    tracking_orientation_error_bound_ = std::max(
-        0.0,
-        get_node()->get_parameter(
-            "tracking_orientation_error_bound").as_double());
-    tracking_acc_error_bound_ = std::max(
-        0.0,
-        get_node()->get_parameter(
-            "tracking_acc_error_bound").as_double());
 
     trajectory_generator_config_path_ =
         cps_trajectory_generators::defaultTrajectoryGeneratorConfigPath();
@@ -4607,6 +4695,21 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
           human_workspace_topic_.c_str());
     } else {
       human_workspace_sub_.reset();
+    }
+
+    if (enable_reachable_set_visualization_) {
+      reachable_set_visualization_pub_ =
+          get_node()->create_publisher<visualization_msgs::msg::MarkerArray>(
+              reachable_set_visualization_topic_,
+              rclcpp::QoS(1).reliable().transient_local());
+      RCLCPP_INFO(
+          get_node()->get_logger(),
+          "Publishing SaRA robot reachable sets on '%s' in frame '%s' "
+          "(safe=last interval, unsafe=first unsafe interval).",
+          reachable_set_visualization_topic_.c_str(),
+          reachable_set_visualization_frame_id_.c_str());
+    } else {
+      reachable_set_visualization_pub_.reset();
     }
 
     if (!cartesian_via_points_topic_.empty()) {
@@ -5046,6 +5149,27 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                            active_monitor_joint_dynamics_source_ ==
                            "pinocchio")
                     << "\n"
+                    << "robot_reachable_set_backend: "
+                    << (robot_reachability_provider_
+                            ? robot_reachability_provider_->backendName()
+                            : "legacy_cartesian")
+                    << "\n"
+                    << "sara_robot_config_path: "
+                    << robot_reach_config_path_ << "\n"
+                    << "sara_secure_radius: "
+                    << robot_secure_radius_ << "\n"
+                    << "sara_alpha_mode: dynamic_from_complete_monitored_trajectory\n"
+                    << "enable_reachable_set_visualization: "
+                    << static_cast<int>(
+                         enable_reachable_set_visualization_) << "\n"
+                    << "reachable_set_visualization_topic: "
+                    << reachable_set_visualization_topic_ << "\n"
+                    << "reachable_set_visualization_frame_id: "
+                    << reachable_set_visualization_frame_id_ << "\n"
+                    << "reachable_set_visualization_period_sec: "
+                    << reachable_set_visualization_period_sec_ << "\n"
+                    << "reachable_set_visualization_alpha: "
+                    << reachable_set_visualization_alpha_ << "\n"
                     << "monitor_update_period_sec: " << monitor_update_period_sec_ << "\n"
                     << "monitor_decimation: " << monitor_decimation_ << "\n"
                     << "shield_intended_steps: " << shield_intended_steps_ << "\n"
@@ -5108,12 +5232,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "contact_relevant_for_energy_legend: "
                        "1=workspace_distance_now_nonpositive\n"
                     << "cartesian_effective_time_freeze_enabled: 0\n"
-                    << "tracking_position_error_bound: "
-                    << tracking_position_error_bound_ << "\n"
-                    << "tracking_orientation_error_bound: "
-                    << tracking_orientation_error_bound_ << "\n"
-                    << "tracking_acc_error_bound: "
-                    << tracking_acc_error_bound_ << "\n"
                     << "nullspace_home_pose: ["
                     << nullspace_home_pose_(0) << ", "
                     << nullspace_home_pose_(1) << ", "
@@ -5183,6 +5301,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                   prediction_log_file_path_.c_str());
     }
   }
+  last_reachable_set_visualization_wall_time_ = -1.0;
+  last_reachable_set_visualization_marker_count_ = 0;
   startSafetyMonitorWorker();
   return CallbackReturn::SUCCESS;
 }
@@ -5190,6 +5310,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
 CallbackReturn ReachableCartesianImpedanceController::on_deactivate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   stopSafetyMonitorWorker();
+  clearRobotReachableSetVisualization();
   stopLogWriters();
   plan_failure_reason_ = PlanFailureReason::kNone;
   human_workspace_active_ = false;

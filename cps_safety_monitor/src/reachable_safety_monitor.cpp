@@ -81,6 +81,37 @@ double orientationInducedPositionError(double offset_norm,
   return 2.0 * std::max(0.0, offset_norm) * std::sin(0.5 * angle);
 }
 
+double trackingGeometryInflation(double position_error_bound,
+                                 double orientation_error_bound,
+                                 double collision_center_offset_norm) {
+  return std::max(0.0, position_error_bound) +
+         orientationInducedPositionError(
+             collision_center_offset_norm,
+             orientation_error_bound);
+}
+
+struct EnergyUpperBound {
+  double kinetic{0.0};
+  double potential{0.0};
+
+  double total() const { return kinetic + potential; }
+};
+
+EnergyUpperBound addOneSidedEnergyErrorBounds(
+    double nominal_kinetic,
+    double nominal_potential,
+    double kinetic_error_bound,
+    double potential_error_bound) {
+  // Tracking-pose tubes intentionally do not enter this function. They are
+  // geometry bounds, whereas beta_K and beta_V directly bound the residuals
+  // of their corresponding predicted energy terms.
+  return EnergyUpperBound{
+      std::max(0.0, nominal_kinetic) +
+          std::max(0.0, kinetic_error_bound),
+      std::max(0.0, nominal_potential) +
+          std::max(0.0, potential_error_bound)};
+}
+
 double maxBlockRadius(const Matrix6d& tube, int block_start) {
   const Matrix3d block =
       0.5 * (tube.block<3, 3>(block_start, block_start) +
@@ -157,14 +188,12 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
 
   const double acc_error_bound =
       std::max(0.0, config.tracking_acc_error_bound);
-  const double fixed_position_error_bound =
-      std::max(0.0, config.tracking_position_error_bound);
-  const double fixed_orientation_error_bound =
-      std::max(0.0, config.tracking_orientation_error_bound);
   const double kinetic_energy_error_bound =
       std::max(0.0, config.kinetic_energy_error_bound_joule);
   const double potential_energy_error_bound =
       std::max(0.0, config.potential_energy_error_bound_joule);
+  const double energy_budget_eff =
+      std::max(0.0, config.energy_budget_joule);
   Matrix6d tracking_tube = Matrix6d::Zero();
 
   out.worst_case_pos_error_radius = 0.0;
@@ -232,8 +261,10 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   double previous_edge_time = plan.anchor.t;
   double previous_position_error_radius = 0.0;
   double previous_orientation_error_radius = 0.0;
+  int monitored_interval_index = 0;
 
   auto eval_sample = [&](const ImpedanceSample& s, double dtp) {
+    const int interval_index = monitored_interval_index++;
     const double segment_start_time_sec = config.wall_time_sec + t_prev;
     const double segment_end_time_sec = config.wall_time_sec + s.t;
 
@@ -284,21 +315,18 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
             dtp,
             acc_error_bound);
     const double next_position_error_radius =
-        fixed_position_error_bound +
         maxBlockRadius(tracking_tube_next, 0);
-    const double next_orientation_error_radius =
-        fixed_orientation_error_bound;
+    const double next_orientation_error_radius = 0.0;
     const double segment_position_error_radius =
         std::max(previous_position_error_radius,
                  next_position_error_radius);
     const double segment_orientation_error_radius =
         std::max(previous_orientation_error_radius,
                  next_orientation_error_radius);
-    const double rho_p_segment =
-        segment_position_error_radius +
-        orientationInducedPositionError(
-            config.collision_center_offset.norm(),
-            segment_orientation_error_radius);
+    const double rho_p_segment = trackingGeometryInflation(
+        segment_position_error_radius,
+        segment_orientation_error_radius,
+        config.collision_center_offset.norm());
     double d_segment = std::numeric_limits<double>::infinity();
     if (!config.assume_human_workspace_clear) {
       const double inflated_contact_radius_segment =
@@ -325,23 +353,35 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     // Pose tracking bounds enlarge collision geometry only. Energy-model
     // mismatch is represented directly by the independent one-sided K/V
     // error bounds, so it is not counted a second time through the pose tube.
-    const double cartesian_T_ub =
-        quadraticEnergy(next_twist, cartesian_inertia) +
-        kinetic_energy_error_bound;
-    const double cartesian_V_ub =
-        quadraticEnergy(next_pose_error, K_cartesian) +
-        potential_energy_error_bound;
+    const EnergyUpperBound energy_ub = addOneSidedEnergyErrorBounds(
+        quadraticEnergy(next_twist, cartesian_inertia),
+        quadraticEnergy(next_pose_error, K_cartesian),
+        kinetic_energy_error_bound,
+        potential_energy_error_bound);
+    const double cartesian_T_ub = energy_ub.kinetic;
+    const double cartesian_V_ub = energy_ub.potential;
 
     const bool contact_possible_step = d_segment <= 0.0;
+    if (contact_possible_step && out.first_contact_interval_index < 0) {
+      out.first_contact_interval_index = interval_index;
+    }
     // Candidate acceptance is based on the maximum complete Cartesian control
     // energy over every monitored sample that may intersect the workspace.
     // The normal-projected energy remains available only as a collision
     // diagnostic and must not authorize a 6D-energetic trajectory.
-    const double next_edge_energy_ub = cartesian_T_ub + cartesian_V_ub;
+    const double next_edge_energy_ub = energy_ub.total();
     const bool previous_edge_is_worst =
         previous_edge_energy_ub >= next_edge_energy_ub;
     const double interval_energy_ub =
         std::max(previous_edge_energy_ub, next_edge_energy_ub);
+    if (contact_possible_step && interval_energy_ub > energy_budget_eff &&
+        out.collision_interval_index < 0) {
+      out.collision_interval_index = interval_index;
+    }
+    if (contact_possible_step && interval_energy_ub > energy_budget_eff &&
+        out.first_energy_unsafe_contact_interval_index < 0) {
+      out.first_energy_unsafe_contact_interval_index = interval_index;
+    }
     if (contact_possible_step && interval_energy_ub > E_contact_max) {
       E_contact_max = interval_energy_ub;
 
@@ -405,9 +445,6 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   out.worst_case_cartesian_control_energy_ub = E_contact_max;
   out.worst_case_total_control_energy_ub = E_contact_max;
   out.terminal_energy_ub = terminal_T_ub + terminal_V_ub;
-
-  const double energy_budget_eff =
-      std::max(0.0, config.energy_budget_joule);
 
   // Keep runtime energy adaptation orthogonal to candidate verification:
   // current geometry gates the runtime stiffness budget, while any predicted
@@ -483,7 +520,7 @@ MonitorResult verifyReachablePlanJointSpace(
     *lambda = symmetrized(lambda_ldlt.solve(Matrix6d::Identity()));
     return lambda->allFinite() && inertia_inv->allFinite();
   };
-  auto collisionPosition = [&](const JointDynamicsSample& state) {
+  auto collisionPosition = [&](const JointDynamicsSample& state) -> Vector3d {
     return state.control_position +
            state.control_orientation.normalized() *
                config.collision_center_offset;
@@ -579,18 +616,43 @@ MonitorResult verifyReachablePlanJointSpace(
     }
   }
 
+  const bool use_sara_robot_reach =
+      static_cast<bool>(config.robot_reachability_provider);
+  // A zero-duration occupancy is independent of alpha. Supplying an explicit
+  // zero vector keeps the provider API uniform without inventing a fixed
+  // acceleration bound before the complete trajectory has been rolled out.
+  const std::vector<double> zero_robot_alpha(7, 0.0);
+  out.robot_secure_radius = use_sara_robot_reach
+      ? config.robot_reachability_provider->secureRadius()
+      : 0.0;
   const Vector3d collision_position_now = collisionPosition(state);
+  const Vector3d human_center_now =
+      config.human_workspace.centerAtTime(config.wall_time_sec);
   if (config.assume_human_workspace_clear) {
     out.workspace_distance_now = std::numeric_limits<double>::infinity();
+  } else if (use_sara_robot_reach) {
+    std::vector<RobotReachCapsule> current_capsules;
+    if (!config.robot_reachability_provider->reachInterval(
+            q_pred, q_pred, 0.0, zero_robot_alpha, &current_capsules)) {
+      out.joint_limit_unsafe = true;
+      out.predicted_trigger = true;
+      out.monitored_unsafe = true;
+      return out;
+    }
+    out.workspace_distance_now =
+        config.robot_reachability_provider->minimumSignedDistance(
+            current_capsules,
+            human_center_now,
+            human_center_now,
+            config.human_workspace.motionRadius(),
+            &out.current_robot_link_index);
   } else {
     const double inflated_contact_radius_now =
         config.human_workspace.inflatedCollisionRadius(
             config.ee_collision_radius, 0.0);
     out.workspace_distance_now =
-        config.human_workspace.signedDistanceToInflatedSphere(
-            collision_position_now,
-            inflated_contact_radius_now,
-            config.wall_time_sec);
+        (collision_position_now - human_center_now).norm() -
+        inflated_contact_radius_now;
   }
   out.workspace_distance_min = out.workspace_distance_now;
 
@@ -625,14 +687,12 @@ MonitorResult verifyReachablePlanJointSpace(
 
   const JointDynamicsLimits limits = dynamics.limits();
   Matrix6d tracking_tube = Matrix6d::Zero();
-  const double fixed_position_error_bound =
-      std::max(0.0, config.tracking_position_error_bound);
-  const double fixed_orientation_error_bound =
-      std::max(0.0, config.tracking_orientation_error_bound);
   const double kinetic_energy_error_bound =
       std::max(0.0, config.kinetic_energy_error_bound_joule);
   const double potential_energy_error_bound =
       std::max(0.0, config.potential_energy_error_bound_joule);
+  const double energy_budget_eff =
+      std::max(0.0, config.energy_budget_joule);
   double total_contact_energy_max = 0.0;
   double terminal_total_energy = 0.0;
   bool terminal_sample_found = false;
@@ -661,23 +721,51 @@ MonitorResult verifyReachablePlanJointSpace(
   double previous_position_error_radius = 0.0;
   double previous_orientation_error_radius = 0.0;
 
-  if (prediction_trace != nullptr) {
-    JointPredictionSample initial_prediction;
-    initial_prediction.t = plan.anchor.t;
-    initial_prediction.q = q_pred;
-    initial_prediction.dq = dq_pred;
-    initial_prediction.energy_valid = true;
-    initial_prediction.joint_kinetic_energy =
-        previous_edge_joint_kinetic;
-    initial_prediction.cartesian_potential_energy =
-        previous_edge_potential;
-    prediction_trace->push_back(initial_prediction);
-  }
+  // SaRA PFL computes one alpha_i vector from the complete monitored
+  // trajectory and then reuses it for every interval. Therefore the rollout
+  // trace must exist even when the caller does not request it as an output.
+  std::vector<JointPredictionSample> rollout_trace;
+  rollout_trace.reserve(1 + plan.intended.size() + plan.failsafe.size());
+  JointPredictionSample initial_prediction;
+  initial_prediction.t = plan.anchor.t;
+  initial_prediction.q = q_pred;
+  initial_prediction.dq = dq_pred;
+  initial_prediction.energy_valid = true;
+  initial_prediction.joint_kinetic_energy = previous_edge_joint_kinetic;
+  initial_prediction.cartesian_potential_energy = previous_edge_potential;
+  rollout_trace.push_back(initial_prediction);
+
+  struct PredictedReachInterval {
+    int index{-1};
+    double start_time{0.0};
+    double end_time{0.0};
+    Vector7d start_q{Vector7d::Zero()};
+    Vector7d end_q{Vector7d::Zero()};
+    double start_cartesian_kinetic{0.0};
+    double start_joint_kinetic{0.0};
+    double start_potential{0.0};
+    double start_total_energy{0.0};
+    double end_cartesian_kinetic{0.0};
+    double end_joint_kinetic{0.0};
+    double end_potential{0.0};
+    double end_total_energy{0.0};
+  };
+  std::vector<PredictedReachInterval> predicted_reach_intervals;
+  predicted_reach_intervals.reserve(
+      plan.intended.size() + plan.failsafe.size());
+
+  int monitored_interval_index = 0;
+  auto markIntervalUnsafe = [&](int interval_index) {
+    if (out.collision_interval_index < 0) {
+      out.collision_interval_index = interval_index;
+    }
+  };
 
   auto recordLimitViolation = [&](const Vector7d& q,
                                   const Vector7d& dq,
                                   const Vector7d& ddq,
-                                  const Vector7d& tau) {
+                                  const Vector7d& tau,
+                                  int interval_index) {
     for (int i = 0; i < 7; ++i) {
       const double q_violation = std::max(
           {limits.position_lower(i) - q(i),
@@ -696,6 +784,7 @@ MonitorResult verifyReachablePlanJointSpace(
       const double largest_hard = std::max(
           {q_violation, dq_violation, tau_violation});
       if (largest_hard > 0.0) {
+        markIntervalUnsafe(interval_index);
         out.joint_limit_unsafe = true;
         if (out.joint_limit_index < 0 ||
             largest_hard > std::max(
@@ -717,11 +806,13 @@ MonitorResult verifyReachablePlanJointSpace(
   };
 
   auto evalSample = [&](const ImpedanceSample& desired, double dt) {
+    const int interval_index = monitored_interval_index++;
     Matrix6d lambda = Matrix6d::Zero();
     Matrix7d inertia_inv = Matrix7d::Zero();
     const bool lambda_valid = taskInertia(
         state.inertia, state.control_jacobian, &lambda, &inertia_inv);
     if (!lambda_valid) {
+      markIntervalUnsafe(interval_index);
       out.joint_limit_unsafe = true;
       return false;
     }
@@ -745,13 +836,32 @@ MonitorResult verifyReachablePlanJointSpace(
 
     Vector7d tau_nullspace = Vector7d::Zero();
     const Vector3d collision_start = collisionPosition(state);
-    const double start_distance = config.assume_human_workspace_clear
-        ? std::numeric_limits<double>::infinity()
-        : config.human_workspace.signedDistanceToInflatedSphere(
-              collision_start,
-              config.human_workspace.inflatedCollisionRadius(
-                  config.ee_collision_radius, 0.0),
-              config.wall_time_sec + t_prev);
+    double start_distance = std::numeric_limits<double>::infinity();
+    if (!config.assume_human_workspace_clear && use_sara_robot_reach) {
+      std::vector<RobotReachCapsule> start_capsules;
+      if (config.robot_reachability_provider->reachInterval(
+              q_pred, q_pred, 0.0, zero_robot_alpha, &start_capsules)) {
+        const Vector3d human_center =
+            config.human_workspace.centerAtTime(
+                config.wall_time_sec + t_prev);
+        start_distance =
+            config.robot_reachability_provider->minimumSignedDistance(
+                start_capsules,
+                human_center,
+                human_center,
+                config.human_workspace.motionRadius());
+      } else {
+        markIntervalUnsafe(interval_index);
+        out.joint_limit_unsafe = true;
+        return false;
+      }
+    } else if (!config.assume_human_workspace_clear) {
+      start_distance = config.human_workspace.signedDistanceToInflatedSphere(
+          collision_start,
+          config.human_workspace.inflatedCollisionRadius(
+              config.ee_collision_radius, 0.0),
+          config.wall_time_sec + t_prev);
+    }
     const bool nullspace_enabled_for_sample =
         config.nullspace_stiffness > 0.0 && start_distance > 0.0 &&
         !(desired.failsafe && config.disable_nullspace_in_failsafe);
@@ -789,8 +899,10 @@ MonitorResult verifyReachablePlanJointSpace(
     const Vector7d dq_next = dq_pred + ddq * h;
     const Vector7d q_next = q_pred + 0.5 * (dq_pred + dq_next) * h;
 
-    recordLimitViolation(q_next, dq_next, ddq, torque_command);
+    recordLimitViolation(
+        q_next, dq_next, ddq, torque_command, interval_index);
     if (!q_next.allFinite() || !dq_next.allFinite()) {
+      markIntervalUnsafe(interval_index);
       out.joint_limit_unsafe = true;
       return false;
     }
@@ -798,46 +910,53 @@ MonitorResult verifyReachablePlanJointSpace(
     JointDynamicsSample next_state;
     if (!dynamics.evaluate(q_next, dq_next, &next_state) ||
         !next_state.valid) {
+      markIntervalUnsafe(interval_index);
       out.joint_limit_unsafe = true;
       return false;
     }
 
-    const Matrix3d task_inertia_inv =
-        (state.control_jacobian * inertia_inv *
-         state.control_jacobian.transpose()).topLeftCorner<3, 3>();
-    const Matrix6d tracking_tube_next = propagateTrackingTube(
-        tracking_tube,
-        task_inertia_inv,
-        positiveSemidefinitePart(
-            Matrix3d(desired.K.topLeftCorner<3, 3>())),
-        positiveSemidefinitePart(
-            Matrix3d(desired.D.topLeftCorner<3, 3>())),
-        h,
-        config.tracking_acc_error_bound);
-    const double next_position_error_radius =
-        fixed_position_error_bound +
-        maxBlockRadius(tracking_tube_next, 0);
-    const double next_orientation_error_radius =
-        fixed_orientation_error_bound;
-    const double rho_p = std::max(
-        previous_position_error_radius,
-        next_position_error_radius) +
-        orientationInducedPositionError(
-            config.collision_center_offset.norm(),
-            std::max(previous_orientation_error_radius,
-                     next_orientation_error_radius));
-    const Vector3d collision_end = collisionPosition(next_state);
-    const double segment_distance = config.assume_human_workspace_clear
-        ? std::numeric_limits<double>::infinity()
-        : config.human_workspace.signedDistanceSegmentToInflatedSphere(
+    Matrix6d tracking_tube_next = tracking_tube;
+    double next_position_error_radius = 0.0;
+    double next_orientation_error_radius = 0.0;
+    double segment_distance = std::numeric_limits<double>::infinity();
+    int segment_robot_link_index = -1;
+    // SaRA intervals are intentionally deferred until the complete intended +
+    // failsafe q/dq rollout is available and dynamic alpha_i has been derived.
+    if (!config.assume_human_workspace_clear && !use_sara_robot_reach) {
+      const Matrix3d task_inertia_inv =
+          (state.control_jacobian * inertia_inv *
+           state.control_jacobian.transpose()).topLeftCorner<3, 3>();
+      tracking_tube_next = propagateTrackingTube(
+          tracking_tube,
+          task_inertia_inv,
+          positiveSemidefinitePart(
+              Matrix3d(desired.K.topLeftCorner<3, 3>())),
+          positiveSemidefinitePart(
+              Matrix3d(desired.D.topLeftCorner<3, 3>())),
+          h,
+          config.tracking_acc_error_bound);
+      next_position_error_radius = maxBlockRadius(tracking_tube_next, 0);
+      next_orientation_error_radius = 0.0;
+      const double rho_p = trackingGeometryInflation(
+          std::max(previous_position_error_radius,
+                   next_position_error_radius),
+          std::max(previous_orientation_error_radius,
+                   next_orientation_error_radius),
+          config.collision_center_offset.norm());
+      const Vector3d collision_end = collisionPosition(next_state);
+      segment_distance =
+          config.human_workspace.signedDistanceSegmentToInflatedSphere(
               collision_start,
               collision_end,
               config.human_workspace.inflatedCollisionRadius(
                   config.ee_collision_radius, rho_p),
               config.wall_time_sec + t_prev,
               config.wall_time_sec + desired.t);
-    out.workspace_distance_min =
-        std::min(out.workspace_distance_min, segment_distance);
+    }
+    if (segment_distance < out.workspace_distance_min) {
+      out.workspace_distance_min = segment_distance;
+      out.worst_case_robot_link_index = segment_robot_link_index;
+    }
 
     const Vector6d next_error = poseError(next_state, desired);
     Matrix6d next_lambda = Matrix6d::Zero();
@@ -855,49 +974,78 @@ MonitorResult verifyReachablePlanJointSpace(
         jointKineticEnergy(dq_next, next_state.inertia);
     const double nominal_potential = quadraticEnergy(
         next_error, positiveSemidefinitePart(desired.K));
-    const double joint_kinetic =
-        nominal_joint_kinetic + kinetic_energy_error_bound;
-    const double potential =
-        nominal_potential + potential_energy_error_bound;
-    const double total_energy = joint_kinetic + potential;
+    const EnergyUpperBound energy_ub = addOneSidedEnergyErrorBounds(
+        nominal_joint_kinetic,
+        nominal_potential,
+        kinetic_energy_error_bound,
+        potential_energy_error_bound);
+    const double joint_kinetic = energy_ub.kinetic;
+    const double potential = energy_ub.potential;
+    const double total_energy = energy_ub.total();
 
-    if (prediction_trace != nullptr) {
-      JointPredictionSample endpoint_prediction;
-      endpoint_prediction.t = desired.t;
-      endpoint_prediction.q = q_next;
-      endpoint_prediction.dq = dq_next;
-      endpoint_prediction.energy_valid = true;
-      endpoint_prediction.joint_kinetic_energy =
-          nominal_joint_kinetic;
-      endpoint_prediction.cartesian_potential_energy =
-          nominal_potential;
-      prediction_trace->push_back(endpoint_prediction);
-    }
+    JointPredictionSample endpoint_prediction;
+    endpoint_prediction.t = desired.t;
+    endpoint_prediction.q = q_next;
+    endpoint_prediction.dq = dq_next;
+    endpoint_prediction.energy_valid = true;
+    endpoint_prediction.joint_kinetic_energy = nominal_joint_kinetic;
+    endpoint_prediction.cartesian_potential_energy = nominal_potential;
+    rollout_trace.push_back(endpoint_prediction);
 
     const bool previous_edge_is_worst =
         previous_edge_total_energy >= total_energy;
     const double interval_energy =
         std::max(previous_edge_total_energy, total_energy);
-    if (segment_distance <= 0.0 &&
-        interval_energy > total_contact_energy_max) {
-      total_contact_energy_max = interval_energy;
-      out.worst_case_contact_time =
-          previous_edge_is_worst ? previous_edge_time : desired.t;
-      out.worst_case_workspace_distance_at_candidate = segment_distance;
-      out.worst_case_cartesian_kinetic_energy_ub =
-          previous_edge_is_worst
-              ? previous_edge_cartesian_kinetic
-              : cartesian_kinetic;
-      out.worst_case_joint_kinetic_energy_ub =
-          previous_edge_is_worst
-              ? previous_edge_joint_kinetic
-              : joint_kinetic;
-      out.worst_case_cartesian_potential_energy_ub =
-          previous_edge_is_worst ? previous_edge_potential : potential;
-      // Kept for CSV/API compatibility; this now denotes the kinetic metric
-      // that actually gates the paper energy budget plus Cartesian potential.
-      out.worst_case_cartesian_control_energy_ub = interval_energy;
-      out.worst_case_total_control_energy_ub = interval_energy;
+    if (use_sara_robot_reach) {
+      PredictedReachInterval interval;
+      interval.index = interval_index;
+      interval.start_time = previous_edge_time;
+      interval.end_time = desired.t;
+      interval.start_q = q_pred;
+      interval.end_q = q_next;
+      interval.start_cartesian_kinetic =
+          previous_edge_cartesian_kinetic;
+      interval.start_joint_kinetic = previous_edge_joint_kinetic;
+      interval.start_potential = previous_edge_potential;
+      interval.start_total_energy = previous_edge_total_energy;
+      interval.end_cartesian_kinetic = cartesian_kinetic;
+      interval.end_joint_kinetic = joint_kinetic;
+      interval.end_potential = potential;
+      interval.end_total_energy = total_energy;
+      predicted_reach_intervals.push_back(interval);
+    } else {
+      if (segment_distance <= 0.0 &&
+          out.first_contact_interval_index < 0) {
+        out.first_contact_interval_index = interval_index;
+      }
+      if (segment_distance <= 0.0 && interval_energy > energy_budget_eff) {
+        if (out.first_energy_unsafe_contact_interval_index < 0) {
+          out.first_energy_unsafe_contact_interval_index = interval_index;
+        }
+        markIntervalUnsafe(interval_index);
+      }
+      if (segment_distance <= 0.0 &&
+          interval_energy > total_contact_energy_max) {
+        total_contact_energy_max = interval_energy;
+        out.worst_case_contact_time =
+            previous_edge_is_worst ? previous_edge_time : desired.t;
+        out.worst_case_workspace_distance_at_candidate = segment_distance;
+        out.worst_case_robot_link_index = segment_robot_link_index;
+        out.worst_case_cartesian_kinetic_energy_ub =
+            previous_edge_is_worst
+                ? previous_edge_cartesian_kinetic
+                : cartesian_kinetic;
+        out.worst_case_joint_kinetic_energy_ub =
+            previous_edge_is_worst
+                ? previous_edge_joint_kinetic
+                : joint_kinetic;
+        out.worst_case_cartesian_potential_energy_ub =
+            previous_edge_is_worst ? previous_edge_potential : potential;
+        // Kept for CSV/API compatibility; this now denotes the kinetic metric
+        // that actually gates the paper energy budget plus Cartesian potential.
+        out.worst_case_cartesian_control_energy_ub = interval_energy;
+        out.worst_case_total_control_energy_ub = interval_energy;
+      }
     }
     if (desired.failsafe) {
       terminal_total_energy = total_energy;
@@ -915,17 +1063,19 @@ MonitorResult verifyReachablePlanJointSpace(
     previous_edge_potential = potential;
     previous_edge_total_energy = total_energy;
     previous_edge_time = desired.t;
-    previous_position_error_radius = next_position_error_radius;
-    previous_orientation_error_radius = next_orientation_error_radius;
-    out.worst_case_pos_error_radius = std::max(
-        out.worst_case_pos_error_radius,
-        next_position_error_radius);
-    out.worst_case_orientation_error_radius = std::max(
-        out.worst_case_orientation_error_radius,
-        next_orientation_error_radius);
-    out.worst_case_vel_error_radius = std::max(
-        out.worst_case_vel_error_radius,
-        maxBlockRadius(tracking_tube, 3));
+    if (!use_sara_robot_reach) {
+      previous_position_error_radius = next_position_error_radius;
+      previous_orientation_error_radius = next_orientation_error_radius;
+      out.worst_case_pos_error_radius = std::max(
+          out.worst_case_pos_error_radius,
+          next_position_error_radius);
+      out.worst_case_orientation_error_radius = std::max(
+          out.worst_case_orientation_error_radius,
+          next_orientation_error_radius);
+      out.worst_case_vel_error_radius = std::max(
+          out.worst_case_vel_error_radius,
+          maxBlockRadius(tracking_tube, 3));
+    }
     return true;
   };
 
@@ -971,8 +1121,12 @@ MonitorResult verifyReachablePlanJointSpace(
   ImpedanceSample previous_desired = plan.anchor;
   auto evaluateStage = [&](const std::vector<ImpedanceSample>& stage) {
     for (const auto& desired : stage) {
-      const double segment_dt =
-          std::max(desired.t - previous_desired.t, kMinDt);
+      const double segment_dt = desired.t - previous_desired.t;
+      if (!std::isfinite(segment_dt) || segment_dt <= 0.0) {
+        markIntervalUnsafe(monitored_interval_index);
+        out.joint_limit_unsafe = true;
+        return false;
+      }
       const double max_step =
           std::max(config.joint_rollout_max_dt, kMinDt);
       const int substeps = std::max(
@@ -995,8 +1149,121 @@ MonitorResult verifyReachablePlanJointSpace(
   };
 
   const bool intended_complete = evaluateStage(plan.intended);
+  bool failsafe_complete = false;
   if (intended_complete && !out.joint_limit_unsafe) {
-    evaluateStage(plan.failsafe);
+    failsafe_complete = evaluateStage(plan.failsafe);
+  }
+  const bool complete_monitored_rollout =
+      intended_complete && failsafe_complete && !out.joint_limit_unsafe;
+
+  if (prediction_trace != nullptr) {
+    *prediction_trace = rollout_trace;
+  }
+
+  if (use_sara_robot_reach && complete_monitored_rollout) {
+    std::vector<double> dynamic_alpha;
+    const bool interval_trace_consistent =
+        rollout_trace.size() == predicted_reach_intervals.size() + 1;
+    if (!interval_trace_consistent ||
+        !config.robot_reachability_provider->calculateTrajectoryAlpha(
+            rollout_trace, &dynamic_alpha) ||
+        dynamic_alpha.size() != 7 ||
+        std::any_of(
+            dynamic_alpha.begin(), dynamic_alpha.end(), [](double value) {
+              return !std::isfinite(value) || value < 0.0;
+            })) {
+      // Fail closed when SaRA's dynamic alpha cannot be derived from exactly
+      // the q/dq samples that define the monitored intervals.
+      markIntervalUnsafe(0);
+      out.joint_limit_unsafe = true;
+    } else {
+      out.robot_reach_alpha_valid = true;
+      for (int i = 0; i < 7; ++i) {
+        out.robot_reach_alpha(i) = dynamic_alpha[static_cast<std::size_t>(i)];
+      }
+
+      if (!config.assume_human_workspace_clear) {
+        for (const auto& interval : predicted_reach_intervals) {
+          const double interval_duration =
+              interval.end_time - interval.start_time;
+          std::vector<RobotReachCapsule> robot_capsules;
+          if (!std::isfinite(interval_duration) ||
+              interval_duration <= 0.0 ||
+              !config.robot_reachability_provider->reachInterval(
+                  interval.start_q,
+                  interval.end_q,
+                  interval_duration,
+                  dynamic_alpha,
+                  &robot_capsules)) {
+            markIntervalUnsafe(interval.index);
+            out.joint_limit_unsafe = true;
+            break;
+          }
+
+          int segment_robot_link_index = -1;
+          const double segment_distance =
+              config.robot_reachability_provider->minimumSignedDistance(
+                  robot_capsules,
+                  config.human_workspace.centerAtTime(
+                      config.wall_time_sec + interval.start_time),
+                  config.human_workspace.centerAtTime(
+                      config.wall_time_sec + interval.end_time),
+                  config.human_workspace.motionRadius(),
+                  &segment_robot_link_index);
+          if (!std::isfinite(segment_distance)) {
+            markIntervalUnsafe(interval.index);
+            out.joint_limit_unsafe = true;
+            break;
+          }
+          if (segment_distance < out.workspace_distance_min) {
+            out.workspace_distance_min = segment_distance;
+            out.worst_case_robot_link_index = segment_robot_link_index;
+          }
+          if (segment_distance <= 0.0 &&
+              out.first_contact_interval_index < 0) {
+            out.first_contact_interval_index = interval.index;
+          }
+
+          const bool start_is_worst =
+              interval.start_total_energy >= interval.end_total_energy;
+          const double interval_energy = std::max(
+              interval.start_total_energy, interval.end_total_energy);
+          if (segment_distance <= 0.0 &&
+              interval_energy > energy_budget_eff) {
+            if (out.first_energy_unsafe_contact_interval_index < 0) {
+              out.first_energy_unsafe_contact_interval_index = interval.index;
+            }
+            markIntervalUnsafe(interval.index);
+          }
+          if (segment_distance <= 0.0 &&
+              interval_energy > total_contact_energy_max) {
+            total_contact_energy_max = interval_energy;
+            out.worst_case_contact_time = start_is_worst
+                ? interval.start_time
+                : interval.end_time;
+            out.worst_case_workspace_distance_at_candidate =
+                segment_distance;
+            out.worst_case_robot_link_index = segment_robot_link_index;
+            out.worst_case_cartesian_kinetic_energy_ub = start_is_worst
+                ? interval.start_cartesian_kinetic
+                : interval.end_cartesian_kinetic;
+            out.worst_case_joint_kinetic_energy_ub = start_is_worst
+                ? interval.start_joint_kinetic
+                : interval.end_joint_kinetic;
+            out.worst_case_cartesian_potential_energy_ub = start_is_worst
+                ? interval.start_potential
+                : interval.end_potential;
+            out.worst_case_cartesian_control_energy_ub = interval_energy;
+            out.worst_case_total_control_energy_ub = interval_energy;
+          }
+        }
+      }
+    }
+  } else if (use_sara_robot_reach && !out.joint_limit_unsafe) {
+    // A partial intended/failsafe trajectory must never be verified with an
+    // alpha vector computed from only the available prefix.
+    markIntervalUnsafe(0);
+    out.joint_limit_unsafe = true;
   }
 
   out.monitored_contact_possible = out.workspace_distance_min <= 0.0;
@@ -1008,8 +1275,6 @@ MonitorResult verifyReachablePlanJointSpace(
   // contact in the complete monitored trajectory is still energy-verified.
   out.contact_relevant_for_energy = out.workspace_distance_now <= 0.0;
 
-  const double energy_budget_eff =
-      std::max(0.0, config.energy_budget_joule);
   const bool predicted_contact_requires_verification =
       out.monitored_contact_possible;
   const bool current_collision_energy_unsafe =

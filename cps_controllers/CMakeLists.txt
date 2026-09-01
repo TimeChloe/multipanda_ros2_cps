@@ -27,6 +27,7 @@ find_package(realtime_tools REQUIRED)
 find_package(franka_semantic_components REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(franka_msgs REQUIRED)
 find_package(mujoco_ros_msgs REQUIRED)
 # CMake 3.22's FindBoost does not map python310 to boost/python.hpp.
@@ -49,6 +50,7 @@ add_library(${PROJECT_NAME} SHARED
   src/reachable_cartesian_impedance/async.cpp
   src/reachable_cartesian_impedance_controller.cpp
   src/reachable_cartesian_impedance/logging.cpp
+  src/reachable_cartesian_impedance/visualization.cpp
   src/free_motion_external_wrench_controller.cpp
 )
 
@@ -69,6 +71,7 @@ ament_target_dependencies(${PROJECT_NAME}
   franka_semantic_components
   std_msgs
   geometry_msgs
+  visualization_msgs
   franka_msgs
   mujoco_ros_msgs
   panda_motion_generator_msgs
@@ -113,6 +116,7 @@ ament_export_dependencies(
   franka_semantic_components
   std_msgs
   geometry_msgs
+  visualization_msgs
   franka_msgs
   pinocchio
   panda_motion_generator_msgs

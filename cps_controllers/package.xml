@@ -19,6 +19,7 @@
   <depend>franka_semantic_components</depend>
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
   <depend>franka_msgs</depend>
   <depend>mujoco_ros_msgs</depend>
   <depend>pinocchio</depend>

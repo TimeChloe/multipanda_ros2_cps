@@ -25,66 +25,6 @@ namespace
 constexpr double kMinDt = 1e-6;
 constexpr double kSmallPositive = 1e-9;
 
-Matrix3d positiveSemidefinitePart(const Matrix3d & matrix)
-{
-  const Matrix3d symmetric = 0.5 * (matrix + matrix.transpose());
-  const Eigen::SelfAdjointEigenSolver<Matrix3d> eig(symmetric);
-  if (eig.info() != Eigen::Success) {
-    return symmetric;
-  }
-  Matrix3d psd =
-    eig.eigenvectors() *
-    eig.eigenvalues().cwiseMax(0.0).asDiagonal() *
-    eig.eigenvectors().transpose();
-  return 0.5 * (psd + psd.transpose());
-}
-
-double maxTrackingBlockRadius(const Matrix6d & tube, int block_start)
-{
-  const Matrix3d block =
-    0.5 * (tube.block<3, 3>(block_start, block_start) +
-    tube.block<3, 3>(block_start, block_start).transpose());
-  const Eigen::SelfAdjointEigenSolver<Matrix3d> eig(block);
-  if (eig.info() != Eigen::Success) {
-    return std::sqrt(std::max(0.0, block.norm()));
-  }
-  return std::sqrt(std::max(0.0, eig.eigenvalues().maxCoeff()));
-}
-
-double orientationInducedPositionError(
-  double offset_norm, double orientation_error_bound)
-{
-  constexpr double kPi = 3.14159265358979323846;
-  const double angle = std::clamp(
-    std::max(0.0, orientation_error_bound), 0.0, kPi);
-  return 2.0 * std::max(0.0, offset_norm) * std::sin(0.5 * angle);
-}
-
-Matrix6d propagateTrackingTube(
-  const Matrix6d & tube,
-  const Matrix3d & task_inertia_inv,
-  const Matrix3d & Kp,
-  const Matrix3d & Dp,
-  double dt,
-  double acc_error_bound)
-{
-  const double h = std::max(dt, kMinDt);
-  Matrix6d A = Matrix6d::Identity();
-  A.topRightCorner<3, 3>() = h * Matrix3d::Identity();
-  A.bottomLeftCorner<3, 3>() = -h * task_inertia_inv * Kp;
-  A.bottomRightCorner<3, 3>() =
-    Matrix3d::Identity() - h * task_inertia_inv * Dp;
-
-  Eigen::Matrix<double, 6, 3> B = Eigen::Matrix<double, 6, 3>::Zero();
-  B.topRows<3>() = 0.5 * h * h * Matrix3d::Identity();
-  B.bottomRows<3>() = h * Matrix3d::Identity();
-
-  const double acc_bound = std::max(0.0, acc_error_bound);
-  const Matrix6d propagated =
-    A * tube * A.transpose() + acc_bound * acc_bound * B * B.transpose();
-  return 0.5 * (propagated + propagated.transpose());
-}
-
 }  // namespace
 
 VerifiedPlan
@@ -248,6 +188,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         std::numeric_limits<double>::quiet_NaN())};
     Vector7d joint_dq{Vector7d::Constant(
         std::numeric_limits<double>::quiet_NaN())};
+    bool robot_reach_valid{false};
+    int closest_robot_link_index{-1};
     double d_segment{0.0};
     Vector3d human_center_end{Vector3d::Zero()};
     bool contact_possible{false};
@@ -273,9 +215,6 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   const Vector6d collision_twist =
     twistAtCollisionCenter(current_orientation, ee_twist);
 
-  const double acc_error_bound =
-    std::max(0.0, tracking_acc_error_bound_);
-
   Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
   task_inertia_inv.diagonal().array() += kSmallPositive;
   Matrix6d K_exec = K_runtime;
@@ -283,13 +222,16 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
 
   Vector3d x_pred = collision_center;
   Vector3d v_pred = collision_twist.head<3>();
-  Matrix6d tracking_tube = Matrix6d::Zero();
-  double previous_position_error_radius = 0.0;
-  double previous_orientation_error_radius = 0.0;
+  Vector7d previous_joint_q = current_q;
   double t_prev = collision_plan.anchor.t;
   std::vector<PredictionRow> rows;
   rows.reserve(1 + collision_plan.intended.size() + collision_plan.failsafe.size());
   std::size_t joint_trace_index = 0;
+  std::vector<double> dynamic_robot_alpha;
+  const bool dynamic_robot_alpha_valid =
+    robot_reachability_provider_ &&
+    robot_reachability_provider_->calculateTrajectoryAlpha(
+    joint_prediction_trace, &dynamic_robot_alpha);
 
   auto append_row = [&](const char * stage,
       int index,
@@ -302,8 +244,6 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
 
       const Matrix3d Kp_raw = K_exec.topLeftCorner<3, 3>();
       const Matrix3d Dp_raw = D_exec.topLeftCorner<3, 3>();
-      const Matrix3d Kp = positiveSemidefinitePart(Kp_raw);
-      const Matrix3d Dp = positiveSemidefinitePart(Dp_raw);
       const Vector3d force_pred =
         Kp_raw * (collision_sample.p - x_pred) -
         Dp_raw * (v_pred - collision_sample.dp);
@@ -318,28 +258,6 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         x_pred + v_pred * dtp + 0.5 * a_pred * dtp * dtp;
       const Vector3d v_next = v_pred + a_pred * dtp;
 
-      const Matrix6d tracking_tube_next =
-        propagateTrackingTube(
-        tracking_tube,
-        task_inertia_inv,
-        Kp,
-        Dp,
-        dtp,
-        acc_error_bound);
-      const double next_position_error_radius =
-        std::max(0.0, tracking_position_error_bound_) +
-        maxTrackingBlockRadius(tracking_tube_next, 0);
-      const double next_orientation_error_radius =
-        std::max(0.0, tracking_orientation_error_bound_);
-      const double rho_p_segment =
-        std::max(
-        previous_position_error_radius,
-        next_position_error_radius) +
-        orientationInducedPositionError(
-        ee_collision_center_offset_.norm(),
-        std::max(
-        previous_orientation_error_radius,
-        next_orientation_error_radius));
       PredictionRow row;
       row.stage = stage;
       row.index = index;
@@ -395,16 +313,31 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       row.human_center_end = human_workspace.centerAtTime(segment_end_time_sec);
       if (human_workspace_assumed_clear) {
         row.d_segment = std::numeric_limits<double>::infinity();
+      } else if (robot_reachability_provider_ && row.joint_state_valid) {
+        std::vector<cps_safety_monitor::RobotReachCapsule> robot_capsules;
+        row.robot_reach_valid =
+          dynamic_robot_alpha_valid &&
+          robot_reachability_provider_->reachInterval(
+          previous_joint_q,
+          row.joint_q,
+          dtp,
+          dynamic_robot_alpha,
+          &robot_capsules);
+        row.d_segment = row.robot_reach_valid ?
+          robot_reachability_provider_->minimumSignedDistance(
+          robot_capsules,
+          human_workspace.centerAtTime(segment_start_time_sec),
+          row.human_center_end,
+          human_workspace.motionRadius(),
+          &row.closest_robot_link_index) :
+          -std::numeric_limits<double>::infinity();
       } else {
-        const double inflated_contact_radius_segment =
-          human_workspace.inflatedCollisionRadius(
-          ee_collision_radius_,
-          rho_p_segment);
         row.d_segment =
           human_workspace.signedDistanceSegmentToInflatedSphere(
           x_pred,
           x_next,
-          inflated_contact_radius_segment,
+          human_workspace.inflatedCollisionRadius(
+            ee_collision_radius_, 0.0),
           segment_start_time_sec,
           segment_end_time_sec);
       }
@@ -419,9 +352,9 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
 
       x_pred = x_next;
       v_pred = v_next;
-      tracking_tube = tracking_tube_next;
-      previous_position_error_radius = next_position_error_radius;
-      previous_orientation_error_radius = next_orientation_error_radius;
+      if (row.joint_state_valid) {
+        previous_joint_q = row.joint_q;
+      }
     };
 
   auto append_samples = [&](const char * stage,
@@ -440,17 +373,34 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   append_samples("intended", collision_plan.intended);
   append_samples("failsafe", collision_plan.failsafe);
 
-  const double actual_collision_distance = human_workspace_active
-    ? human_workspace.signedDistanceToInflatedSphere(
+  const Vector3d actual_human_center = human_workspace.centerAtTime(wall_time);
+  double actual_collision_distance =
+    human_workspace_assumed_clear ?
+    std::numeric_limits<double>::infinity() :
+    std::numeric_limits<double>::quiet_NaN();
+  int actual_closest_robot_link_index = -1;
+  if (human_workspace_active && robot_reachability_provider_) {
+    std::vector<cps_safety_monitor::RobotReachCapsule> robot_capsules;
+    const std::vector<double> zero_alpha(7, 0.0);
+    if (robot_reachability_provider_->reachInterval(
+        current_q, current_q, 0.0, zero_alpha, &robot_capsules))
+    {
+      actual_collision_distance =
+        robot_reachability_provider_->minimumSignedDistance(
+        robot_capsules,
+        actual_human_center,
+        actual_human_center,
+        human_workspace.motionRadius(),
+        &actual_closest_robot_link_index);
+    }
+  } else if (human_workspace_active) {
+    actual_collision_distance =
+      human_workspace.signedDistanceToInflatedSphere(
       collision_center,
       human_workspace.inflatedCollisionRadius(
-        ee_collision_radius_,
-        0.0),
-      wall_time)
-    : human_workspace_assumed_clear
-      ? std::numeric_limits<double>::infinity()
-      : std::numeric_limits<double>::quiet_NaN();
-  const Vector3d actual_human_center = human_workspace.centerAtTime(wall_time);
+        ee_collision_radius_, 0.0),
+      wall_time);
+  }
 
   output << std::fixed << std::setprecision(9);
   for (const auto & row : rows) {
@@ -482,6 +432,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << accepted_plan_generation << ","
       << static_cast<int>(executing_last_verified_monitored) << ","
       << static_cast<int>(monitor.predicted_trigger) << ","
+      << monitor.collision_interval_index << ","
       << static_cast<int>(monitor.monitored_contact_possible) << ","
       << monitor_plan.intended.size() << ","
       << monitor_plan.failsafe.size() << ","
@@ -492,6 +443,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << actual_human_center(0) << "," << actual_human_center(1) << "," << actual_human_center(2) <<
       ","
       << actual_collision_distance << ","
+      << actual_closest_robot_link_index << ","
       << current_q(0) << "," << current_q(1) << "," << current_q(2) << ","
       << current_q(3) << "," << current_q(4) << "," << current_q(5) << ","
       << current_q(6) << ","
@@ -530,6 +482,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << row.joint_dq(6) << ","
       << row.human_center_end(0) << "," << row.human_center_end(1) << "," <<
       row.human_center_end(2) << ","
+      << static_cast<int>(row.robot_reach_valid) << ","
+      << row.closest_robot_link_index << ","
       << row.d_segment << ","
       << static_cast<int>(row.contact_possible) << ","
       << row.Kx << "," << row.Ky << "," << row.Kz << ","
@@ -577,7 +531,7 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "measured_path_rate_valid,measured_path_acceleration,"
     "measured_path_acceleration_valid,mode,execution_stage,fallback_reason,"
     "plan_failure_reason,candidate_verified,monitor_prediction_valid,"
-    "predicted_trigger,predicted_contact_possible,"
+    "predicted_trigger,collision_interval_index,predicted_contact_possible,"
     "monitored_contact_possible,human_workspace_active,"
     "human_workspace_assumed_clear,contact_relevant_for_energy,"
     "collision_energy_unsafe,monitored_unsafe,joint_limit_unsafe,"
@@ -600,8 +554,11 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "worst_case_cartesian_potential_energy_ub,"
     "worst_case_total_control_energy_ub,"
     "terminal_energy_ub,"
-    "worst_case_pos_error_radius,worst_case_orientation_error_radius,"
-    "worst_case_vel_error_radius,"
+    "robot_reach_secure_radius,robot_reach_alpha_valid,"
+    "robot_reach_alpha_1,robot_reach_alpha_2,robot_reach_alpha_3,"
+    "robot_reach_alpha_4,robot_reach_alpha_5,robot_reach_alpha_6,"
+    "robot_reach_alpha_7,current_robot_link_index,"
+    "worst_case_robot_link_index,"
     "monitor_current_cartesian_energy_valid,"
     "monitor_current_cartesian_kinetic_energy,"
     "monitor_current_joint_energy_valid,"
@@ -709,10 +666,12 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "plan_build_ms,monitor_eval_ms,mode,candidate_verified,"
       "accepted_plan_generation,"
       "executing_last_verified_monitored,predicted_trigger,"
-      "monitored_contact_possible,plan_intended_steps,plan_failsafe_steps,"
+      "collision_interval_index,monitored_contact_possible,"
+      "plan_intended_steps,plan_failsafe_steps,"
       "stage,index,is_failsafe_sample,sample_t,dt,actual_collision_px,actual_collision_py,"
       "actual_collision_pz,actual_human_center_px,actual_human_center_py,"
       "actual_human_center_pz,actual_collision_distance,"
+      "actual_closest_robot_link_index,"
       "measured_q1,measured_q2,measured_q3,measured_q4,measured_q5,"
       "measured_q6,measured_q7,measured_dq1,measured_dq2,measured_dq3,"
       "measured_dq4,measured_dq5,measured_dq6,measured_dq7,collision_target_px,"
@@ -729,7 +688,8 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "pred_q1,pred_q2,pred_q3,pred_q4,pred_q5,pred_q6,pred_q7,"
       "pred_dq1,pred_dq2,pred_dq3,pred_dq4,pred_dq5,pred_dq6,pred_dq7,"
       "human_center_end_px,human_center_end_py,"
-      "human_center_end_pz,distance_segment,contact_possible,"
+      "human_center_end_pz,robot_reach_valid,closest_robot_link_index,"
+      "distance_segment,contact_possible,"
       "Kx,Ky,Kz,Dx,Dy,Dz,"
       "monitor_worst_case_cartesian_kinetic_energy_ub,"
       "monitor_worst_case_joint_kinetic_energy_ub,"

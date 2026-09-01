@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <limits>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -72,6 +74,62 @@ class JointDynamicsProvider {
   virtual JointDynamicsLimits limits() const = 0;
 };
 
+// Geometry-only robot reachable occupancy.  The runtime implementation is an
+// adapter around SaRA-Shield's RobotArmReach and ReachLib capsules; keeping
+// this narrow interface here avoids exposing the third-party headers to every
+// controller that consumes cps_safety_monitor.
+struct RobotReachCapsule {
+  Vector3d p1{Vector3d::Zero()};
+  Vector3d p2{Vector3d::Zero()};
+  double radius{0.0};
+};
+
+class RobotReachabilityProvider {
+ public:
+  virtual ~RobotReachabilityProvider() = default;
+
+  // Return SaRA's enclosing capsules for the joint-space interval
+  // [start_q, goal_q].  interval_duration_sec is passed as SaRA's s_diff.
+  virtual bool reachInterval(
+      const Vector7d& start_q,
+      const Vector7d& goal_q,
+      double interval_duration_sec,
+      const std::vector<double>& alpha_i,
+      std::vector<RobotReachCapsule>* capsules) const = 0;
+
+  // Match SARA Shield's PFL path: compute one Cartesian-acceleration value
+  // per robot capsule from all q/dq samples in the complete monitored
+  // trajectory. The returned vector is reused for every time interval.
+  virtual bool calculateTrajectoryAlpha(
+      const std::vector<JointPredictionSample>& trajectory,
+      std::vector<double>* alpha_i) const = 0;
+
+  // Signed distance between a robot reachable occupancy and the human-center
+  // interval capsule.  Implementations use the same ReachLib capsule distance
+  // routine as SaRA-Shield.
+  virtual double minimumSignedDistance(
+      const std::vector<RobotReachCapsule>& robot_capsules,
+      const Vector3d& human_center_start,
+      const Vector3d& human_center_end,
+      double human_radius,
+      int* closest_robot_link_index = nullptr) const = 0;
+
+  virtual double secureRadius() const = 0;
+  virtual const char* backendName() const = 0;
+};
+
+// Build a provider from an unmodified SaRA robot-parameter YAML file.  The
+// configured secure_radius is overridden explicitly so it can be calibrated
+// without forking SaRA's robot geometry file.
+std::shared_ptr<const RobotReachabilityProvider>
+makeSaraRobotReachabilityProvider(
+    const std::string& robot_config_path,
+    double secure_radius);
+
+// Installed copy of SaRA-Shield's unmodified Panda robot parameters. This
+// avoids source-tree-specific paths on both the simulator and the real robot.
+std::string defaultSaraPandaRobotConfigPath();
+
 struct MonitorResult {
   bool monitored_contact_possible{false};
   // Current measured collision geometry overlaps the human workspace. This is
@@ -84,8 +142,26 @@ struct MonitorResult {
   // within the energy budget does not trigger candidate rejection.
   bool predicted_trigger{false};
 
+  // SaRA-style index of the first monitored time interval that makes the
+  // candidate unsafe. This indexes [prediction_trace[i],
+  // prediction_trace[i + 1]]. It remains -1 for a verified trajectory.
+  int collision_interval_index{-1};
+  // First interval whose robot reachable occupancy intersects the human
+  // workspace, regardless of whether its energy is within the PFL budget.
+  // This is diagnostic metadata and does not affect candidate acceptance.
+  int first_contact_interval_index{-1};
+  // First geometrically intersecting interval whose energy exceeds the PFL
+  // budget. Unlike collision_interval_index, this never denotes a joint-limit
+  // or invalid-rollout failure.
+  int first_energy_unsafe_contact_interval_index{-1};
+
   double workspace_distance_now{0.0};
   double workspace_distance_min{0.0};
+  int current_robot_link_index{-1};
+  int worst_case_robot_link_index{-1};
+  double robot_secure_radius{0.0};
+  bool robot_reach_alpha_valid{false};
+  Vector7d robot_reach_alpha{Vector7d::Zero()};
 
   double worst_case_contact_time{0.0};
   double worst_case_workspace_distance_at_candidate{0.0};
@@ -213,16 +289,18 @@ struct SafetyMonitorConfig {
 
   double wall_time_sec{0.0};
   double energy_budget_joule{0.05};
-  // Direct one-sided energy-model error bounds:
+  // Direct one-sided energy-model error bounds. These affect energy
+  // verification only; they do not enlarge the robot reachable occupancy:
   // K_real <= K_pred + kinetic_energy_error_bound_joule and
   // V_real <= V_pred + potential_energy_error_bound_joule.
   double kinetic_energy_error_bound_joule{0.0};
   double potential_energy_error_bound_joule{0.0};
+  // When set, all robot collision geometry is produced from the predicted
+  // joint-state intervals by SaRA RobotArmReach.  Tracking/model uncertainty
+  // is already contained once in its secure_radius.
+  std::shared_ptr<const RobotReachabilityProvider>
+      robot_reachability_provider;
   double ee_collision_radius{0.04};
-  // Fixed certified bounds between a predicted Cartesian state and the state
-  // reached by the real robot after applying the verified command.
-  double tracking_position_error_bound{0.0};
-  double tracking_orientation_error_bound{0.0};
   double tracking_acc_error_bound{0.2};
   bool use_dynamic_consistent_impedance{true};
   Vector7d nullspace_reference{Vector7d::Zero()};

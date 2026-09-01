@@ -112,8 +112,8 @@ struct ShieldDecision
   ImpedanceSample command;
   MonitorResult monitor;
   VerifiedPlan evaluated_plan;
-  // Filled only when prediction logging is enabled. It is produced by the
-  // same joint rollout that made the monitor decision.
+  // Filled when prediction logging or reachable-set visualization is enabled.
+  // It is produced by the same joint rollout that made the monitor decision.
   std::vector<JointPredictionSample> joint_prediction_trace;
   double monitor_total_ms{0.0};
   double planner_ms{0.0};

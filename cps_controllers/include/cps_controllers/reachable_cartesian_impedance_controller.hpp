@@ -22,6 +22,7 @@
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp>
 #include <realtime_tools/realtime_buffer.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include "cps_human_workspace/human_workspace.hpp"
 #include "cps_human_workspace/msg/human_workspace.hpp"
@@ -280,6 +281,22 @@ class ReachableCartesianImpedanceController
       const std::shared_ptr<CartesianViaMotionGoalHandle> goal_handle,
       bool calibration_execution);
   void safetyMonitorWorkerLoop();
+
+  struct ReachableSetVisualizationSnapshot {
+    double wall_time{0.0};
+    Vector7d current_q{Vector7d::Zero()};
+    cps_human_workspace::HumanWorkspace human_workspace;
+    bool human_workspace_active{false};
+    bool human_workspace_assumed_clear{false};
+    bool current_contact_energy_unsafe{false};
+    int first_contact_interval_index{-1};
+    int first_energy_unsafe_contact_interval_index{-1};
+    std::vector<JointPredictionSample> joint_prediction_trace;
+  };
+
+  void publishRobotReachableSetVisualization(
+      const ReachableSetVisualizationSnapshot& snapshot);
+  void clearRobotReachableSetVisualization();
   void startSafetyMonitorWorker();
   void stopSafetyMonitorWorker();
   void handleCartesianViaPoints(
@@ -376,7 +393,9 @@ class ReachableCartesianImpedanceController
       const char* source);
 
   struct ControlLogRecord {
-    static constexpr std::size_t kMaxValues = 176;
+    // Keep spare capacity for diagnostics added to the fixed, allocation-free
+    // real-time log record. The current schema uses 180 columns.
+    static constexpr std::size_t kMaxValues = 192;
     std::array<double, kMaxValues> values{};
     std::size_t value_count{0};
   };
@@ -508,9 +527,22 @@ class ReachableCartesianImpedanceController
   class FrankaInterfaceJointDynamicsProvider;
   std::unique_ptr<cps_safety_monitor::JointDynamicsProvider>
       monitor_joint_dynamics_provider_;
+  std::shared_ptr<const cps_safety_monitor::RobotReachabilityProvider>
+      robot_reachability_provider_;
   std::string monitor_joint_dynamics_source_{"auto"};
   std::string active_monitor_joint_dynamics_source_;
   std::string monitor_urdf_model_path_;
+  std::string robot_reach_config_path_;
+  double robot_secure_radius_{0.02};
+  bool enable_reachable_set_visualization_{true};
+  std::string reachable_set_visualization_topic_{"~/robot_reachable_sets"};
+  std::string reachable_set_visualization_frame_id_;
+  double reachable_set_visualization_period_sec_{0.1};
+  double reachable_set_visualization_alpha_{0.3};
+  double last_reachable_set_visualization_wall_time_{-1.0};
+  std::size_t last_reachable_set_visualization_marker_count_{0};
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
+      reachable_set_visualization_pub_;
   // Constant joint-space inertia added only by the Pinocchio prediction
   // backend. This represents simulator armature/rotor inertia that is absent
   // from the URDF. The real Franka model interface ignores this value.
@@ -592,12 +624,6 @@ class ReachableCartesianImpedanceController
   bool human_workspace_configured_static_{false};
   std::atomic_bool human_workspace_live_received_{false};
   std::atomic<double> latest_human_workspace_msg_time_sec_{-1.0};
-
-  // Certified fixed pose error bounds plus the propagated acceleration-error
-  // tube used by the verifier.
-  double tracking_position_error_bound_{0.0};
-  double tracking_orientation_error_bound_{0.0};
-  double tracking_acc_error_bound_{0.2};
 
   double shield_plan_dt_{0.01};
   int shield_intended_steps_{1};

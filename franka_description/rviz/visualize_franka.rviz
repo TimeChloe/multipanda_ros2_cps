@@ -139,6 +139,18 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /human_workspace/markers
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: SaRA Robot Reachable Sets
+      Namespaces:
+        {}
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /reachable_cartesian_impedance_controller/robot_reachable_sets
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48

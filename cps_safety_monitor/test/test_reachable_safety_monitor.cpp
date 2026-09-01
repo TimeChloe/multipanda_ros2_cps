@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <memory>
 
 #include <Eigen/Geometry>
 
@@ -21,8 +23,8 @@ class IdentityJointDynamicsProvider final : public JointDynamicsProvider {
       return false;
     }
     sample->valid = true;
-    sample->control_position = Vector3d::Zero();
-    sample->control_orientation = Quaterniond::Identity();
+    sample->control_position = control_position_;
+    sample->control_orientation = control_orientation_;
     sample->control_jacobian.setZero();
     sample->control_jacobian.leftCols<6>() = Matrix6d::Identity();
     sample->control_jdot_dq.setZero();
@@ -35,7 +37,70 @@ class IdentityJointDynamicsProvider final : public JointDynamicsProvider {
 
   JointDynamicsLimits limits_;
   double inertia_scale_{1.0};
+  Vector3d control_position_{Vector3d::Zero()};
+  Quaterniond control_orientation_{Quaterniond::Identity()};
   mutable int evaluate_count_{0};
+};
+
+class RecordingRobotReachabilityProvider final
+    : public RobotReachabilityProvider {
+ public:
+  bool reachInterval(
+      const Vector7d& start_q,
+      const Vector7d& goal_q,
+      double interval_duration_sec,
+      const std::vector<double>& alpha_i,
+      std::vector<RobotReachCapsule>* capsules) const override {
+    if (capsules == nullptr || !start_q.allFinite() || !goal_q.allFinite() ||
+        !std::isfinite(interval_duration_sec) || alpha_i.size() != 7) {
+      return false;
+    }
+    const bool dynamic = std::any_of(
+        alpha_i.begin(), alpha_i.end(), [](double value) {
+          return value > 0.0;
+        });
+    if (dynamic) {
+      ++dynamic_reach_count_;
+      last_dynamic_alpha_ = alpha_i;
+    } else {
+      ++static_reach_count_;
+    }
+    capsules->assign(1, RobotReachCapsule{});
+    return true;
+  }
+
+  bool calculateTrajectoryAlpha(
+      const std::vector<JointPredictionSample>& trajectory,
+      std::vector<double>* alpha_i) const override {
+    alpha_trajectory_ = trajectory;
+    if (!alpha_success_ || alpha_i == nullptr) {
+      return false;
+    }
+    alpha_i->assign(7, dynamic_alpha_value_);
+    return true;
+  }
+
+  double minimumSignedDistance(
+      const std::vector<RobotReachCapsule>&,
+      const Vector3d&,
+      const Vector3d&,
+      double,
+      int* closest_robot_link_index) const override {
+    if (closest_robot_link_index != nullptr) {
+      *closest_robot_link_index = 0;
+    }
+    return 1.0;
+  }
+
+  double secureRadius() const override { return 0.02; }
+  const char* backendName() const override { return "recording"; }
+
+  bool alpha_success_{true};
+  double dynamic_alpha_value_{2.5};
+  mutable int static_reach_count_{0};
+  mutable int dynamic_reach_count_{0};
+  mutable std::vector<double> last_dynamic_alpha_;
+  mutable std::vector<JointPredictionSample> alpha_trajectory_;
 };
 
 TEST(ReachableSafetyMonitor, RejectsTangentialAndRotationalCartesianEnergy) {
@@ -85,6 +150,9 @@ TEST(ReachableSafetyMonitor, RejectsTangentialAndRotationalCartesianEnergy) {
                   result.worst_case_cartesian_potential_energy_ub,
               1.0e-9);
   EXPECT_TRUE(result.predicted_trigger);
+  EXPECT_EQ(result.collision_interval_index, 0);
+  EXPECT_EQ(result.first_contact_interval_index, 0);
+  EXPECT_EQ(result.first_energy_unsafe_contact_interval_index, 0);
 }
 
 TEST(ReachableSafetyMonitor,
@@ -129,6 +197,9 @@ TEST(ReachableSafetyMonitor,
   EXPECT_FALSE(result.collision_energy_unsafe);
   EXPECT_FALSE(result.predicted_trigger);
   EXPECT_FALSE(result.monitored_unsafe);
+  EXPECT_EQ(result.collision_interval_index, -1);
+  EXPECT_EQ(result.first_contact_interval_index, 0);
+  EXPECT_EQ(result.first_energy_unsafe_contact_interval_index, -1);
 }
 
 TEST(ReachableSafetyMonitor,
@@ -206,6 +277,7 @@ TEST(ReachableSafetyMonitor,
   EXPECT_GT(result.worst_case_total_control_energy_ub,
             config.energy_budget_joule);
   EXPECT_TRUE(result.predicted_trigger);
+  EXPECT_EQ(result.collision_interval_index, 0);
 }
 
 TEST(ReachableSafetyMonitor,
@@ -241,6 +313,8 @@ TEST(ReachableSafetyMonitor,
   EXPECT_FALSE(result.joint_limit_unsafe);
   EXPECT_FALSE(result.predicted_trigger);
   EXPECT_FALSE(result.monitored_unsafe);
+  EXPECT_EQ(result.first_contact_interval_index, 0);
+  EXPECT_EQ(result.first_energy_unsafe_contact_interval_index, -1);
 }
 
 TEST(ReachableSafetyMonitor, UsesExecutedCommandForCurrentPotentialEnergy) {
@@ -399,6 +473,8 @@ TEST(ReachableSafetyMonitor, JointRolloutDetectsPositionLimit) {
 
   EXPECT_TRUE(result.joint_limit_unsafe);
   EXPECT_EQ(result.joint_limit_index, 0);
+  EXPECT_GE(result.collision_interval_index, 0);
+  EXPECT_EQ(result.first_energy_unsafe_contact_interval_index, -1);
   EXPECT_GT(result.joint_position_violation, 0.0);
   EXPECT_TRUE(result.predicted_trigger);
   ASSERT_GE(prediction_trace.size(), 2U);
@@ -444,13 +520,55 @@ TEST(ReachableSafetyMonitor, ContactIntervalUsesMaximumEndpointEnergy) {
   EXPECT_NEAR(result.worst_case_joint_kinetic_energy_ub, 0.5, 1.0e-12);
   EXPECT_NEAR(result.worst_case_total_control_energy_ub, 0.5, 1.0e-12);
   EXPECT_TRUE(result.predicted_trigger);
+  EXPECT_EQ(result.collision_interval_index, 0);
+  EXPECT_EQ(result.first_energy_unsafe_contact_interval_index, 0);
 }
 
-TEST(ReachableSafetyMonitor,
-     FixedTrackingPoseBoundsInflateContactButNotPotentialEnergy) {
+TEST(ReachableSafetyMonitor, ReportsFirstUnsafePredictionTraceInterval) {
+  IdentityJointDynamicsProvider dynamics;
   SafetyMonitorConfig config;
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d::Zero();
+  workspace_parameters.motion_radius = 0.10;
+  config.human_workspace.setParameters(workspace_parameters);
+  config.ee_collision_radius = 0.04;
+  config.energy_budget_joule = 0.001;
+  config.tracking_acc_error_bound = 0.0;
+  config.joint_rollout_max_dt = 0.001;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample safe_interval_end = plan.anchor;
+  safe_interval_end.t = 0.001;
+  plan.intended.push_back(safe_interval_end);
+  ImpedanceSample unsafe_interval_end = safe_interval_end;
+  unsafe_interval_end.t = 0.002;
+  unsafe_interval_end.p.x() = 0.10;
+  unsafe_interval_end.K(0, 0) = 1.0;
+  plan.intended.push_back(unsafe_interval_end);
+
+  std::vector<JointPredictionSample> prediction_trace;
+  const MonitorResult result = verifyReachablePlanJointSpace(
+      plan,
+      Vector7d::Zero(),
+      Vector7d::Zero(),
+      dynamics,
+      config,
+      &prediction_trace);
+
+  ASSERT_EQ(prediction_trace.size(), 3U);
+  EXPECT_TRUE(result.predicted_trigger);
+  EXPECT_EQ(result.collision_interval_index, 1);
+  EXPECT_EQ(result.first_contact_interval_index, 0);
+  EXPECT_EQ(result.first_energy_unsafe_contact_interval_index, 1);
+}
+
+TEST(ReachableSafetyMonitor,
+     DirectPotentialEnergyErrorBoundAppliesToFutureEndpoint) {
+  SafetyMonitorConfig config;
+  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
+  workspace_parameters.sphere_center = Vector3d(0.151, 0.0, 0.0);
   workspace_parameters.motion_radius = 0.10;
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
@@ -470,44 +588,8 @@ TEST(ReachableSafetyMonitor,
 
   Matrix67d jacobian = Matrix67d::Zero();
   jacobian.leftCols<6>() = Matrix6d::Identity();
-  const MonitorResult nominal = verifyReachablePlan(
-      plan,
-      plan.anchor.p,
-      plan.anchor.q,
-      Vector6d::Zero(),
-      Matrix7d::Identity(),
-      jacobian,
-      config);
-
-  EXPECT_GT(nominal.workspace_distance_now, 0.0);
-  EXPECT_FALSE(nominal.monitored_contact_possible);
-
-  config.tracking_position_error_bound = 0.012;
-  config.tracking_orientation_error_bound = 0.10;
-  const MonitorResult bounded = verifyReachablePlan(
-      plan,
-      plan.anchor.p,
-      plan.anchor.q,
-      Vector6d::Zero(),
-      Matrix7d::Identity(),
-      jacobian,
-      config);
-
-  // The current measured geometry remains nominal; only future reachable
-  // states are enlarged by the certified tracking bounds.
-  EXPECT_NEAR(bounded.workspace_distance_now,
-              nominal.workspace_distance_now,
-              1.0e-12);
-  EXPECT_TRUE(bounded.monitored_contact_possible);
-  EXPECT_NEAR(bounded.worst_case_pos_error_radius, 0.012, 1.0e-12);
-  EXPECT_NEAR(bounded.worst_case_orientation_error_radius, 0.10, 1.0e-12);
-  EXPECT_NEAR(bounded.worst_case_cartesian_potential_energy_ub,
-              0.0,
-              1.0e-12);
-  EXPECT_FALSE(bounded.predicted_trigger);
-
   config.potential_energy_error_bound_joule = 0.06;
-  const MonitorResult energy_bounded = verifyReachablePlan(
+  const MonitorResult result = verifyReachablePlan(
       plan,
       plan.anchor.p,
       plan.anchor.q,
@@ -515,10 +597,12 @@ TEST(ReachableSafetyMonitor,
       Matrix7d::Identity(),
       jacobian,
       config);
-  EXPECT_NEAR(energy_bounded.worst_case_cartesian_potential_energy_ub,
+
+  EXPECT_TRUE(result.monitored_contact_possible);
+  EXPECT_NEAR(result.worst_case_cartesian_potential_energy_ub,
               0.06,
               1.0e-12);
-  EXPECT_TRUE(energy_bounded.predicted_trigger);
+  EXPECT_TRUE(result.predicted_trigger);
 }
 
 TEST(ReachableSafetyMonitor,
@@ -560,6 +644,42 @@ TEST(ReachableSafetyMonitor,
   EXPECT_NEAR(prediction_trace.back().cartesian_potential_energy,
               0.0,
               1.0e-12);
+}
+
+TEST(ReachableSafetyMonitor,
+     JointSpaceDirectEnergyBoundsApplyWithoutPoseParameters) {
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
+  workspace_parameters.sphere_center = Vector3d::Zero();
+  workspace_parameters.motion_radius = 0.10;
+  config.human_workspace.setParameters(workspace_parameters);
+  config.ee_collision_radius = 0.04;
+  config.energy_budget_joule = 1.0;
+  config.tracking_acc_error_bound = 0.0;
+  config.kinetic_energy_error_bound_joule = 0.02;
+  config.potential_energy_error_bound_joule = 0.03;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.t = 0.001;
+  plan.intended.push_back(sample);
+
+  const MonitorResult result = verifyReachablePlanJointSpace(
+      plan,
+      Vector7d::Zero(),
+      Vector7d::Zero(),
+      dynamics,
+      config);
+
+  EXPECT_TRUE(result.monitored_contact_possible);
+  EXPECT_NEAR(result.worst_case_joint_kinetic_energy_ub, 0.02, 1.0e-12);
+  EXPECT_NEAR(
+      result.worst_case_cartesian_potential_energy_ub, 0.03, 1.0e-12);
+  EXPECT_NEAR(result.worst_case_total_control_energy_ub, 0.05, 1.0e-12);
+  EXPECT_FALSE(result.predicted_trigger);
 }
 
 TEST(ReachableSafetyMonitor,
@@ -609,6 +729,144 @@ TEST(ReachableSafetyMonitor,
   ASSERT_TRUE(result.inertia_model_energy_ratio_valid);
   EXPECT_NEAR(result.inertia_model_min_energy_ratio, 2.0, 1.0e-12);
   EXPECT_NEAR(result.inertia_model_max_energy_ratio, 2.0, 1.0e-12);
+}
+
+TEST(ReachableSafetyMonitor,
+     UsesSaraRobotArmReachForPredictedJointIntervals) {
+  const auto robot_reachability = makeSaraRobotReachabilityProvider(
+      SARA_PANDA_CONFIG_PATH,
+      0.02);
+  ASSERT_NE(robot_reachability, nullptr);
+  EXPECT_STREQ(robot_reachability->backendName(), "sara_robot_arm_reach");
+
+  std::vector<RobotReachCapsule> capsules;
+  const std::vector<double> zero_alpha(7, 0.0);
+  ASSERT_TRUE(robot_reachability->reachInterval(
+      Vector7d::Zero(),
+      Vector7d::Zero(),
+      0.001,
+      zero_alpha,
+      &capsules));
+  ASSERT_EQ(capsules.size(), 7U);
+
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  config.robot_reachability_provider = robot_reachability;
+  config.tracking_acc_error_bound = 100.0;
+  config.energy_budget_joule = 1.0;
+  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
+  workspace_parameters.sphere_center = capsules.front().p1;
+  workspace_parameters.motion_radius = 0.0;
+  config.human_workspace.setParameters(workspace_parameters);
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  ImpedanceSample sample;
+  sample.t = 0.001;
+  sample.q = Quaterniond::Identity();
+  plan.intended.push_back(sample);
+
+  const MonitorResult result = verifyReachablePlanJointSpace(
+      plan,
+      Vector7d::Zero(),
+      Vector7d::Zero(),
+      dynamics,
+      config);
+
+  EXPECT_TRUE(result.monitored_contact_possible);
+  EXPECT_LE(result.workspace_distance_now, 0.0);
+  EXPECT_NEAR(result.robot_secure_radius, 0.02, 1.0e-12);
+  EXPECT_TRUE(result.robot_reach_alpha_valid);
+  EXPECT_TRUE(result.robot_reach_alpha.isZero(1.0e-12));
+  EXPECT_GE(result.current_robot_link_index, 0);
+  EXPECT_EQ(result.first_contact_interval_index, 0);
+  // The legacy Cartesian tracking tube is bypassed when SaRA is present;
+  // SaRA's secure radius is the sole geometric uncertainty inflation.
+  EXPECT_NEAR(result.worst_case_pos_error_radius, 0.0, 1.0e-12);
+  EXPECT_NEAR(result.worst_case_orientation_error_radius, 0.0, 1.0e-12);
+  EXPECT_NEAR(result.worst_case_vel_error_radius, 0.0, 1.0e-12);
+}
+
+TEST(ReachableSafetyMonitor,
+     ComputesDynamicAlphaFromCompleteIntendedAndFailsafeRollout) {
+  IdentityJointDynamicsProvider dynamics;
+  auto robot_reachability =
+      std::make_shared<RecordingRobotReachabilityProvider>();
+  SafetyMonitorConfig config;
+  config.robot_reachability_provider = robot_reachability;
+  config.joint_rollout_max_dt = 0.001;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample intended = plan.anchor;
+  intended.t = 0.001;
+  plan.intended.push_back(intended);
+  ImpedanceSample failsafe = intended;
+  failsafe.t = 0.002;
+  failsafe.failsafe = true;
+  plan.failsafe.push_back(failsafe);
+
+  std::vector<JointPredictionSample> prediction_trace;
+  const MonitorResult result = verifyReachablePlanJointSpace(
+      plan,
+      Vector7d::Zero(),
+      Vector7d::Zero(),
+      dynamics,
+      config,
+      &prediction_trace);
+
+  ASSERT_EQ(prediction_trace.size(), 3U);
+  ASSERT_EQ(robot_reachability->alpha_trajectory_.size(), 3U);
+  EXPECT_EQ(robot_reachability->dynamic_reach_count_, 2);
+  ASSERT_EQ(robot_reachability->last_dynamic_alpha_.size(), 7U);
+  EXPECT_TRUE(result.robot_reach_alpha_valid);
+  EXPECT_TRUE(result.robot_reach_alpha.isConstant(2.5));
+  EXPECT_FALSE(result.monitored_unsafe);
+}
+
+TEST(ReachableSafetyMonitor, DynamicAlphaFailureFailsClosed) {
+  IdentityJointDynamicsProvider dynamics;
+  auto robot_reachability =
+      std::make_shared<RecordingRobotReachabilityProvider>();
+  robot_reachability->alpha_success_ = false;
+  SafetyMonitorConfig config;
+  config.robot_reachability_provider = robot_reachability;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.t = 0.001;
+  plan.intended.push_back(sample);
+
+  const MonitorResult result = verifyReachablePlanJointSpace(
+      plan,
+      Vector7d::Zero(),
+      Vector7d::Zero(),
+      dynamics,
+      config);
+
+  EXPECT_FALSE(result.robot_reach_alpha_valid);
+  EXPECT_TRUE(result.joint_limit_unsafe);
+  EXPECT_TRUE(result.predicted_trigger);
+  EXPECT_TRUE(result.monitored_unsafe);
+  EXPECT_EQ(result.collision_interval_index, 0);
+  EXPECT_EQ(robot_reachability->dynamic_reach_count_, 0);
+}
+
+TEST(ReachableSafetyMonitor, SaraDynamicAlphaRejectsInvalidSampleTimes) {
+  const auto robot_reachability = makeSaraRobotReachabilityProvider(
+      SARA_PANDA_CONFIG_PATH,
+      0.02);
+  std::vector<JointPredictionSample> trajectory(2);
+  trajectory[0].t = 0.001;
+  trajectory[1].t = 0.001;
+  std::vector<double> alpha_i(7, 123.0);
+
+  EXPECT_FALSE(robot_reachability->calculateTrajectoryAlpha(
+      trajectory, &alpha_i));
+  EXPECT_TRUE(alpha_i.empty());
 }
 
 TEST(ReachableSafetyMonitor,

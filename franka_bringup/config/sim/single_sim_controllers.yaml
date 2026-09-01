@@ -249,9 +249,10 @@ reachable_cartesian_impedance_controller:
     enable_safety_monitor: true
 
     energy_budget_joule: 0.12
-    # Simulator-calibrated one-sided prediction error bounds. These values are
-    # based on exact control-sequence matches across five MuJoCo calibration
-    # runs and must not be reused for the real robot without recalibration.
+    # Simulator-calibrated one-sided prediction energy residuals. beta_K
+    # covers velocity and inertia-model mismatch; beta_V directly covers the
+    # measured-minus-predicted impedance potential-energy residual. They do
+    # not inflate collision geometry and must be recalibrated on real Panda.
     kinetic_energy_error_bound_joule: 0.0
     potential_energy_error_bound_joule: 0.027
     # Normal safety-monitor mode applies runtime energy scaling when contact
@@ -271,7 +272,7 @@ reachable_cartesian_impedance_controller:
     # tcp_offset keeps Cartesian control at the metal-ball TCP
     # (panda_link8 + [0, 0, 0.06]); ee_collision_center_offset moves the
     # safety collision model back to the metal-ball center.
-    # ee_collision_radius expands theterminal_energy_ub monitored sphere around that center.
+    # ee_collision_radius expands the monitored sphere around that center.
     ee_collision_radius: 0.03
     tcp_offset: [0.0, 0.0, 0.06]
     ee_collision_center_offset: [0.0, 0.0, -0.03]
@@ -281,6 +282,20 @@ reachable_cartesian_impedance_controller:
     monitor_joint_dynamics_source: pinocchio
     monitor_urdf_model_path: /home/developer/multipanda_ws/src/model_urdf/panda_ng.urdf
     prediction_joint_armature: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    # Robot occupancy uses SaRA-Shield's RobotArmReach and ReachLib directly.
+    # pred_q supplies each interval's start/goal configuration. secure_radius
+    # is added once by SaRA to cover tracking and geometry-model uncertainty.
+    # alpha_i is derived dynamically from capsule endpoint velocities over the
+    # complete intended + failsafe prediction, matching SaRA Shield PFL mode.
+    # Leave sara_robot_config_path unset to use the installed SaRA Panda YAML.
+    sara_secure_radius: 0.00
+    # Match SaRA-Shield visualization: show only the final interval when the
+    # plan is safe, or the first unsafe interval when verification rejects it.
+    enable_reachable_set_visualization: true
+    reachable_set_visualization_topic: "~/robot_reachable_sets"
+    reachable_set_visualization_frame_id: panda_link0
+    reachable_set_visualization_period_sec: 0.1
+    reachable_set_visualization_alpha: 0.3
     async_safety_monitor: true
     # Pin the 200 Hz worker away from the main ROS/MuJoCo scheduling traffic on
     # this 24-core workstation. Affinity failure is non-fatal on other hosts.
@@ -299,10 +314,4 @@ reachable_cartesian_impedance_controller:
     mujoco_contact_sensor_topic: /panda_metal_ball_touch
     mujoco_contact_threshold: 1.0e-6
 
-    # Certified fixed tracking-error bounds for all future rollout states.
-    tracking_position_error_bound: 0.0       # m
-    tracking_orientation_error_bound: 0.0    # rad
-    # Residual acceleration disturbance propagated over the rollout horizon.
-    tracking_acc_error_bound: 0.2
-
-    use_dynamic_consistent_impedance: true
+    use_dynamic_consistent_impedance: false

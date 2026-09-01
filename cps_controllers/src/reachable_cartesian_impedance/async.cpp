@@ -781,6 +781,36 @@ void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop()
         0, worker_start_ns - input.publish_steady_time_ns));
     output.decision =
       computeShieldDecisionForAsyncInput(input, last_verified_plan);
+
+    const bool visualization_due =
+      enable_reachable_set_visualization_ &&
+      reachable_set_visualization_pub_ &&
+      (last_reachable_set_visualization_wall_time_ < 0.0 ||
+      input.wall_time < last_reachable_set_visualization_wall_time_ ||
+      input.wall_time - last_reachable_set_visualization_wall_time_ >=
+      reachable_set_visualization_period_sec_);
+    ReachableSetVisualizationSnapshot visualization_snapshot;
+    if (visualization_due) {
+      visualization_snapshot.wall_time = input.wall_time;
+      visualization_snapshot.current_q = input.q;
+      visualization_snapshot.human_workspace = input.human_workspace;
+      visualization_snapshot.human_workspace_active =
+        input.human_workspace_active;
+      visualization_snapshot.human_workspace_assumed_clear =
+        input.human_workspace_assumed_clear;
+      visualization_snapshot.current_contact_energy_unsafe =
+        output.decision.monitor.contact_relevant_for_energy &&
+        output.decision.monitor.current_joint_energy_valid &&
+        output.decision.monitor.current_total_control_energy >
+        std::max(0.0, energy_budget_joule_);
+      visualization_snapshot.first_contact_interval_index =
+        output.decision.monitor.first_contact_interval_index;
+      visualization_snapshot.first_energy_unsafe_contact_interval_index =
+        output.decision.monitor.first_energy_unsafe_contact_interval_index;
+      visualization_snapshot.joint_prediction_trace =
+        output.decision.joint_prediction_trace;
+    }
+
     output.input = std::move(input);
     output.worker_finish_steady_time_ns = steadyNowNanoseconds();
     output.worker_compute_ms = nanosecondsToMilliseconds(
@@ -799,6 +829,11 @@ void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop()
     if (discarded_outputs > 0) {
       async_monitor_output_overwrite_count_.fetch_add(
         discarded_outputs, std::memory_order_relaxed);
+    }
+    // The safety result is handed off before RViz marker construction. This
+    // keeps visualization latency out of the controller's acceptance path.
+    if (visualization_due) {
+      publishRobotReachableSetVisualization(visualization_snapshot);
     }
   }
 }
