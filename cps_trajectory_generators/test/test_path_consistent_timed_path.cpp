@@ -12,11 +12,18 @@ namespace {
 using cps_trajectory_generators::CartesianTrajectorySample;
 using cps_trajectory_generators::LocalCartesianReplanConfig;
 using cps_trajectory_generators::PathConsistentTimedPathConfig;
+using cps_trajectory_generators::TrajectoryGeneratorSettings;
 using cps_trajectory_generators::makeCartesianBrakeTrajectory;
 using cps_trajectory_generators::makePathConsistentTimedPathBrake;
 using cps_trajectory_generators::makePathConsistentTimedPathIntendedPrefix;
 using cps_trajectory_generators::makeRetimedPathState;
 using cps_trajectory_generators::makeSmoothViaPointCartesianTrajectory;
+
+TEST(TrajectoryGeneratorSettings, UsesSaraPandaFiveSampleReachabilityWindow) {
+  const TrajectoryGeneratorSettings settings;
+  EXPECT_DOUBLE_EQ(settings.local_replan_dt, 0.001);
+  EXPECT_DOUBLE_EQ(settings.shield_plan_dt, 5.0 * settings.local_replan_dt);
+}
 
 Eigen::Quaterniond quaternionFromRotationVector(
     const Eigen::Vector3d& rotation_vector) {

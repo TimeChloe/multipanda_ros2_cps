@@ -2,7 +2,6 @@
 #include <chrono>
 #include <cmath>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -70,6 +69,12 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     marker_lifetime_sec_ = std::max(
         0.0,
         declare_parameter<double>("marker_lifetime_sec", 0.1));
+    visualize_hand_reachable_set_ =
+        declare_parameter<bool>("visualize_hand_reachable_set", true);
+    reachability_set_interval_sec_ = std::max(
+        0.0,
+        declare_parameter<double>(
+            "reachability_set_interval_sec", 0.005));
     visualize_ee_collision_area_ =
         declare_parameter<bool>("visualize_ee_collision_area", true);
     ee_frame_id_ = declare_parameter<std::string>("ee_frame_id", "panda_metal_ball_link");
@@ -118,8 +123,10 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
 
     RCLCPP_INFO(
         get_logger(),
-        "Publishing human workspace markers on %s and state on %s in frame %s.",
+        "Publishing SaRA BodyPartCombined reachable-set markers on %s "
+        "(one %.3f s SaRA interval); state topic %s; frame %s.",
         topic_name_.c_str(),
+        reachability_set_interval_sec_,
         state_topic_name_.c_str(),
         frame_id_.c_str());
   }
@@ -144,43 +151,70 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
     const double elapsed_time_sec =
         std::max(0.0, (now() - start_time_).seconds());
     const Vector3d center = workspace_.centerAtTime(elapsed_time_sec);
+    const Vector3d velocity =
+        workspace_.centerVelocityAtTime(elapsed_time_sec);
 
-    {
+    // Explicitly remove markers published by older visualizer versions. This
+    // also clears transient-local or infinite-lifetime markers already cached
+    // by RViz after an upgrade.
+    auto deleteMarker = [this, &array](int id, const std::string& ns) {
       Marker marker;
-      setupMarker(marker, 1, "human_workspace_motion_sphere", Marker::SPHERE);
-      marker.pose.position = toPoint(center);
-      marker.pose.orientation.w = 1.0;
-      marker.scale.x = 2.0 * workspace_.motionRadius();
-      marker.scale.y = 2.0 * workspace_.motionRadius();
-      marker.scale.z = 2.0 * workspace_.motionRadius();
-      marker.color = makeColor(1.0f, 0.8f, 0.1f, 0.22f);
-      array.markers.push_back(marker);
-    }
-
-    {
-      Marker marker;
-      setupMarker(marker, 2, "human_workspace_status", Marker::TEXT_VIEW_FACING);
+      setupMarker(marker, id, ns, Marker::SPHERE);
       marker.action = Marker::DELETE;
+      array.markers.push_back(marker);
+    };
+    deleteMarker(1, "human_hand_physical");
+    deleteMarker(1, "human_workspace_motion_sphere");
+    deleteMarker(2, "human_workspace_status");
+
+    HumanWorkspace observed_hand;
+    auto observed_parameters = workspace_.parameters();
+    observed_parameters.sphere_center = center;
+    observed_parameters.center_velocity = velocity;
+    observed_parameters.center_sinusoid_amplitude.setZero();
+    observed_parameters.center_sinusoid_frequency_hz = 0.0;
+    observed_parameters.center_sinusoid_phase_rad = 0.0;
+    observed_parameters.center_motion_time_offset_sec = elapsed_time_sec;
+    observed_hand.setParameters(observed_parameters);
+
+    if (visualize_hand_reachable_set_) {
+      const auto final_reach = observed_hand.handReachableSetAtTime(
+          elapsed_time_sec + reachability_set_interval_sec_);
+      Marker marker;
+      setupMarker(
+          marker,
+          100,
+          "human_hand_sara_interval_preview",
+          Marker::SPHERE);
+      marker.pose.position = toPoint(final_reach.center);
+      marker.pose.orientation.w = 1.0;
+      marker.scale.x = 2.0 * final_reach.radius;
+      marker.scale.y = 2.0 * final_reach.radius;
+      marker.scale.z = 2.0 * final_reach.radius;
+      marker.color = makeColor(0.05f, 0.75f, 1.0f, 0.18f);
       array.markers.push_back(marker);
     }
 
     publishEndEffectorMarkers(array);
 
     marker_pub_->publish(array);
-    publishWorkspaceState(center, elapsed_time_sec);
+    publishWorkspaceState(center, velocity);
   }
 
-  void publishWorkspaceState(const Vector3d& center, double elapsed_time_sec) {
+  void publishWorkspaceState(
+      const Vector3d& center,
+      const Vector3d& velocity) {
     HumanWorkspaceMsg msg;
     msg.header.stamp = now();
     msg.header.frame_id = frame_id_;
     msg.sphere_center = toPoint(center);
-    msg.center_velocity = toVector3Msg(workspace_.centerVelocityAtTime(elapsed_time_sec));
-    msg.center_sinusoid_amplitude = toVector3Msg(Vector3d::Zero());
-    msg.center_sinusoid_frequency_hz = 0.0;
-    msg.center_sinusoid_phase_rad = 0.0;
-    msg.center_motion_time_offset_sec = elapsed_time_sec;
+    msg.center_velocity = toVector3Msg(velocity);
     msg.motion_radius = workspace_.motionRadius();
+    msg.hand_max_velocity = workspace_.handMaxVelocity();
+    msg.hand_max_acceleration = workspace_.handMaxAcceleration();
+    msg.measurement_error_position = workspace_.measurementErrorPosition();
+    msg.measurement_error_velocity = workspace_.measurementErrorVelocity();
+    msg.measurement_delay = workspace_.measurementDelay();
     state_pub_->publish(msg);
   }
 
@@ -269,8 +303,10 @@ class HumanWorkspaceVisualizer : public rclcpp::Node {
   std::string topic_name_;
   std::string state_topic_name_;
   bool visualize_ee_collision_area_{true};
+  bool visualize_hand_reachable_set_{true};
   double publish_rate_hz_{10.0};
   double marker_lifetime_sec_{0.1};
+  double reachability_set_interval_sec_{0.005};
   double ee_collision_radius_{0.04};
   Vector3d ee_collision_center_offset_{Vector3d::Zero()};
   double tracking_pos_error_bound_{0.005};

@@ -17,7 +17,14 @@ reachability logic is kept apart from human, robot, and scenario config files.
 
 ```yaml
 sphere_center: [0.3, 0.0, 0.25]
-motion_radius: 0.12
+motion_radius: 0.103
+
+hand_reachability:
+  max_velocity: 2.0
+  max_acceleration: 50.0
+  measurement_error_position: 0.0
+  measurement_error_velocity: 0.1
+  delay: 0.0
 
 center_motion:
   velocity: [0.0, 0.0, 0.0]
@@ -27,18 +34,33 @@ center_motion:
   time_offset_sec: 0.0
 ```
 
-`motion_radius` is the complete human motion/occupancy area radius around
-`sphere_center`. `center_motion` is optional. Without it, the human workspace
-sphere is static.
+The package has one human reachability model: a single-hand specialization of
+SaRA ReachLib's `BodyPartCombined`. `motion_radius` is the physical hand
+enclosure radius; bounded future motion and measurement uncertainty are added
+for every monitor interval. The dynamic example above follows the TUM
+SaRA-Shield hand values: 0.206 m thickness, 2 m/s maximum speed, 50 m/s^2
+maximum acceleration, and 0.1 m/s velocity uncertainty. There is no model
+selector.
+
+The default `human_workspace.yaml` is instead an explicit stationary-hand
+assumption. It uses zero maximum velocity and zero velocity measurement error,
+so the same BodyPartCombined generator returns the fixed physical hand sphere
+for every prediction horizon. Use that assumption only when the hand is known
+not to move.
+
+`center_motion` is only a repeatable synthetic measurement source. The live
+message carries the current hand position and velocity; the controller does
+not assume that the configured future sinusoid is known.
 
 ## Live Workspace State Topic
 
 Runtime providers publish `cps_human_workspace/msg/HumanWorkspace` on
-`human_workspace/state`. For camera or Vicon input, publish the current sphere
-center in the robot base frame, the current center velocity, the workspace
-radius. The controller treats each message as a live snapshot and extrapolates
-it for short monitor horizons until
-`human_workspace_timeout_sec` expires.
+`human_workspace/state`. For camera or Vicon input, publish the measured hand
+position and velocity in the robot base frame, its physical enclosure radius,
+and the reachability limits/error bounds. The controller treats each message
+as a timestamped observation and generates a SaRA BodyPartCombined reachable ball for
+each monitor interval until `human_workspace_timeout_sec` expires. A zero or
+invalid timestamp falls back to receipt time.
 
 ## Start The Visualizer
 
@@ -52,6 +74,25 @@ ros2 launch cps_human_workspace human_workspace_visualizer.launch.py \
 Markers expire automatically after `marker_lifetime_sec` seconds once the
 visualizer stops publishing. Set `marker_lifetime_sec:=0.0` if you want RViz to
 keep the last marker forever.
+
+The `Human Hand Reachable Set` RViz display shows only the cyan preview of one
+SaRA BodyPartCombined interval. It intentionally contains no separate physical-hand
+sphere or text label. SaRA's Panda trajectory configuration uses
+`reachability_set_interval_size: 5`; with this project's `1 ms` sample time,
+the interval is therefore `5 ms`:
+
+```bash
+ros2 launch cps_human_workspace human_workspace_visualizer.launch.py \
+  human_workspace_config:=human_workspace_dynamic_crossing.yaml \
+  reachability_set_interval_sec:=0.005
+```
+
+The preview is not the complete braking horizon. The controller evaluates
+successive 5 ms intervals over its complete intended + failsafe trajectory.
+The `SaRA Robot Reachable Sets` RViz display publishes only the selected robot
+interval. Human markers remain owned by the `Human Hand Reachable Set` display;
+the safety monitor is the layer that intersects the independently generated
+robot and human occupancies.
 
 Use a config from another ROS package:
 

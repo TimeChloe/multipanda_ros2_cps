@@ -19,6 +19,10 @@ def _launch_setup(context, *args, **kwargs):
     state_topic = LaunchConfiguration('state_topic')
     publish_rate = LaunchConfiguration('publish_rate')
     marker_lifetime_sec = LaunchConfiguration('marker_lifetime_sec')
+    visualize_hand_reachable_set = LaunchConfiguration(
+        'visualize_hand_reachable_set')
+    reachability_set_interval_sec = LaunchConfiguration(
+        'reachability_set_interval_sec')
     use_sim_time = LaunchConfiguration('use_sim_time')
     visualize_ee_collision_area = LaunchConfiguration('visualize_ee_collision_area')
     ee_frame_id = LaunchConfiguration('ee_frame_id')
@@ -44,6 +48,12 @@ def _launch_setup(context, *args, **kwargs):
             'publish_rate': ParameterValue(publish_rate, value_type=float),
             'marker_lifetime_sec': ParameterValue(
                 marker_lifetime_sec,
+                value_type=float),
+            'visualize_hand_reachable_set': ParameterValue(
+                visualize_hand_reachable_set,
+                value_type=bool),
+            'reachability_set_interval_sec': ParameterValue(
+                reachability_set_interval_sec,
                 value_type=float),
             'visualize_ee_collision_area': ParameterValue(
                 visualize_ee_collision_area,
@@ -103,6 +113,14 @@ def generate_launch_description():
             'marker_lifetime_sec',
             default_value='0.1',
             description='Marker lifetime. Use 0.0 to keep markers forever.'),
+        DeclareLaunchArgument(
+            'visualize_hand_reachable_set',
+            default_value='true',
+            description='Show SaRA BodyPartCombined hand reachable-set spheres.'),
+        DeclareLaunchArgument(
+            'reachability_set_interval_sec',
+            default_value='0.005',
+            description='SaRA hand reachable-set interval width in seconds.'),
         DeclareLaunchArgument(
             'use_sim_time',
             default_value='true',

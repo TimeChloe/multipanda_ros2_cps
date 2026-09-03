@@ -282,7 +282,6 @@ void ReachableCartesianImpedanceController::resetViaPointExecutionState(
   double wall_time)
 {
   paused_nominal_time_sec_ = wall_time;
-  failsafe_start_time_sec_ = -1.0;
   failsafe_enter_wall_time_sec_ = -1.0;
   commanded_path_time_ = 0.0;
   // The nominal Cartesian path is already jerk-limited and starts with zero

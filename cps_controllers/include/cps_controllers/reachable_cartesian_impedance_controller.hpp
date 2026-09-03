@@ -129,6 +129,10 @@ class ReachableCartesianImpedanceController
                                       bool human_workspace_assumed_clear,
                                       const ImpedanceSample& current_command_reference,
                                       bool current_command_reference_valid,
+                                      double current_nullspace_stiffness,
+                                      const cps_safety_monitor::
+                                          OverbudgetJointStabilizationState&
+                                              overbudget_joint_state,
                                       std::vector<JointPredictionSample>*
                                           joint_prediction_trace = nullptr) const;
 
@@ -194,6 +198,9 @@ class ReachableCartesianImpedanceController
 
     ImpedanceSample last_commanded_sample;
     bool last_commanded_sample_valid{false};
+    double last_nullspace_stiffness{0.0};
+    cps_safety_monitor::OverbudgetJointStabilizationState
+        overbudget_joint_state;
     double commanded_path_time{0.0};
     double commanded_path_rate{0.0};
     double target_path_rate{1.0};
@@ -394,8 +401,8 @@ class ReachableCartesianImpedanceController
 
   struct ControlLogRecord {
     // Keep spare capacity for diagnostics added to the fixed, allocation-free
-    // real-time log record. The current schema uses 180 columns.
-    static constexpr std::size_t kMaxValues = 192;
+    // real-time log record. The current schema uses 203 columns.
+    static constexpr std::size_t kMaxValues = 224;
     std::array<double, kMaxValues> values{};
     std::size_t value_count{0};
   };
@@ -411,7 +418,8 @@ class ReachableCartesianImpedanceController
                                   const Vector3d& current_position,
                                   const Quaterniond& current_orientation,
                                   const ImpedanceSample& cmd,
-                                  bool cartesian_energy_budget_active,
+                                  double nullspace_stiffness,
+                                  const Vector7d& overbudget_joint_torque,
                                   double dt);
 
   ImpedanceSample getNextFailsafeCommandFromCache(bool advance_index);
@@ -438,14 +446,17 @@ class ReachableCartesianImpedanceController
 
   bool calibrationExecutionComplete() const;
 
-  struct CartesianEnergyBudgetInfo {
+  struct EnergyBudgetInfo {
     bool active{false};
     bool lambda_valid{false};
     double scale{1.0};
     double kinetic_energy{0.0};
     double potential_energy_before_scaling{0.0};
+    double nullspace_potential_energy_before_scaling{0.0};
     double total_energy_before_scaling{0.0};
     double potential_energy{0.0};
+    double nullspace_potential_energy{0.0};
+    double nullspace_stiffness{0.0};
     double total_energy{0.0};
   };
 
@@ -453,24 +464,21 @@ class ReachableCartesianImpedanceController
   bool shouldRejectCandidateWithMonitor(const MonitorResult& monitor,
                                         bool human_workspace_available) const;
 
-  bool shouldApplyCartesianEnergyBudget(
+  bool shouldApplyEnergyBudget(
       const MonitorResult& monitor) const;
 
   bool computeTaskInertia(const Matrix7d& inertia,
                           const Matrix67d& J_geo,
                           Matrix6d* lambda) const;
 
-  double cartesianEnergyScaleFloor(const Matrix6d& K_reference) const;
-
-  ImpedanceSample applyCartesianEnergyBudget(
+  ImpedanceSample applyEnergyBudget(
       const ImpedanceSample& command,
       double kinetic_energy,
       double potential_energy,
+      double nullspace_potential_energy,
       bool energy_valid,
       bool active,
-      const Matrix6d& cartesian_task_inertia_sqrt,
-      bool cartesian_task_inertia_valid,
-      CartesianEnergyBudgetInfo* info) const;
+      EnergyBudgetInfo* info) const;
 
   bool enable_error_logging_{false};
   std::string error_log_root_dir_{"/home/developer/multipanda_ws/src/data_log"};
@@ -560,7 +568,6 @@ class ReachableCartesianImpedanceController
   ExecutionStage execution_stage_{ExecutionStage::kCurrentVerified};
   FallbackReason fallback_reason_{FallbackReason::kNone};
   PlanFailureReason plan_failure_reason_{PlanFailureReason::kNone};
-  double failsafe_start_time_sec_{-1.0};
   double failsafe_enter_wall_time_sec_{-1.0};
   double paused_nominal_time_sec_{0.0};
 
@@ -571,14 +578,22 @@ class ReachableCartesianImpedanceController
   Matrix6d K_runtime_{Matrix6d::Zero()};
   Matrix6d D_runtime_{Matrix6d::Zero()};
 
+  bool enable_nullspace_{false};
+  // Effective nominal stiffness. It is forced to zero when
+  // enable_nullspace is false and otherwise remains active in every stage.
   double n_stiffness_{0.0};
-  bool disable_nullspace_in_failsafe_{true};
+  bool enable_overbudget_joint_stabilization_{true};
+  double overbudget_joint_stiffness_{1.0};
+  double overbudget_joint_scale_omega_{40.0};
+  cps_safety_monitor::OverbudgetJointStabilizationState
+      overbudget_joint_state_;
 
   bool enable_safety_monitor_{true};
 
   double energy_budget_joule_{0.05};
   double kinetic_energy_error_bound_joule_{0.0};
   double potential_energy_error_bound_joule_{0.0};
+  double nullspace_potential_energy_error_bound_joule_{0.0};
   bool enable_runtime_energy_scaling_{true};
   // Passive calibration logging only. This never changes scheduling, plan
   // acceptance, command selection, gains, or the normal safety state machine.
@@ -614,6 +629,7 @@ class ReachableCartesianImpedanceController
   std::size_t async_verified_horizon_steps_{20};
 
   cps_human_workspace::HumanWorkspace human_workspace_;
+  cps_human_workspace::HumanWorkspace configured_human_workspace_source_;
   realtime_tools::RealtimeBuffer<cps_human_workspace::HumanWorkspace::Parameters>
       human_workspace_param_buffer_;
   rclcpp::Subscription<cps_human_workspace::msg::HumanWorkspace>::SharedPtr
@@ -625,7 +641,7 @@ class ReachableCartesianImpedanceController
   std::atomic_bool human_workspace_live_received_{false};
   std::atomic<double> latest_human_workspace_msg_time_sec_{-1.0};
 
-  double shield_plan_dt_{0.01};
+  double shield_plan_dt_{0.005};
   int shield_intended_steps_{1};
   double monitor_frequency_hz_{200.0};
   double monitor_update_period_sec_{0.01};
@@ -659,11 +675,7 @@ class ReachableCartesianImpedanceController
 
   bool use_dynamic_consistent_impedance_{true};
   bool torque_rate_limited_last_{false};
-  double torque_rate_max_desired_delta_nm_last_{0.0};
-  double torque_rate_limit_delta_nm_last_{0.0};
-  double torque_rate_max_excess_nm_last_{0.0};
   double torque_rate_max_ratio_last_{0.0};
-  double torque_rate_max_cmd_delta_nm_last_{0.0};
   Matrix67d J_geo_prev_{Matrix67d::Zero()};
   Vector6d Jdot_dq_filtered_{Vector6d::Zero()};
   bool J_geo_prev_valid_{false};
@@ -748,21 +760,29 @@ class ReachableCartesianImpedanceController
   double prof_io_sum_ms_{0.0};
   double prof_io_max_ms_{0.0};
 
-  double cartesian_energy_min_pos_stiffness_{0.0};
   double cartesian_energy_lambda_update_period_sec_{0.001};
-  double cartesian_energy_damping_ratio_{0.8};
   Matrix6d cartesian_energy_task_inertia_cache_{Matrix6d::Zero()};
-  Matrix6d cartesian_energy_task_inertia_sqrt_cache_{Matrix6d::Zero()};
   bool cartesian_energy_task_inertia_cache_valid_{false};
   double cartesian_energy_task_inertia_cache_wall_time_{-1.0};
-  bool last_cartesian_energy_budget_active_{false};
-  bool last_cartesian_energy_budget_lambda_valid_{false};
-  double last_cartesian_energy_scale_{1.0};
+  bool last_energy_budget_active_{false};
+  bool last_energy_budget_lambda_valid_{false};
+  double last_energy_stiffness_scale_{1.0};
+  double last_nullspace_stiffness_{0.0};
   double last_joint_kinetic_energy_{0.0};
   double last_cartesian_potential_energy_before_scaling_{0.0};
-  double last_cartesian_control_energy_before_scaling_{0.0};
+  double last_nullspace_potential_energy_before_scaling_{0.0};
+  double last_nullspace_potential_energy_{0.0};
+  double last_total_control_energy_before_scaling_{0.0};
   double last_cartesian_potential_energy_{0.0};
-  double last_cartesian_control_energy_{0.0};
+  double last_total_control_energy_{0.0};
+  double last_overbudget_joint_potential_energy_{0.0};
+  double last_overbudget_joint_scale_rho_{1.0};
+  double last_overbudget_joint_torque_norm_{0.0};
+  double last_tau_task_norm_{0.0};
+  double last_tau_nullspace_raw_norm_{0.0};
+  double last_tau_nullspace_projected_norm_{0.0};
+  double last_coriolis_norm_{0.0};
+  double last_tau_desired_before_rate_limit_norm_{0.0};
 };
 
 }  // namespace cps_controllers

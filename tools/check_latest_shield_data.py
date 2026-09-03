@@ -255,8 +255,11 @@ def build_comparison(
                 "monitor_cartesian_potential_energy_ub": to_float(
                     pred, "monitor_worst_case_cartesian_potential_energy_ub"
                 ),
-                "monitor_cartesian_control_energy_ub": to_float(
-                    pred, "monitor_worst_case_cartesian_control_energy_ub"
+                "monitor_nullspace_potential_energy_ub": to_float(
+                    pred, "monitor_worst_case_nullspace_potential_energy_ub"
+                ),
+                "monitor_total_control_energy_ub": to_float(
+                    pred, "monitor_worst_case_total_control_energy_ub"
                 ),
                 "mode": to_int(measured, "mode"),
                 "predicted_trigger": to_int(measured, "predicted_trigger"),
@@ -425,8 +428,11 @@ def build_mode1_nominal_prediction_comparison(
                 "monitor_cartesian_potential_energy_ub": to_float(
                     pred, "monitor_worst_case_cartesian_potential_energy_ub"
                 ),
-                "monitor_cartesian_control_energy_ub": to_float(
-                    pred, "monitor_worst_case_cartesian_control_energy_ub"
+                "monitor_nullspace_potential_energy_ub": to_float(
+                    pred, "monitor_worst_case_nullspace_potential_energy_ub"
+                ),
+                "monitor_total_control_energy_ub": to_float(
+                    pred, "monitor_worst_case_total_control_energy_ub"
                 ),
                 "distance_segment": to_float(pred, "distance_segment"),
             }
@@ -522,8 +528,11 @@ def build_verification_aligned_comparison(
                 "monitor_cartesian_potential_energy_ub": to_float(
                     pred, "monitor_worst_case_cartesian_potential_energy_ub"
                 ) if has_match else math.nan,
-                "monitor_cartesian_control_energy_ub": to_float(
-                    pred, "monitor_worst_case_cartesian_control_energy_ub"
+                "monitor_nullspace_potential_energy_ub": to_float(
+                    pred, "monitor_worst_case_nullspace_potential_energy_ub"
+                ) if has_match else math.nan,
+                "monitor_total_control_energy_ub": to_float(
+                    pred, "monitor_worst_case_total_control_energy_ub"
                 ) if has_match else math.nan,
                 "distance_segment": to_float(pred, "distance_segment") if has_match else math.nan,
             }
@@ -547,7 +556,16 @@ def summarize(
     schema = state_log_schema(run_dir)
     fallback_reason_names = (
         FALLBACK_REASON_NAMES_V3
-        if schema in {"orthogonal_execution_v3", "orthogonal_execution_v4"}
+        if schema in {
+            "orthogonal_execution_v3",
+            "orthogonal_execution_v4",
+            "orthogonal_execution_v5",
+            "orthogonal_execution_v6",
+            "orthogonal_execution_v7",
+            "orthogonal_execution_v8",
+            "orthogonal_execution_v9",
+            "orthogonal_execution_v10",
+        }
         else FALLBACK_REASON_NAMES_LEGACY
     )
     first_contact = first_time(validation_rows, "monitored_contact_possible")
@@ -561,7 +579,7 @@ def summarize(
 
     monitored_energy_values = finite_values(
         [
-            to_float(row, "monitor_worst_case_cartesian_control_energy_ub")
+            to_float(row, "monitor_worst_case_total_control_energy_ub")
             for row in prediction_rows
         ]
     )
@@ -579,7 +597,7 @@ def summarize(
         f"first_execution_stage_2_failsafe_sec: {first_failsafe}",
         f"first_execution_stage_3_hold_sec: {first_hold}",
         f"first_mujoco_contact_active_sec: {first_mujoco_contact}",
-        "max_monitored_cartesian_control_energy_ub_joule: "
+        "max_monitored_total_control_energy_ub_joule: "
         f"{max(monitored_energy_values) if monitored_energy_values else None}",
     ]
 

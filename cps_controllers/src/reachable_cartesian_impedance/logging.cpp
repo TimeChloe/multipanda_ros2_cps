@@ -184,6 +184,15 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     bool joint_energy_valid{false};
     double joint_kinetic_energy{0.0};
     double cartesian_potential_energy{0.0};
+    double nullspace_potential_energy{0.0};
+    bool nullspace_potential_energy_active{false};
+    bool energy_scaling_active{false};
+    double energy_stiffness_scale{1.0};
+    double applied_nullspace_stiffness{0.0};
+    bool overbudget_joint_stabilization_active{false};
+    double overbudget_joint_potential_energy{0.0};
+    double overbudget_joint_scale_rho{1.0};
+    double overbudget_joint_torque_norm{0.0};
     Vector7d joint_q{Vector7d::Constant(
         std::numeric_limits<double>::quiet_NaN())};
     Vector7d joint_dq{Vector7d::Constant(
@@ -192,6 +201,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     int closest_robot_link_index{-1};
     double d_segment{0.0};
     Vector3d human_center_end{Vector3d::Zero()};
+    double human_reach_radius{0.0};
     bool contact_possible{false};
     double Kx{0.0};
     double Ky{0.0};
@@ -295,6 +305,24 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
             joint_sample.joint_kinetic_energy;
           row.cartesian_potential_energy =
             joint_sample.cartesian_potential_energy;
+          row.nullspace_potential_energy =
+            joint_sample.nullspace_potential_energy;
+          row.nullspace_potential_energy_active =
+            joint_sample.nullspace_potential_energy_active;
+          row.energy_scaling_active =
+            joint_sample.energy_scaling_active;
+          row.energy_stiffness_scale =
+            joint_sample.energy_stiffness_scale;
+          row.applied_nullspace_stiffness =
+            joint_sample.applied_nullspace_stiffness;
+          row.overbudget_joint_stabilization_active =
+            joint_sample.overbudget_joint_stabilization_active;
+          row.overbudget_joint_potential_energy =
+            joint_sample.overbudget_joint_potential_energy;
+          row.overbudget_joint_scale_rho =
+            joint_sample.overbudget_joint_scale_rho;
+          row.overbudget_joint_torque_norm =
+            joint_sample.overbudget_joint_torque_norm;
           if (async_timing.valid) {
             row.horizon_steps = static_cast<std::size_t>(std::max<long long>(
                 0,
@@ -310,7 +338,10 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
           }
         }
       }
-      row.human_center_end = human_workspace.centerAtTime(segment_end_time_sec);
+      const auto hand_reach =
+        human_workspace.handReachableSetAtTime(segment_end_time_sec);
+      row.human_center_end = hand_reach.center;
+      row.human_reach_radius = hand_reach.radius;
       if (human_workspace_assumed_clear) {
         row.d_segment = std::numeric_limits<double>::infinity();
       } else if (robot_reachability_provider_ && row.joint_state_valid) {
@@ -326,9 +357,9 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         row.d_segment = row.robot_reach_valid ?
           robot_reachability_provider_->minimumSignedDistance(
           robot_capsules,
-          human_workspace.centerAtTime(segment_start_time_sec),
           row.human_center_end,
-          human_workspace.motionRadius(),
+          row.human_center_end,
+          row.human_reach_radius,
           &row.closest_robot_link_index) :
           -std::numeric_limits<double>::infinity();
       } else {
@@ -342,12 +373,16 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
           segment_end_time_sec);
       }
       row.contact_possible = row.d_segment <= 0.0;
-      row.Kx = K_exec(0, 0);
-      row.Ky = K_exec(1, 1);
-      row.Kz = K_exec(2, 2);
-      row.Dx = D_exec(0, 0);
-      row.Dy = D_exec(1, 1);
-      row.Dz = D_exec(2, 2);
+      const double logged_energy_scale = row.joint_state_valid
+        ? std::clamp(row.energy_stiffness_scale, 0.0, 1.0)
+        : 1.0;
+      const double logged_damping_scale = std::sqrt(logged_energy_scale);
+      row.Kx = logged_energy_scale * K_exec(0, 0);
+      row.Ky = logged_energy_scale * K_exec(1, 1);
+      row.Kz = logged_energy_scale * K_exec(2, 2);
+      row.Dx = logged_damping_scale * D_exec(0, 0);
+      row.Dy = logged_damping_scale * D_exec(1, 1);
+      row.Dz = logged_damping_scale * D_exec(2, 2);
       rows.push_back(row);
 
       x_pred = x_next;
@@ -373,7 +408,9 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   append_samples("intended", collision_plan.intended);
   append_samples("failsafe", collision_plan.failsafe);
 
-  const Vector3d actual_human_center = human_workspace.centerAtTime(wall_time);
+  const auto actual_hand_reach =
+    human_workspace.handReachableSetAtTime(wall_time);
+  const Vector3d actual_human_center = actual_hand_reach.center;
   double actual_collision_distance =
     human_workspace_assumed_clear ?
     std::numeric_limits<double>::infinity() :
@@ -390,7 +427,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
         robot_capsules,
         actual_human_center,
         actual_human_center,
-        human_workspace.motionRadius(),
+        actual_hand_reach.radius,
         &actual_closest_robot_link_index);
     }
   } else if (human_workspace_active) {
@@ -441,7 +478,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << row.sample_t << "," << row.dt << ","
       << collision_center(0) << "," << collision_center(1) << "," << collision_center(2) << ","
       << actual_human_center(0) << "," << actual_human_center(1) << "," << actual_human_center(2) <<
-      ","
+      "," << actual_hand_reach.radius << ","
       << actual_collision_distance << ","
       << actual_closest_robot_link_index << ","
       << current_q(0) << "," << current_q(1) << "," << current_q(2) << ","
@@ -466,14 +503,33 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << static_cast<int>(row.joint_energy_valid) << ","
       << row.joint_kinetic_energy << ","
       << row.cartesian_potential_energy << ","
-      << row.joint_kinetic_energy + row.cartesian_potential_energy << ","
+      << row.nullspace_potential_energy << ","
+      << static_cast<int>(row.nullspace_potential_energy_active) << ","
+      << static_cast<int>(row.energy_scaling_active) << ","
+      << row.energy_stiffness_scale << ","
+      << row.applied_nullspace_stiffness << ","
+      << static_cast<int>(
+        row.overbudget_joint_stabilization_active) << ","
+      << row.overbudget_joint_potential_energy << ","
+      << row.overbudget_joint_scale_rho << ","
+      << row.overbudget_joint_torque_norm << ","
+      << row.joint_kinetic_energy + row.cartesian_potential_energy +
+        row.nullspace_potential_energy << ","
       << row.joint_kinetic_energy +
         std::max(0.0, kinetic_energy_error_bound_joule_) << ","
       << row.cartesian_potential_energy +
         std::max(0.0, potential_energy_error_bound_joule_) << ","
+      << row.nullspace_potential_energy +
+        (row.nullspace_potential_energy_active ?
+          std::max(0.0, nullspace_potential_energy_error_bound_joule_) :
+          0.0) << ","
       << row.joint_kinetic_energy + row.cartesian_potential_energy +
+        row.nullspace_potential_energy +
         std::max(0.0, kinetic_energy_error_bound_joule_) +
-        std::max(0.0, potential_energy_error_bound_joule_) << ","
+        std::max(0.0, potential_energy_error_bound_joule_) +
+        (row.nullspace_potential_energy_active ?
+          std::max(0.0, nullspace_potential_energy_error_bound_joule_) :
+          0.0) << ","
       << row.joint_q(0) << "," << row.joint_q(1) << "," << row.joint_q(2) << ","
       << row.joint_q(3) << "," << row.joint_q(4) << "," << row.joint_q(5) << ","
       << row.joint_q(6) << ","
@@ -481,7 +537,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << row.joint_dq(3) << "," << row.joint_dq(4) << "," << row.joint_dq(5) << ","
       << row.joint_dq(6) << ","
       << row.human_center_end(0) << "," << row.human_center_end(1) << "," <<
-      row.human_center_end(2) << ","
+      row.human_center_end(2) << "," << row.human_reach_radius << ","
       << static_cast<int>(row.robot_reach_valid) << ","
       << row.closest_robot_link_index << ","
       << row.d_segment << ","
@@ -491,6 +547,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << monitor.worst_case_cartesian_kinetic_energy_ub << ","
       << monitor.worst_case_joint_kinetic_energy_ub << ","
       << monitor.worst_case_cartesian_potential_energy_ub << ","
+      << monitor.worst_case_nullspace_potential_energy_ub << ","
       << monitor.worst_case_total_control_energy_ub << ","
       << monitor.terminal_energy_ub << ","
       << monitor.workspace_distance_margin << ","
@@ -499,6 +556,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << static_cast<int>(monitor.current_joint_energy_valid) << ","
       << monitor.current_joint_kinetic_energy << ","
       << monitor.current_cartesian_potential_energy << ","
+      << monitor.current_nullspace_potential_energy << ","
       << monitor.current_total_control_energy << ","
       << static_cast<int>(monitor.inertia_model_comparison_valid) << ","
       << monitor.runtime_model_joint_kinetic_energy << ","
@@ -527,9 +585,7 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "wall_time_sec,nominal_time_sec,paused_nominal_time_sec,"
     "commanded_path_time_sec,command_path_time_sec,"
     "command_path_time_valid,commanded_path_rate,"
-    "generator_target_path_rate,measured_path_rate,"
-    "measured_path_rate_valid,measured_path_acceleration,"
-    "measured_path_acceleration_valid,mode,execution_stage,fallback_reason,"
+    "generator_target_path_rate,mode,execution_stage,fallback_reason,"
     "plan_failure_reason,candidate_verified,monitor_prediction_valid,"
     "predicted_trigger,collision_interval_index,predicted_contact_possible,"
     "monitored_contact_possible,human_workspace_active,"
@@ -547,11 +603,15 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "human_center_px,human_center_py,human_center_pz,"
     "collision_center_vx,collision_center_vy,collision_center_vz,"
     "des_vx,des_vy,des_vz,err_px,err_py,err_pz,err_rx,err_ry,err_rz,"
-    "tau_cmd_norm,torque_rate_limited,torque_rate_max_ratio,Kx,Ky,Kz,Dx,Dy,Dz,"
+    "tau_cmd_norm,tau_task_norm,tau_nullspace_raw_norm,"
+    "tau_nullspace_projected_norm,tau_overbudget_joint_norm,coriolis_norm,"
+    "tau_desired_before_rate_limit_norm,torque_rate_limited,"
+    "torque_rate_max_ratio,Kx,Ky,Kz,Dx,Dy,Dz,"
     "worst_case_contact_time,worst_case_workspace_distance_at_candidate,"
     "worst_case_cartesian_kinetic_energy_ub,"
     "worst_case_joint_kinetic_energy_ub,"
     "worst_case_cartesian_potential_energy_ub,"
+    "worst_case_nullspace_potential_energy_ub,"
     "worst_case_total_control_energy_ub,"
     "terminal_energy_ub,"
     "robot_reach_secure_radius,robot_reach_alpha_valid,"
@@ -564,6 +624,7 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "monitor_current_joint_energy_valid,"
     "monitor_current_joint_kinetic_energy,"
     "monitor_current_cartesian_potential_energy_after_scaling,"
+    "monitor_current_nullspace_potential_energy,"
     "monitor_current_total_control_energy_after_scaling,monitored_steps,"
     "monitored_intended_steps,"
     "monitored_failsafe_steps,control_loop_sequence,"
@@ -596,15 +657,29 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "calibration_activation_intended_index,"
     "calibration_activation_failsafe_index,"
     "runtime_energy_scaling_enabled,"
-    "cartesian_energy_budget_active,cartesian_effective_time_frozen,"
-    "cartesian_energy_lambda_valid,cartesian_energy_scale,"
+    "energy_budget_active,"
+    "cartesian_energy_lambda_valid,energy_stiffness_scale,"
     "joint_kinetic_energy,cartesian_potential_energy_before_scaling,"
+    "nullspace_potential_energy_before_scaling,"
     "total_control_energy_before_scaling,"
     "cartesian_potential_energy_after_scaling,"
+    "nullspace_potential_energy_after_scaling,"
+    "nullspace_enabled,nullspace_stiffness_before_scaling,"
+    "nullspace_stiffness_after_scaling,"
     "total_control_energy_after_scaling,"
+    "overbudget_joint_stabilization_enabled,"
+    "overbudget_joint_stabilization_active,"
+    "overbudget_joint_stiffness,overbudget_joint_scale_omega,"
+    "overbudget_joint_potential_energy,overbudget_joint_scale_rho,"
+    "overbudget_joint_reference_q1,overbudget_joint_reference_q2,"
+    "overbudget_joint_reference_q3,overbudget_joint_reference_q4,"
+    "overbudget_joint_reference_q5,overbudget_joint_reference_q6,"
+    "overbudget_joint_reference_q7,"
     "previous_applied_energy_valid,"
     "previous_applied_joint_kinetic_energy,"
     "previous_applied_cartesian_potential_energy,"
+    "previous_applied_nullspace_potential_energy,"
+    "previous_applied_nullspace_potential_energy_active,"
     "previous_applied_total_energy,energy_budget_joule,mujoco_contact_value,"
     "mujoco_contact_active,mujoco_contact_sample_age_sec";
 
@@ -670,7 +745,7 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "plan_intended_steps,plan_failsafe_steps,"
       "stage,index,is_failsafe_sample,sample_t,dt,actual_collision_px,actual_collision_py,"
       "actual_collision_pz,actual_human_center_px,actual_human_center_py,"
-      "actual_human_center_pz,actual_collision_distance,"
+      "actual_human_center_pz,actual_hand_reach_radius,actual_collision_distance,"
       "actual_closest_robot_link_index,"
       "measured_q1,measured_q2,measured_q3,measured_q4,measured_q5,"
       "measured_q6,measured_q7,measured_dq1,measured_dq2,measured_dq3,"
@@ -682,18 +757,28 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "expected_control_sequence_valid,expected_control_loop_sequence,"
       "prediction_horizon_steps,guaranteed_committed_sample,"
       "pred_energy_valid,pred_joint_kinetic_energy,"
-      "pred_cartesian_potential_energy,pred_total_energy,"
+      "pred_cartesian_potential_energy,pred_nullspace_potential_energy,"
+      "pred_nullspace_potential_energy_active,pred_energy_scaling_active,"
+      "pred_energy_stiffness_scale,"
+      "pred_applied_nullspace_stiffness,"
+      "pred_overbudget_joint_stabilization_active,"
+      "pred_overbudget_joint_potential_energy,"
+      "pred_overbudget_joint_scale_rho,pred_overbudget_joint_torque_norm,"
+      "pred_total_energy,"
       "pred_joint_kinetic_energy_ub,pred_cartesian_potential_energy_ub,"
+      "pred_nullspace_potential_energy_ub,"
       "pred_total_energy_ub,"
       "pred_q1,pred_q2,pred_q3,pred_q4,pred_q5,pred_q6,pred_q7,"
       "pred_dq1,pred_dq2,pred_dq3,pred_dq4,pred_dq5,pred_dq6,pred_dq7,"
       "human_center_end_px,human_center_end_py,"
-      "human_center_end_pz,robot_reach_valid,closest_robot_link_index,"
+      "human_center_end_pz,human_reach_radius,robot_reach_valid,"
+      "closest_robot_link_index,"
       "distance_segment,contact_possible,"
       "Kx,Ky,Kz,Dx,Dy,Dz,"
       "monitor_worst_case_cartesian_kinetic_energy_ub,"
       "monitor_worst_case_joint_kinetic_energy_ub,"
       "monitor_worst_case_cartesian_potential_energy_ub,"
+      "monitor_worst_case_nullspace_potential_energy_ub,"
       "monitor_worst_case_total_control_energy_ub,"
       "monitor_terminal_energy_ub,monitor_workspace_distance_margin,"
       "monitor_current_cartesian_energy_valid,"
@@ -701,6 +786,7 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "monitor_current_joint_energy_valid,"
       "monitor_current_joint_kinetic_energy,"
       "monitor_current_cartesian_potential_energy,"
+      "monitor_current_nullspace_potential_energy,"
       "monitor_current_total_control_energy,"
       "inertia_model_comparison_valid,"
       "runtime_model_joint_kinetic_energy,"

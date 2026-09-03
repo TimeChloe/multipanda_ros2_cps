@@ -124,6 +124,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_reachable_safety_monitor
     ${PROJECT_NAME}
     Eigen3::Eigen
+    SaRA
+  )
+  target_include_directories(test_reachable_safety_monitor SYSTEM PRIVATE
+    "${SARA_REACHLIB_SOURCE_DIR}/include"
   )
   target_compile_definitions(test_reachable_safety_monitor PRIVATE
     "SARA_PANDA_CONFIG_PATH=\"${SARA_SHIELD_SOURCE_DIR}/config/robot_config/robot_parameters_panda.yaml\"")

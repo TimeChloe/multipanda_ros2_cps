@@ -62,7 +62,8 @@ struct PathConsistentTimedPathConfig {
 };
 
 struct TrajectoryGeneratorSettings {
-  double shield_plan_dt{0.001};
+  // SaRA-Shield Panda: 5 controller samples per reachability interval.
+  double shield_plan_dt{0.005};
   double monitor_frequency_hz{200.0};
 
   int local_replan_horizon_steps{64};

@@ -1,7 +1,7 @@
 // Copyright (c) 2026
 // Reachable Cartesian Impedance Controller
 //
-// Monitored execution with a Cartesian Lachner-style energy budget in nominal contact.
+// Monitored execution with a whole-robot Lachner-style energy budget in nominal contact.
 // Intended prefix is supplied by the trajectory generator package.
 //
 // Modified version:
@@ -596,9 +596,30 @@ void ReachableCartesianImpedanceController::handleHumanWorkspaceState(
   parameters.center_sinusoid_phase_rad = 0.0;
   parameters.center_motion_time_offset_sec = 0.0;
   parameters.motion_radius = msg->motion_radius;
+  parameters.hand_max_velocity = msg->hand_max_velocity;
+  parameters.hand_max_acceleration = msg->hand_max_acceleration;
+  parameters.measurement_error_position =
+      msg->measurement_error_position;
+  parameters.measurement_error_velocity =
+      msg->measurement_error_velocity;
+  parameters.measurement_delay = msg->measurement_delay;
 
+  const bool reachability_parameters_valid =
+      std::isfinite(parameters.hand_max_velocity) &&
+      parameters.hand_max_velocity >= 0.0 &&
+      std::isfinite(parameters.hand_max_acceleration) &&
+      parameters.hand_max_acceleration > 0.0 &&
+      std::isfinite(parameters.measurement_error_position) &&
+      parameters.measurement_error_position >= 0.0 &&
+      std::isfinite(parameters.measurement_error_velocity) &&
+      parameters.measurement_error_velocity >= 0.0 &&
+      std::isfinite(parameters.measurement_delay) &&
+      parameters.measurement_delay >= 0.0;
   if (parameters.motion_radius < 0.0 ||
-      !std::isfinite(parameters.motion_radius)) {
+      !std::isfinite(parameters.motion_radius) ||
+      !parameters.sphere_center.allFinite() ||
+      !parameters.center_velocity.allFinite() ||
+      !reachability_parameters_valid) {
     RCLCPP_WARN_THROTTLE(
         get_node()->get_logger(),
         *get_node()->get_clock(),
@@ -610,8 +631,15 @@ void ReachableCartesianImpedanceController::handleHumanWorkspaceState(
 
   human_workspace_param_buffer_.writeFromNonRT(parameters);
   human_workspace_live_received_.store(true, std::memory_order_relaxed);
+  const double receipt_time_sec = get_node()->now().seconds();
+  const double message_time_sec =
+      static_cast<double>(msg->header.stamp.sec) +
+      1.0e-9 * static_cast<double>(msg->header.stamp.nanosec);
+  const bool message_time_valid =
+      std::isfinite(message_time_sec) && message_time_sec > 0.0 &&
+      message_time_sec <= receipt_time_sec + 0.1;
   latest_human_workspace_msg_time_sec_.store(
-      get_node()->now().seconds(),
+      message_time_valid ? message_time_sec : receipt_time_sec,
       std::memory_order_relaxed);
 }
 
@@ -649,6 +677,18 @@ bool ReachableCartesianImpedanceController::refreshHumanWorkspaceForMonitor(
   }
 
   human_workspace_active_ = human_workspace_configured_static_;
+  if (human_workspace_active_) {
+    auto observed_parameters = configured_human_workspace_source_.parameters();
+    observed_parameters.sphere_center =
+        configured_human_workspace_source_.centerAtTime(wall_time);
+    observed_parameters.center_velocity =
+        configured_human_workspace_source_.centerVelocityAtTime(wall_time);
+    observed_parameters.center_sinusoid_amplitude.setZero();
+    observed_parameters.center_sinusoid_frequency_hz = 0.0;
+    observed_parameters.center_sinusoid_phase_rad = 0.0;
+    observed_parameters.center_motion_time_offset_sec = wall_time;
+    human_workspace_.setParameters(observed_parameters);
+  }
   if (!human_workspace_active_) {
     RCLCPP_WARN_THROTTLE(
         get_node()->get_logger(),
@@ -687,8 +727,12 @@ bool ReachableCartesianImpedanceController::shouldRejectCandidateWithMonitor(
   return shouldRejectCandidateWithMonitor(monitor, human_workspace_active_);
 }
 
-bool ReachableCartesianImpedanceController::shouldApplyCartesianEnergyBudget(
+bool ReachableCartesianImpedanceController::shouldApplyEnergyBudget(
     const MonitorResult& monitor) const {
+  // The controlled energy is measured throughout execution, but the gain
+  // adaptation is activated only after the current robot occupancy overlaps
+  // the human workspace. This preserves the nominal gains outside the
+  // collision area while using Eq. (14) for the command actually sent inside.
   return enable_safety_monitor_ &&
          human_workspace_active_ &&
          monitor.contact_relevant_for_energy;
@@ -722,46 +766,32 @@ bool ReachableCartesianImpedanceController::computeTaskInertia(
   return lambda->array().isFinite().all();
 }
 
-double ReachableCartesianImpedanceController::cartesianEnergyScaleFloor(
-    const Matrix6d& K_reference) const {
-  const double min_pos_stiffness =
-      std::max(0.0, cartesian_energy_min_pos_stiffness_);
-  if (min_pos_stiffness <= kSmallPositive) {
-    return 0.0;
-  }
-
-  double scale_floor = 0.0;
-  for (int i = 0; i < 3; ++i) {
-    const double k_ref = K_reference(i, i);
-    if (k_ref > kSmallPositive) {
-      const double bounded_floor = std::min(min_pos_stiffness, k_ref);
-      scale_floor = std::max(scale_floor, bounded_floor / k_ref);
-    }
-  }
-  return clamp01(scale_floor);
-}
-
-ImpedanceSample ReachableCartesianImpedanceController::applyCartesianEnergyBudget(
+ImpedanceSample ReachableCartesianImpedanceController::applyEnergyBudget(
     const ImpedanceSample& command,
     double kinetic_energy,
     double potential_energy,
+    double nullspace_potential_energy,
     bool energy_valid,
     bool active,
-    const Matrix6d& cartesian_task_inertia_sqrt,
-    bool cartesian_task_inertia_valid,
-    CartesianEnergyBudgetInfo* info) const {
-  CartesianEnergyBudgetInfo local_info;
+    EnergyBudgetInfo* info) const {
+  EnergyBudgetInfo local_info;
   local_info.active = active;
   local_info.lambda_valid = energy_valid;
   local_info.kinetic_energy = std::max(0.0, kinetic_energy);
   local_info.potential_energy_before_scaling =
       std::max(0.0, potential_energy);
+  local_info.nullspace_potential_energy_before_scaling =
+      std::max(0.0, nullspace_potential_energy);
   local_info.total_energy_before_scaling =
       local_info.kinetic_energy +
-      local_info.potential_energy_before_scaling;
+      local_info.potential_energy_before_scaling +
+      local_info.nullspace_potential_energy_before_scaling;
   // Without active scaling, the candidate and applied energies are equal.
   local_info.potential_energy =
       local_info.potential_energy_before_scaling;
+  local_info.nullspace_potential_energy =
+      local_info.nullspace_potential_energy_before_scaling;
+  local_info.nullspace_stiffness = n_stiffness_;
   local_info.total_energy = local_info.total_energy_before_scaling;
 
   ImpedanceSample scaled_command = command;
@@ -772,50 +802,33 @@ ImpedanceSample ReachableCartesianImpedanceController::applyCartesianEnergyBudge
     return scaled_command;
   }
 
-  const double budget = std::max(0.0, energy_budget_joule_);
-  if (local_info.kinetic_energy > budget) {
-    local_info.scale = 0.0;
-  } else if (local_info.total_energy_before_scaling <= budget) {
-    local_info.scale = 1.0;
-  } else if (local_info.potential_energy_before_scaling > kSmallPositive) {
-    local_info.scale =
-        clamp01((budget - local_info.kinetic_energy) /
-                local_info.potential_energy_before_scaling);
-  } else {
-    local_info.scale = 0.0;
-  }
-  local_info.scale =
-      std::max(local_info.scale, cartesianEnergyScaleFloor(command.K));
-
+  // Lachner et al. Eq. (14): one common kappa scales U_x and U_q. This is
+  // essential for a globally enabled nullspace spring; treating U_n as fixed
+  // would leave part of the controlled potential outside the budget action.
+  local_info.scale = cps_safety_monitor::energyBudgetStiffnessScale(
+      local_info.kinetic_energy,
+      local_info.potential_energy_before_scaling,
+      local_info.nullspace_potential_energy_before_scaling,
+      energy_budget_joule_);
   // This is the elastic energy stored by the stiffness command that will
   // actually be used in this control cycle. K is scaled linearly, therefore
   // its quadratic potential is scaled by the same factor.
   local_info.potential_energy =
       local_info.scale * local_info.potential_energy_before_scaling;
+  local_info.nullspace_potential_energy =
+      local_info.scale *
+      local_info.nullspace_potential_energy_before_scaling;
+  local_info.nullspace_stiffness = local_info.scale * n_stiffness_;
   local_info.total_energy =
-      local_info.kinetic_energy + local_info.potential_energy;
+      local_info.kinetic_energy + local_info.potential_energy +
+      local_info.nullspace_potential_energy;
 
-  // Lachner et al. (14) and (18): scale the complete Cartesian elastic
-  // potential by kappa and the corresponding damping by sqrt(kappa).  The
-  // matrix form below is their Cartesian damping design (9a), evaluated with
-  // the current kinetic-energy matrix instead of assuming unit task inertia.
+  // Lachner et al. (14) and (18): the same kappa also scales Cartesian
+  // stiffness. The nullspace controller consumes local_info.nullspace_stiffness
+  // and therefore obtains kappa*K_n and sqrt(kappa)*B_n as well.
   scaled_command.K =
       0.5 * local_info.scale * (command.K + command.K.transpose());
-  scaled_command.D = command.D;
-  if (cartesian_task_inertia_valid) {
-    Matrix6d stiffness_sqrt = Matrix6d::Zero();
-    if (symmetricPositiveSemidefiniteSquareRoot(
-            scaled_command.K, &stiffness_sqrt)) {
-      const Matrix6d damping_ratio =
-          std::clamp(cartesian_energy_damping_ratio_, 0.0, 1.0) *
-          Matrix6d::Identity();
-      scaled_command.D =
-          cartesian_task_inertia_sqrt * damping_ratio * stiffness_sqrt +
-          stiffness_sqrt * damping_ratio * cartesian_task_inertia_sqrt;
-      scaled_command.D =
-          0.5 * (scaled_command.D + scaled_command.D.transpose());
-    }
-  }
+  scaled_command.D = std::sqrt(local_info.scale) * command.D;
   if (info != nullptr) {
     *info = local_info;
   }
@@ -1217,8 +1230,7 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     // the new Ruckig segment with measured along-path velocity and
     // acceleration. This preserves forward command-position continuity while
     // avoiding a restart from artificial zero command derivatives.
-    if (reanchor_path_kinematics &&
-        planning_start_command.nominal_path_time_valid) {
+    if (reanchor_path_kinematics) {
       planning_start = makeRetimedPathState(
           active_path,
           path_start_time,
@@ -1404,7 +1416,11 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
           ? intended_samples.back().nominal_path_time
           : intended_samples.back().t;
   const ImpedanceSample freeze_anchor = plan.intended.back();
-  const double failsafe_plan_dt = std::max(shield_plan_dt_, local_replan_dt_);
+  // Match SaRA-Shield's separation between the dense controller trajectory
+  // and the coarser reachability interval edges: braking remains sampled at
+  // the controller period, while makeSparsePlanForMonitor() groups those
+  // samples into shield_plan_dt_ intervals.
+  const double failsafe_plan_dt = std::max(local_replan_dt_, kMinDt);
 
   auto fill_failsafe_prefix = [&]() {
     plan.failsafe.clear();
@@ -1727,6 +1743,16 @@ SafetyMonitorConfig ReachableCartesianImpedanceController::makeSafetyMonitorConf
       kinetic_energy_error_bound_joule_;
   config.potential_energy_error_bound_joule =
       potential_energy_error_bound_joule_;
+  config.nullspace_potential_energy_error_bound_joule =
+      nullspace_potential_energy_error_bound_joule_;
+  config.enable_runtime_energy_scaling =
+      enable_runtime_energy_scaling_;
+  config.enable_overbudget_joint_stabilization =
+      enable_overbudget_joint_stabilization_;
+  config.overbudget_joint_stiffness =
+      overbudget_joint_stiffness_;
+  config.overbudget_joint_scale_omega =
+      overbudget_joint_scale_omega_;
   config.robot_reachability_provider = robot_reachability_provider_;
   config.ee_collision_radius = ee_collision_radius_;
   config.use_dynamic_consistent_impedance = use_dynamic_consistent_impedance_;
@@ -1799,7 +1825,6 @@ VerifiedPlan ReachableCartesianImpedanceController::makeSparsePlanForMonitor(
     const VerifiedPlan& dense_plan) const {
   const double interval_dt = std::max(shield_plan_dt_, kMinDt);
   VerifiedPlan sparse_plan;
-  sparse_plan.valid = dense_plan.valid;
   sparse_plan.anchor = dense_plan.anchor;
   sparse_plan.generated_wall_time = dense_plan.generated_wall_time;
   sparse_plan.nominal_time_anchor = dense_plan.nominal_time_anchor;
@@ -1887,6 +1912,9 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
     bool human_workspace_assumed_clear,
     const ImpedanceSample& current_command_reference,
     bool current_command_reference_valid,
+    double current_nullspace_stiffness,
+    const cps_safety_monitor::OverbudgetJointStabilizationState&
+        overbudget_joint_state,
     std::vector<JointPredictionSample>* joint_prediction_trace) const {
   if (joint_prediction_trace != nullptr) {
     joint_prediction_trace->clear();
@@ -1911,12 +1939,17 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
   }
   config.nullspace_reference = desired_qn_;
   config.nullspace_stiffness = n_stiffness_;
-  config.disable_nullspace_in_failsafe = disable_nullspace_in_failsafe_;
+  config.current_nullspace_stiffness =
+      std::max(0.0, current_nullspace_stiffness);
+  config.overbudget_joint_state = overbudget_joint_state;
   config.collision_center_offset = ee_collision_center_offset_;
   config.previous_torque_command = previous_torque_command;
   config.previous_torque_command_valid = true;
   config.torque_rate_limit = panda_limits::kTorqueRateLimit;
-  config.joint_rollout_max_dt = local_replan_dt_;
+  // SaRA evaluates robot and human occupancies on the same sparse interval
+  // grid. Keep dense command generation at local_replan_dt_, but do not split
+  // each shield interval back into controller-period reachable sets here.
+  config.joint_rollout_max_dt = shield_plan_dt_;
 
   // Use the snapshot read by the 1 kHz controller for the rollout's initial
   // state. J_geo is expressed at the collision center here; shift it back to
@@ -2013,6 +2046,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
         false,
         last_commanded_sample_,
         last_commanded_sample_valid_,
+        last_nullspace_stiffness_,
+        overbudget_joint_state_,
         (enable_prediction_logging_ || enable_reachable_set_visualization_)
             ? &dec.joint_prediction_trace
             : nullptr);
@@ -2400,6 +2435,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
         input.human_workspace_assumed_clear,
         input.last_commanded_sample,
         input.last_commanded_sample_valid,
+        input.last_nullspace_stiffness,
+        input.overbudget_joint_state,
         (enable_prediction_logging_ || enable_reachable_set_visualization_)
             ? &dec.joint_prediction_trace
             : nullptr);
@@ -2499,7 +2536,8 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
     const Vector3d& current_position,
     const Quaterniond& current_orientation,
     const ImpedanceSample& cmd,
-    bool cartesian_energy_budget_active,
+    double nullspace_stiffness,
+    const Vector7d& overbudget_joint_torque,
     double dt) {
   updateRuntimeGains(cmd.K, cmd.D);
 
@@ -2542,7 +2580,7 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
   J_geo_prev_ = J_geo;
   J_geo_prev_valid_ = true;
 
-  Vector7d tau_task = Vector7d::Zero();
+  Vector7d tau_task;
 
   Matrix7d M_inv = Matrix7d::Zero();
   Matrix6d lambda = Matrix6d::Zero();
@@ -2587,11 +2625,13 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
         (-K_runtime_ * error - D_runtime_ * xdot_error);
   }
 
+  const double effective_nullspace_stiffness =
+      std::max(0.0, nullspace_stiffness);
   const Vector7d tau_nullspace_raw =
-      n_stiffness_ * (desired_qn_ - q)
-      - 2.0 * std::sqrt(std::max(n_stiffness_, 0.0)) * dq;
+      effective_nullspace_stiffness * (desired_qn_ - q)
+      - 2.0 * std::sqrt(effective_nullspace_stiffness) * dq;
 
-  Vector7d tau_nullspace = Vector7d::Zero();
+  Vector7d tau_nullspace;
 
   if (use_dynamic_consistent_impedance_ && lambda_valid) {
     const Eigen::Matrix<double, 7, 6> Jbar =
@@ -2609,34 +2649,30 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
         tau_nullspace_raw;
   }
 
-  const Vector7d tau_nullspace_eff =
-      cartesian_energy_budget_active ||
-              (cmd.failsafe && disable_nullspace_in_failsafe_)
-          ? Vector7d::Zero()
-          : tau_nullspace;
-
-  const Vector7d tau_des = tau_task + coriolis + tau_nullspace_eff;
+  // Nullspace control is not switched by execution stage or contact state.
+  // Its only runtime adaptation is the common Lachner energy scale already
+  // reflected in effective_nullspace_stiffness.
+  const Vector7d tau_des =
+      tau_task + coriolis + tau_nullspace + overbudget_joint_torque;
+  last_tau_task_norm_ = tau_task.norm();
+  last_tau_nullspace_raw_norm_ = tau_nullspace_raw.norm();
+  last_tau_nullspace_projected_norm_ = tau_nullspace.norm();
+  last_coriolis_norm_ = coriolis.norm();
+  last_overbudget_joint_torque_norm_ = overbudget_joint_torque.norm();
+  last_tau_desired_before_rate_limit_norm_ = tau_des.norm();
 
   const double max_delta = panda_limits::kTorqueRateLimit * std::max(dt, kMinDt);
   torque_rate_limited_last_ = false;
-  torque_rate_max_desired_delta_nm_last_ = 0.0;
-  torque_rate_limit_delta_nm_last_ = max_delta;
-  torque_rate_max_excess_nm_last_ = 0.0;
   torque_rate_max_ratio_last_ = 0.0;
-  torque_rate_max_cmd_delta_nm_last_ = 0.0;
 
   Vector7d tau_cmd = tau_cmd_prev_;
 
   for (int i = 0; i < 7; ++i) {
     const double desired_delta = tau_des(i) - tau_cmd_prev_(i);
     const double abs_desired_delta = std::abs(desired_delta);
-    torque_rate_max_desired_delta_nm_last_ =
-        std::max(torque_rate_max_desired_delta_nm_last_, abs_desired_delta);
     torque_rate_max_ratio_last_ =
         std::max(torque_rate_max_ratio_last_,
                  abs_desired_delta / std::max(max_delta, kSmallPositive));
-    torque_rate_max_excess_nm_last_ =
-        std::max(torque_rate_max_excess_nm_last_, abs_desired_delta - max_delta);
     if (abs_desired_delta > max_delta) {
       torque_rate_limited_last_ = true;
     }
@@ -2644,8 +2680,6 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
     const double delta = std::clamp(desired_delta, -max_delta, max_delta);
 
     tau_cmd(i) = tau_cmd_prev_(i) + delta;
-    torque_rate_max_cmd_delta_nm_last_ =
-        std::max(torque_rate_max_cmd_delta_nm_last_, std::abs(delta));
   }
 
   tau_cmd_prev_ = tau_cmd;
@@ -2735,14 +2769,14 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     const std::vector<double> zero_alpha(7, 0.0);
     if (robot_reachability_provider_->reachInterval(
             q, q, 0.0, zero_alpha, &current_capsules)) {
-      const Vector3d human_center =
-          human_workspace_.centerAtTime(wall_time);
+      const auto human_reach =
+          human_workspace_.handReachableSetAtTime(wall_time);
       current_workspace_distance_now =
           robot_reachability_provider_->minimumSignedDistance(
               current_capsules,
-              human_center,
-              human_center,
-              human_workspace_.motionRadius(),
+              human_reach.center,
+              human_reach.center,
+              human_reach.radius,
               &current_robot_link_index);
     } else {
       // Invalid geometry is treated as contact, never as free space.
@@ -2855,11 +2889,14 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           human_workspace_assumed_clear;
       async_input.last_commanded_sample = last_commanded_sample_;
       async_input.last_commanded_sample_valid = last_commanded_sample_valid_;
+      async_input.last_nullspace_stiffness = last_nullspace_stiffness_;
+      async_input.overbudget_joint_state = overbudget_joint_state_;
       async_input.commanded_path_time = commanded_path_time_;
       async_input.commanded_path_rate = commanded_path_rate_;
-      // The nominal generator always requests the configured path rate. The
-      // 1 kHz energy layer may retime or hold execution, but remaining energy
-      // is never an input to Ruckig.
+      // The nominal generator always requests the configured path rate.
+      // Inside the collision area, energy adaptation changes impedance gains
+      // and, for T > L_max, adds Eq. (16)-(17) joint stabilization. It never
+      // freezes effective time.
       async_input.target_path_rate = path_time_rate_target_;
       async_input.reanchor_path_kinematics = false;
       async_input.reanchor_path_rate = 0.0;
@@ -3455,7 +3492,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   if (shield_dec.executing_last_verified_monitored) {
     if (failsafe_enter_wall_time_sec_ < 0.0) {
       failsafe_enter_wall_time_sec_ = wall_time;
-      failsafe_start_time_sec_ = wall_time;
     }
   } else {
     if (failsafe_enter_wall_time_sec_ >= 0.0) {
@@ -3484,9 +3520,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       monitor_prediction_valid
           ? monitor.monitored_contact_possible
           : isCollisionPossibleMode(mode_);
-  // Prediction classifies and verifies the candidate trajectory. Runtime
-  // stiffness adaptation is deliberately separate and starts only when the
-  // current measured collision geometry overlaps the human workspace.
+  // Prediction classifies and verifies contact geometry. Runtime Eq. (14)
+  // uses the current overlap as its activation gate.
   monitor.workspace_distance_now = current_workspace_distance_now;
   monitor.current_robot_link_index = current_robot_link_index;
   monitor.robot_secure_radius = robot_reachability_provider_
@@ -3504,30 +3539,28 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           ? lastVerifiedSafetyModeForMonitor(monitor)
           : nominalSafetyModeForMonitor(monitor);
 
-  CartesianEnergyBudgetInfo cartesian_energy_info;
-  const bool contact_energy_budget_active =
-      shouldApplyCartesianEnergyBudget(monitor);
+  EnergyBudgetInfo energy_info;
+  const bool energy_budget_active =
+      shouldApplyEnergyBudget(monitor);
   const bool apply_runtime_energy_scaling =
-      enable_runtime_energy_scaling_ && contact_energy_budget_active;
-  // Energy calibration is independent of whether contact geometry is
-  // available.  In the dedicated assume-clear experiment, keep calculating
-  // measured-state K/V while leaving contact activation and runtime stiffness
-  // scaling unchanged.
+      enable_runtime_energy_scaling_ && energy_budget_active;
+  // Lachner Eq. (12) is evaluated during the complete controller lifecycle.
+  // Outside the collision area this is diagnostic/predictive measurement only:
+  // it cannot change gains, add torque, or alter trajectory timing.
   const bool track_control_energy =
-      enable_safety_monitor_ &&
-      (human_workspace_active_ || human_workspace_assumed_clear);
+      enable_safety_monitor_;
 
-  struct ContactEnergyTerms {
+  struct ControlEnergyTerms {
     bool valid{false};
     double kinetic_energy{0.0};
     double potential_energy{0.0};
+    double nullspace_potential_energy{0.0};
   };
 
   Matrix6d budget_cartesian_task_inertia = Matrix6d::Zero();
-  Matrix6d budget_cartesian_task_inertia_sqrt = Matrix6d::Zero();
   bool budget_cartesian_task_inertia_valid = false;
   const bool maintain_cartesian_energy_cache =
-      enable_safety_monitor_ && human_workspace_active_;
+      enable_safety_monitor_;
   if (maintain_cartesian_energy_cache) {
     const double cache_period =
         std::max(0.0, cartesian_energy_lambda_update_period_sec_);
@@ -3543,17 +3576,12 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
     if (cache_due) {
       Matrix6d task_inertia = Matrix6d::Zero();
-      Matrix6d task_inertia_sqrt = Matrix6d::Zero();
-      if (computeTaskInertia(inertia, J_geo, &task_inertia) &&
-          symmetricPositiveSemidefiniteSquareRoot(
-              task_inertia, &task_inertia_sqrt)) {
+      if (computeTaskInertia(inertia, J_geo, &task_inertia)) {
         cartesian_energy_task_inertia_cache_ = task_inertia;
-        cartesian_energy_task_inertia_sqrt_cache_ = task_inertia_sqrt;
         cartesian_energy_task_inertia_cache_valid_ = true;
         cartesian_energy_task_inertia_cache_wall_time_ = wall_time;
       } else {
         cartesian_energy_task_inertia_cache_.setZero();
-        cartesian_energy_task_inertia_sqrt_cache_.setZero();
         cartesian_energy_task_inertia_cache_valid_ = false;
         cartesian_energy_task_inertia_cache_wall_time_ = -1.0;
       }
@@ -3562,13 +3590,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     if (cartesian_energy_task_inertia_cache_valid_) {
       budget_cartesian_task_inertia =
           cartesian_energy_task_inertia_cache_;
-      budget_cartesian_task_inertia_sqrt =
-          cartesian_energy_task_inertia_sqrt_cache_;
       budget_cartesian_task_inertia_valid = true;
     }
   } else {
     cartesian_energy_task_inertia_cache_.setZero();
-    cartesian_energy_task_inertia_sqrt_cache_.setZero();
     cartesian_energy_task_inertia_cache_valid_ = false;
     cartesian_energy_task_inertia_cache_wall_time_ = -1.0;
   }
@@ -3581,8 +3606,9 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     return command_error;
   };
 
-  auto compute_contact_energy_terms = [&](const ImpedanceSample& command) {
-    ContactEnergyTerms terms;
+  auto compute_control_energy_terms = [&](const ImpedanceSample& command,
+                                          double nullspace_stiffness) {
+    ControlEnergyTerms terms;
     if (!track_control_energy || !inertia.allFinite() ||
         !dq.allFinite()) {
       return terms;
@@ -3618,6 +3644,12 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             0.0,
             0.5 * (command_error.transpose() *
                    stiffness_storage * command_error)(0, 0));
+    if (nullspace_stiffness > 0.0) {
+      // Lachner et al. Eqs. (5) and (12), with K_q = k_n I.
+      const Vector7d nullspace_error = desired_qn_ - q;
+      terms.nullspace_potential_energy =
+          0.5 * nullspace_stiffness * nullspace_error.squaredNorm();
+    }
     return terms;
   };
 
@@ -3626,42 +3658,49 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   // exact comparison with a predicted rollout endpoint at the corresponding
   // control-loop sequence. The command selected below belongs to the next
   // interval and would otherwise make potential-energy matching off by one.
-  const ContactEnergyTerms previous_applied_energy_terms =
+  const double previous_applied_nullspace_stiffness =
+      last_nullspace_stiffness_;
+  const ControlEnergyTerms previous_applied_energy_terms =
       last_commanded_sample_valid_
-          ? compute_contact_energy_terms(last_commanded_sample_)
-          : ContactEnergyTerms{};
+          ? compute_control_energy_terms(
+                last_commanded_sample_,
+                previous_applied_nullspace_stiffness)
+          : ControlEnergyTerms{};
 
   const ImpedanceSample candidate_budget_command = shield_dec.command;
   const Vector6d error =
       compute_error_for_command(candidate_budget_command);
-  const ContactEnergyTerms energy_budget_terms =
-      compute_contact_energy_terms(candidate_budget_command);
+  const ControlEnergyTerms energy_budget_terms =
+      compute_control_energy_terms(
+          candidate_budget_command,
+          n_stiffness_);
   // Keep the energy-budget stiffness and damping adaptation, but do not
   // freeze or retime the verified trajectory.  Path progress therefore stays
   // governed exclusively by the verified command stream.
-  shield_dec.command = applyCartesianEnergyBudget(
+  shield_dec.command = applyEnergyBudget(
       candidate_budget_command,
       energy_budget_terms.kinetic_energy,
       energy_budget_terms.potential_energy,
+      energy_budget_terms.nullspace_potential_energy,
       energy_budget_terms.valid,
       apply_runtime_energy_scaling,
-      budget_cartesian_task_inertia_sqrt,
-      budget_cartesian_task_inertia_valid,
-      &cartesian_energy_info);
-  cartesian_energy_info.lambda_valid =
+      &energy_info);
+  energy_info.lambda_valid =
       budget_cartesian_task_inertia_valid;
 
   // Runtime "current" energy always describes the command actually applied
   // in this loop, after stiffness scaling. The pre-scaling candidate energy is
-  // retained separately in CartesianEnergyBudgetInfo for diagnostics.
+  // retained separately in EnergyBudgetInfo for diagnostics.
   if (track_control_energy) {
     monitor.current_joint_energy_valid = energy_budget_terms.valid;
     monitor.current_joint_kinetic_energy =
-        cartesian_energy_info.kinetic_energy;
+        energy_info.kinetic_energy;
     monitor.current_cartesian_potential_energy =
-        cartesian_energy_info.potential_energy;
+        energy_info.potential_energy;
+    monitor.current_nullspace_potential_energy =
+        energy_info.nullspace_potential_energy;
     monitor.current_total_control_energy =
-        cartesian_energy_info.total_energy;
+        energy_info.total_energy;
     if (budget_cartesian_task_inertia_valid) {
       monitor.current_cartesian_kinetic_energy = std::max(
           0.0,
@@ -3698,16 +3737,40 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     commanded_path_rate_ = 0.0;
   }
 
-  last_cartesian_energy_budget_active_ = cartesian_energy_info.active;
-  last_cartesian_energy_budget_lambda_valid_ = cartesian_energy_info.lambda_valid;
-  last_cartesian_energy_scale_ = cartesian_energy_info.scale;
-  last_joint_kinetic_energy_ = cartesian_energy_info.kinetic_energy;
+  last_energy_budget_active_ = energy_info.active;
+  last_energy_budget_lambda_valid_ = energy_info.lambda_valid;
+  last_energy_stiffness_scale_ = energy_info.scale;
+  last_nullspace_stiffness_ = energy_info.nullspace_stiffness;
+  last_joint_kinetic_energy_ = energy_info.kinetic_energy;
   last_cartesian_potential_energy_before_scaling_ =
-      cartesian_energy_info.potential_energy_before_scaling;
-  last_cartesian_control_energy_before_scaling_ =
-      cartesian_energy_info.total_energy_before_scaling;
-  last_cartesian_potential_energy_ = cartesian_energy_info.potential_energy;
-  last_cartesian_control_energy_ = cartesian_energy_info.total_energy;
+      energy_info.potential_energy_before_scaling;
+  last_nullspace_potential_energy_before_scaling_ =
+      energy_info.nullspace_potential_energy_before_scaling;
+  last_nullspace_potential_energy_ =
+      energy_info.nullspace_potential_energy;
+  last_total_control_energy_before_scaling_ =
+      energy_info.total_energy_before_scaling;
+  last_cartesian_potential_energy_ = energy_info.potential_energy;
+  last_total_control_energy_ = energy_info.total_energy;
+
+  const cps_safety_monitor::OverbudgetJointStabilizationTerms
+      overbudget_joint_terms =
+          cps_safety_monitor::updateOverbudgetJointStabilization(
+              q,
+              energy_info.kinetic_energy,
+              energy_budget_joule_,
+              overbudget_joint_stiffness_,
+              overbudget_joint_scale_omega_,
+              enable_safety_monitor_ &&
+                  enable_overbudget_joint_stabilization_ &&
+                  energy_budget_active,
+              &overbudget_joint_state_);
+  last_overbudget_joint_potential_energy_ =
+      overbudget_joint_terms.potential_energy;
+  last_overbudget_joint_scale_rho_ =
+      overbudget_joint_terms.scale_rho;
+  last_overbudget_joint_torque_norm_ =
+      overbudget_joint_terms.torque.norm();
 
   const Vector3d desired_position_cur = shield_dec.command.p;
   const Vector3d desired_linear_velocity_cur = shield_dec.command.dp;
@@ -3732,7 +3795,10 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   const Vector7d tau_cmd = computeImpedanceTorque(
       q, dq, inertia, coriolis, J_geo,
       current_position, current_orientation,
-      shield_dec.command, contact_energy_budget_active, dt);
+      shield_dec.command,
+      energy_info.nullspace_stiffness,
+      overbudget_joint_terms.torque,
+      dt);
   const auto toc_torque = SteadyClock::now();
 
   for (int i = 0; i < kNumJoints; ++i) command_interfaces_[i].set_value(tau_cmd(i));
@@ -3744,7 +3810,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
 
   if (enable_error_logging_ && command_recording_active_ &&
       control_log_writer_.running()) {
-    const Vector3d human_center = human_workspace_.centerAtTime(wall_time);
+    const Vector3d human_center =
+        human_workspace_.handReachableSetAtTime(wall_time).center;
     const double mujoco_contact_msg_time =
         latest_mujoco_contact_msg_time_.load(std::memory_order_relaxed);
     const double mujoco_contact_sample_age =
@@ -3774,12 +3841,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(static_cast<double>(shield_dec.command.nominal_path_time_valid));
           add(commanded_path_rate_);
           add(path_time_rate_target_);
-          // Retained as zero-valued compatibility columns after removal of
-          // effective-time retiming.
-          add(0.0);
-          add(0.0);
-          add(0.0);
-          add(0.0);
           add(static_cast<double>(executionModeForLog(execution_stage_)));
           add(static_cast<double>(execution_stage_));
           add(static_cast<double>(fallback_reason_));
@@ -3815,6 +3876,12 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           for (int i = 0; i < 3; ++i) add(desired_linear_velocity_cur(i));
           for (int i = 0; i < 6; ++i) add(error(i));
           add(tau_cmd.norm());
+          add(last_tau_task_norm_);
+          add(last_tau_nullspace_raw_norm_);
+          add(last_tau_nullspace_projected_norm_);
+          add(last_overbudget_joint_torque_norm_);
+          add(last_coriolis_norm_);
+          add(last_tau_desired_before_rate_limit_norm_);
           add(static_cast<double>(torque_rate_limited_last_));
           add(torque_rate_max_ratio_last_);
           for (int i = 0; i < 3; ++i) add(K_runtime_(i, i));
@@ -3824,6 +3891,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(monitor.worst_case_cartesian_kinetic_energy_ub);
           add(monitor.worst_case_joint_kinetic_energy_ub);
           add(monitor.worst_case_cartesian_potential_energy_ub);
+          add(monitor.worst_case_nullspace_potential_energy_ub);
           add(monitor.worst_case_total_control_energy_ub);
           add(monitor.terminal_energy_ub);
           add(monitor.robot_secure_radius);
@@ -3836,6 +3904,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(static_cast<double>(monitor.current_joint_energy_valid));
           add(monitor.current_joint_kinetic_energy);
           add(monitor.current_cartesian_potential_energy);
+          add(monitor.current_nullspace_potential_energy);
           add(monitor.current_total_control_energy);
           add(static_cast<double>(monitored_steps));
           add(static_cast<double>(monitored_intended_steps));
@@ -3904,20 +3973,38 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(static_cast<double>(calibration_activation_intended_index_));
           add(static_cast<double>(calibration_activation_failsafe_index_));
           add(static_cast<double>(enable_runtime_energy_scaling_));
-          add(static_cast<double>(last_cartesian_energy_budget_active_));
-          add(0.0);
-          add(static_cast<double>(last_cartesian_energy_budget_lambda_valid_));
-          add(last_cartesian_energy_scale_);
+          add(static_cast<double>(last_energy_budget_active_));
+          add(static_cast<double>(last_energy_budget_lambda_valid_));
+          add(last_energy_stiffness_scale_);
           add(last_joint_kinetic_energy_);
           add(last_cartesian_potential_energy_before_scaling_);
-          add(last_cartesian_control_energy_before_scaling_);
+          add(last_nullspace_potential_energy_before_scaling_);
+          add(last_total_control_energy_before_scaling_);
           add(last_cartesian_potential_energy_);
-          add(last_cartesian_control_energy_);
+          add(last_nullspace_potential_energy_);
+          add(static_cast<double>(enable_nullspace_));
+          add(n_stiffness_);
+          add(last_nullspace_stiffness_);
+          add(last_total_control_energy_);
+          add(static_cast<double>(
+              enable_overbudget_joint_stabilization_));
+          add(static_cast<double>(overbudget_joint_state_.active));
+          add(overbudget_joint_stiffness_);
+          add(overbudget_joint_scale_omega_);
+          add(last_overbudget_joint_potential_energy_);
+          add(last_overbudget_joint_scale_rho_);
+          for (int i = 0; i < 7; ++i) {
+            add(overbudget_joint_state_.reference(i));
+          }
           add(static_cast<double>(previous_applied_energy_terms.valid));
           add(previous_applied_energy_terms.kinetic_energy);
           add(previous_applied_energy_terms.potential_energy);
+          add(previous_applied_energy_terms.nullspace_potential_energy);
+          add(static_cast<double>(
+              previous_applied_nullspace_stiffness > 0.0));
           add(previous_applied_energy_terms.kinetic_energy +
-              previous_applied_energy_terms.potential_energy);
+              previous_applied_energy_terms.potential_energy +
+              previous_applied_energy_terms.nullspace_potential_energy);
           add(energy_budget_joule_);
           add(latest_mujoco_contact_value_.load(std::memory_order_relaxed));
           add(static_cast<double>(
@@ -4062,22 +4149,26 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
 
     auto_declare<double>("pos_stiffness", 400.0);
     auto_declare<double>("rot_stiffness", 20.0);
+    auto_declare<bool>("enable_nullspace", false);
     auto_declare<double>("n_stiffness", 0.0);
     auto_declare<std::vector<double>>(
         "nullspace_home_pose", defaultNullspaceHomePoseParameter());
-    auto_declare<bool>("disable_nullspace_in_failsafe", true);
     auto_declare<bool>("enable_safety_monitor", true);
 
     auto_declare<double>("energy_budget_joule", 0.05);
     auto_declare<double>("kinetic_energy_error_bound_joule", 0.0);
     auto_declare<double>("potential_energy_error_bound_joule", 0.0);
+    auto_declare<double>(
+        "nullspace_potential_energy_error_bound_joule", 0.0);
     auto_declare<bool>("enable_runtime_energy_scaling", true);
+    auto_declare<bool>(
+        "enable_overbudget_joint_stabilization", true);
+    auto_declare<double>("overbudget_joint_stiffness", 1.0);
+    auto_declare<double>("overbudget_joint_scale_omega", 40.0);
     auto_declare<bool>("enable_calibration_logging", false);
     auto_declare<bool>("calibration_assume_no_human", false);
     auto_declare<double>("calibration_capture_path_time_sec", 0.0);
-    auto_declare<double>("cartesian_energy_min_pos_stiffness", 0.0);
     auto_declare<double>("cartesian_energy_lambda_update_period_sec", 0.001);
-    auto_declare<double>("cartesian_energy_damping_ratio", 0.8);
     auto_declare<double>("ee_collision_radius", 0.04);
     auto_declare<std::vector<double>>(
         "tcp_offset", std::vector<double>{0.0, 0.0, 0.0});
@@ -4311,7 +4402,12 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         get_node()->get_parameter("pos_stiffness").as_double();
     const double rot_stiffness =
         get_node()->get_parameter("rot_stiffness").as_double();
-    n_stiffness_ = get_node()->get_parameter("n_stiffness").as_double();
+    enable_nullspace_ =
+        get_node()->get_parameter("enable_nullspace").as_bool();
+    const double configured_nullspace_stiffness = std::max(
+        0.0, get_node()->get_parameter("n_stiffness").as_double());
+    n_stiffness_ =
+        enable_nullspace_ ? configured_nullspace_stiffness : 0.0;
     nullspace_home_pose_.setZero();
     nullspace_home_pose_valid_ = false;
     const auto nullspace_home_pose =
@@ -4339,7 +4435,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
           "nullspace_home_pose must contain 7 joint values. Falling back "
           "to the activation joint state for the nullspace reference.");
     }
-    disable_nullspace_in_failsafe_ = get_node()->get_parameter("disable_nullspace_in_failsafe").as_bool();
     enable_safety_monitor_ = get_node()->get_parameter("enable_safety_monitor").as_bool();
 
     energy_budget_joule_ =
@@ -4352,8 +4447,22 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         0.0,
         get_node()->get_parameter(
             "potential_energy_error_bound_joule").as_double());
+    nullspace_potential_energy_error_bound_joule_ = std::max(
+        0.0,
+        get_node()->get_parameter(
+            "nullspace_potential_energy_error_bound_joule").as_double());
     enable_runtime_energy_scaling_ =
         get_node()->get_parameter("enable_runtime_energy_scaling").as_bool();
+    enable_overbudget_joint_stabilization_ =
+        get_node()
+            ->get_parameter("enable_overbudget_joint_stabilization")
+            .as_bool();
+    overbudget_joint_stiffness_ = std::max(
+        0.0,
+        get_node()->get_parameter("overbudget_joint_stiffness").as_double());
+    overbudget_joint_scale_omega_ = std::max(
+        0.0,
+        get_node()->get_parameter("overbudget_joint_scale_omega").as_double());
     enable_calibration_logging_ =
         get_node()
             ->get_parameter("enable_calibration_logging")
@@ -4363,15 +4472,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
             ->get_parameter("calibration_assume_no_human")
             .as_bool();
 
-    cartesian_energy_min_pos_stiffness_ =
-        std::max(0.0, get_node()->get_parameter("cartesian_energy_min_pos_stiffness").as_double());
     cartesian_energy_lambda_update_period_sec_ =
         std::max(0.0, get_node()->get_parameter("cartesian_energy_lambda_update_period_sec").as_double());
-    cartesian_energy_damping_ratio_ = std::clamp(
-        get_node()->get_parameter("cartesian_energy_damping_ratio").as_double(),
-        0.0,
-        1.0);
-
     ee_collision_radius_ = get_node()->get_parameter("ee_collision_radius").as_double();
     const auto tcp_offset =
         get_node()->get_parameter("tcp_offset").as_double_array();
@@ -4642,11 +4744,12 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         get_node()->get_parameter("human_workspace_config_path").as_string();
     if (enable_safety_monitor_) {
       if (!human_workspace_config_path.empty()) {
-        if (!human_workspace_.configureFromConfigFile(
+        if (!configured_human_workspace_source_.configureFromConfigFile(
                 human_workspace_config_path,
                 get_node()->get_logger())) {
           return CallbackReturn::ERROR;
         }
+        human_workspace_ = configured_human_workspace_source_;
         human_workspace_configured_static_ = true;
         human_workspace_active_ = true;
       } else {
@@ -4944,7 +5047,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   execution_stage_ = ExecutionStage::kCurrentVerified;
   fallback_reason_ = FallbackReason::kNone;
   plan_failure_reason_ = PlanFailureReason::kNone;
-  failsafe_start_time_sec_ = -1.0;
   failsafe_enter_wall_time_sec_ = -1.0;
   paused_nominal_time_sec_ = 0.0;
   loop_counter_ = 0; exec_sum_ms_ = 0.0; exec_min_ms_ = 1e9; exec_max_ms_ = 0.0;
@@ -4976,16 +5078,28 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   latest_mujoco_contact_active_.store(false);
 
   monitor_counter_ = 0;
-  last_cartesian_energy_budget_active_ = false;
-  last_cartesian_energy_budget_lambda_valid_ = false;
-  last_cartesian_energy_scale_ = 1.0;
+  last_energy_budget_active_ = false;
+  last_energy_budget_lambda_valid_ = false;
+  last_energy_stiffness_scale_ = 1.0;
+  last_nullspace_stiffness_ = 0.0;
   last_joint_kinetic_energy_ = 0.0;
   last_cartesian_potential_energy_before_scaling_ = 0.0;
-  last_cartesian_control_energy_before_scaling_ = 0.0;
+  last_nullspace_potential_energy_before_scaling_ = 0.0;
+  last_nullspace_potential_energy_ = 0.0;
+  last_total_control_energy_before_scaling_ = 0.0;
   last_cartesian_potential_energy_ = 0.0;
-  last_cartesian_control_energy_ = 0.0;
+  last_total_control_energy_ = 0.0;
+  overbudget_joint_state_ =
+      cps_safety_monitor::OverbudgetJointStabilizationState{};
+  last_overbudget_joint_potential_energy_ = 0.0;
+  last_overbudget_joint_scale_rho_ = 1.0;
+  last_overbudget_joint_torque_norm_ = 0.0;
+  last_tau_task_norm_ = 0.0;
+  last_tau_nullspace_raw_norm_ = 0.0;
+  last_tau_nullspace_projected_norm_ = 0.0;
+  last_coriolis_norm_ = 0.0;
+  last_tau_desired_before_rate_limit_norm_ = 0.0;
   cartesian_energy_task_inertia_cache_.setZero();
-  cartesian_energy_task_inertia_sqrt_cache_.setZero();
   cartesian_energy_task_inertia_cache_valid_ = false;
   cartesian_energy_task_inertia_cache_wall_time_ = -1.0;
   last_verified_plan_ = VerifiedPlan{};
@@ -5078,7 +5192,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << log_flush_period_sec_ << "\n"
                     << "recording_start: first_valid_via_points_command\n"
                     << "arm_id: " << arm_id_ << "\n"
-                    << "state_log_schema: orthogonal_execution_v5\n"
+                    << "state_log_schema: orthogonal_execution_v10\n"
                     << "mode_legend: 0=current_verified_execution, "
                        "1=fallback_execution\n"
                     << "execution_stage_legend: 0=current_verified, "
@@ -5177,25 +5291,43 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << trajectory_generator_config_path_ << "\n"
                     << "shield_plan_dt: " << shield_plan_dt_ << "\n"
                     << "monitor_sparse_dt: " << shield_plan_dt_ << "\n"
+                    << "monitor_joint_rollout_max_dt: "
+                    << shield_plan_dt_ << "\n"
                     << "local_replan_dt: " << local_replan_dt_ << "\n"
                     << "failsafe_plan_dt: "
-                    << std::max(shield_plan_dt_, local_replan_dt_) << "\n"
+                    << std::max(local_replan_dt_, kMinDt) << "\n"
                     << "failsafe_command_dt: " << local_replan_dt_ << "\n"
                     << "cartesian_gain_policy: "
-                       "single_base_gain_with_runtime_energy_scaling\n"
+                       "contact_gated_shared_cartesian_nullspace_"
+                       "energy_scaling\n"
                     << "pos_stiffness: " << K_base_(0, 0) << "\n"
                     << "rot_stiffness: " << K_base_(3, 3) << "\n"
                     << "pos_damping: " << D_base_(0, 0) << "\n"
                     << "rot_damping: " << D_base_(3, 3) << "\n"
+                    << "enable_nullspace: "
+                    << static_cast<int>(enable_nullspace_) << "\n"
+                    << "nullspace_stiffness: " << n_stiffness_ << "\n"
+                    << "nullspace_reference: "
+                    << desired_qn_.transpose() << "\n"
                     << "energy_budget_joule: "
                     << energy_budget_joule_ << "\n"
                     << "kinetic_energy_error_bound_joule: "
                     << kinetic_energy_error_bound_joule_ << "\n"
                     << "potential_energy_error_bound_joule: "
                     << potential_energy_error_bound_joule_ << "\n"
+                    << "nullspace_potential_energy_error_bound_joule: "
+                    << nullspace_potential_energy_error_bound_joule_ << "\n"
                     << "enable_runtime_energy_scaling: "
                     << static_cast<int>(enable_runtime_energy_scaling_)
                     << "\n"
+                    << "enable_overbudget_joint_stabilization: "
+                    << static_cast<int>(
+                           enable_overbudget_joint_stabilization_)
+                    << "\n"
+                    << "overbudget_joint_stiffness: "
+                    << overbudget_joint_stiffness_ << "\n"
+                    << "overbudget_joint_scale_omega: "
+                    << overbudget_joint_scale_omega_ << "\n"
                     << "enable_calibration_logging: "
                     << static_cast<int>(
                            enable_calibration_logging_)
@@ -5219,19 +5351,20 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "calibration_prediction_sampling: "
                        "exact_runtime_command_grid_and_indices\n"
                     << "measured_energy_tracking_policy: "
-                       "fresh_human_workspace_or_calibration_assume_clear\n"
-                    << "measured_energy_tracking_changes_runtime_scaling: 0\n"
-                    << "cartesian_energy_min_pos_stiffness: "
-                    << cartesian_energy_min_pos_stiffness_ << "\n"
+                       "global_diagnostics_only_no_control_action\n"
+                    << "measured_energy_tracking_feeds_scaling_when_active: "
+                       "1\n"
                     << "cartesian_energy_lambda_update_period_sec: "
                     << cartesian_energy_lambda_update_period_sec_ << "\n"
-                    << "cartesian_energy_damping_ratio: "
-                    << cartesian_energy_damping_ratio_ << "\n"
-                    << "cartesian_energy_activation: "
+                    << "energy_budget_activation: "
                        "current_workspace_overlap_only\n"
+                    << "prediction_energy_scaling_policy: "
+                       "same_predicted_current_workspace_overlap_gate_"
+                       "as_runtime\n"
+                    << "overbudget_joint_stabilization_policy: "
+                       "current_workspace_overlap_and_T_gt_Lmax_only\n"
                     << "contact_relevant_for_energy_legend: "
                        "1=workspace_distance_now_nonpositive\n"
-                    << "cartesian_effective_time_freeze_enabled: 0\n"
                     << "nullspace_home_pose: ["
                     << nullspace_home_pose_(0) << ", "
                     << nullspace_home_pose_(1) << ", "
@@ -5282,7 +5415,20 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << human_workspace_.centerSinusoidPhaseRad() << "\n"
                     << "human_center_motion_time_offset_sec: "
                     << human_workspace_.centerMotionTimeOffsetSec() << "\n"
-                    << "human_motion_radius: " << human_workspace_.motionRadius() << "\n"
+                    << "human_hand_physical_radius: "
+                    << human_workspace_.motionRadius() << "\n"
+                    << "human_reachability_model: "
+                    << "sara_body_part_combined_single_hand\n"
+                    << "human_hand_max_velocity: "
+                    << human_workspace_.handMaxVelocity() << "\n"
+                    << "human_hand_max_acceleration: "
+                    << human_workspace_.handMaxAcceleration() << "\n"
+                    << "human_measurement_error_position: "
+                    << human_workspace_.measurementErrorPosition() << "\n"
+                    << "human_measurement_error_velocity: "
+                    << human_workspace_.measurementErrorVelocity() << "\n"
+                    << "human_measurement_delay: "
+                    << human_workspace_.measurementDelay() << "\n"
                     << "human_workspace_config_path: "
                     << human_workspace_config_path << "\n";
     }

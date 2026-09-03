@@ -132,10 +132,19 @@ ament_export_dependencies(
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  ament_add_gtest(test_human_workspace
+    test/test_human_workspace.cpp
+  )
+  target_link_libraries(test_human_workspace
+    ${HUMAN_WORKSPACE_MODEL_TARGET}
+    Eigen3::Eigen
+  )
 endif()
 
 ament_package()

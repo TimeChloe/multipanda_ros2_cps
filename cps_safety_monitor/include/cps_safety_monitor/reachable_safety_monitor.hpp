@@ -24,6 +24,40 @@ using Vector6d = Eigen::Matrix<double, 6, 1>;
 using Vector7d = Eigen::Matrix<double, 7, 1>;
 using Quaterniond = Eigen::Quaterniond;
 
+// Lachner et al. Eq. (14). The same scale must be applied to every
+// controlled elastic potential (Cartesian and joint/nullspace). Damping is
+// scaled by sqrt(scale) by the impedance controller.
+double energyBudgetStiffnessScale(double kinetic_energy,
+                                  double cartesian_potential_energy,
+                                  double nullspace_potential_energy,
+                                  double energy_budget);
+
+// Lachner et al. Eqs. (16)-(17). Callers enable this only in the human
+// collision area. q_star is captured on the first enabled cycle for which
+// T > L_max and retained until the budget is recovered or the area is exited.
+// This additional joint potential is distinct from the normal projected
+// nullspace potential U_q.
+struct OverbudgetJointStabilizationState {
+  bool active{false};
+  Vector7d reference{Vector7d::Zero()};
+};
+
+struct OverbudgetJointStabilizationTerms {
+  bool active{false};
+  double potential_energy{0.0};
+  double scale_rho{1.0};
+  Vector7d torque{Vector7d::Zero()};
+};
+
+OverbudgetJointStabilizationTerms updateOverbudgetJointStabilization(
+    const Vector7d& q,
+    double kinetic_energy,
+    double energy_budget,
+    double joint_stiffness,
+    double scale_omega,
+    bool enabled,
+    OverbudgetJointStabilizationState* state);
+
 // Robot-model quantities evaluated at one predicted joint state.  The safety
 // monitor deliberately depends on this small interface instead of a concrete
 // rigid-body library, so a controller can use either its hardware model or a
@@ -63,6 +97,17 @@ struct JointPredictionSample {
   bool energy_valid{false};
   double joint_kinetic_energy{0.0};
   double cartesian_potential_energy{0.0};
+  double nullspace_potential_energy{0.0};
+  bool nullspace_potential_energy_active{false};
+  // True when Eq. (14) was active for the rollout interval ending at this
+  // sample. For the initial sample it records the current-state gate.
+  bool energy_scaling_active{false};
+  double energy_stiffness_scale{1.0};
+  double applied_nullspace_stiffness{0.0};
+  bool overbudget_joint_stabilization_active{false};
+  double overbudget_joint_potential_energy{0.0};
+  double overbudget_joint_scale_rho{1.0};
+  double overbudget_joint_torque_norm{0.0};
 };
 
 class JointDynamicsProvider {
@@ -132,9 +177,8 @@ std::string defaultSaraPandaRobotConfigPath();
 
 struct MonitorResult {
   bool monitored_contact_possible{false};
-  // Current measured collision geometry overlaps the human workspace. This is
-  // the runtime Cartesian energy-budget gate; predicted contact remains a
-  // separate candidate-verification input in monitored_contact_possible.
+  // Current measured collision geometry overlaps the human workspace. This
+  // is also the runtime activation gate for Eq. (14) stiffness scaling.
   bool contact_relevant_for_energy{false};
   bool monitored_unsafe{false};
   // Predicted collision energy exceeds the configured budget, or a predicted
@@ -166,9 +210,11 @@ struct MonitorResult {
   double worst_case_contact_time{0.0};
   double worst_case_workspace_distance_at_candidate{0.0};
   // Cartesian projection retained for diagnosis at the worst monitored
-  // contact sample. Candidate gating uses joint kinetic + Cartesian potential.
+  // contact sample. Candidate gating uses joint kinetic + Cartesian and
+  // nullspace potential energy, following Lachner et al. Eq. (12).
   double worst_case_cartesian_kinetic_energy_ub{0.0};
   double worst_case_cartesian_potential_energy_ub{0.0};
+  double worst_case_nullspace_potential_energy_ub{0.0};
   double worst_case_cartesian_control_energy_ub{0.0};
   // Paper-consistent total kinetic energy 1/2 dq^T M(q) dq.  Cartesian
   // kinetic values above are retained as diagnostics only.
@@ -182,6 +228,7 @@ struct MonitorResult {
   double current_cartesian_control_energy{0.0};
   bool current_cartesian_energy_valid{false};
   double current_joint_kinetic_energy{0.0};
+  double current_nullspace_potential_energy{0.0};
   double current_total_control_energy{0.0};
   bool current_joint_energy_valid{false};
 
@@ -291,10 +338,12 @@ struct SafetyMonitorConfig {
   double energy_budget_joule{0.05};
   // Direct one-sided energy-model error bounds. These affect energy
   // verification only; they do not enlarge the robot reachable occupancy:
-  // K_real <= K_pred + kinetic_energy_error_bound_joule and
-  // V_real <= V_pred + potential_energy_error_bound_joule.
+  // K_real <= K_pred + kinetic_energy_error_bound_joule,
+  // Vx_real <= Vx_pred + potential_energy_error_bound_joule, and
+  // Vn_real <= Vn_pred + nullspace_potential_energy_error_bound_joule.
   double kinetic_energy_error_bound_joule{0.0};
   double potential_energy_error_bound_joule{0.0};
+  double nullspace_potential_energy_error_bound_joule{0.0};
   // When set, all robot collision geometry is produced from the predicted
   // joint-state intervals by SaRA RobotArmReach.  Tracking/model uncertainty
   // is already contained once in its secure_radius.
@@ -304,10 +353,23 @@ struct SafetyMonitorConfig {
   double tracking_acc_error_bound{0.2};
   bool use_dynamic_consistent_impedance{true};
   Vector7d nullspace_reference{Vector7d::Zero()};
+  // Effective nominal stiffness. A value of zero means nullspace control is
+  // globally disabled for the complete intended and fail-safe execution.
   double nullspace_stiffness{0.0};
-  // Keep the joint rollout consistent with controllers that remove
-  // nullspace torque while executing their fail-safe trajectory.
-  bool disable_nullspace_in_failsafe{false};
+  // Actual (possibly energy-scaled) stiffness that produced the measured
+  // current state. Future rollout samples use nullspace_stiffness.
+  double current_nullspace_stiffness{0.0};
+  // Model the same contact-gated Eq. (14) stiffness adaptation used by the
+  // runtime controller. Each rollout state evaluates its own workspace
+  // overlap before selecting the gains for the following interval.
+  bool enable_runtime_energy_scaling{false};
+  // Contact-gated Eqs. (16)-(17) emergency joint stabilization state and
+  // parameters. Each rollout state uses the same current-overlap gate as the
+  // runtime controller.
+  bool enable_overbudget_joint_stabilization{false};
+  double overbudget_joint_stiffness{1.0};
+  double overbudget_joint_scale_omega{40.0};
+  OverbudgetJointStabilizationState overbudget_joint_state;
   Vector7d previous_torque_command{Vector7d::Zero()};
   bool previous_torque_command_valid{false};
   double torque_rate_limit{1000.0};
@@ -323,6 +385,10 @@ MonitorResult verifyReachablePlanJointSpace(
     const SafetyMonitorConfig& config,
     std::vector<JointPredictionSample>* prediction_trace = nullptr);
 
+// Cartesian-only fallback for configurations without a joint dynamics
+// provider. It fails closed for every configured joint-space energy feature
+// because a Cartesian state cannot represent complete joint kinetic energy,
+// U_q, or the Eq. (16)-(17) q_star stabilizer.
 MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
                                   const Vector3d& current_position,
                                   const Quaterniond& current_orientation,

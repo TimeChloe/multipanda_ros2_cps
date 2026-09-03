@@ -20,6 +20,8 @@ namespace
 
 constexpr double kMinimumCapsuleLength = 1.0e-9;
 constexpr char kReachableSetNamespace[] = "sara_robot_reachable_set";
+constexpr char kLegacyHumanReachableSetNamespace[] =
+  "sara_human_hand_reachable_set";
 
 enum class ReachableSetContactState
 {
@@ -81,6 +83,17 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
   const rclcpp::Time stamp = get_node()->now();
   const auto marker_lifetime =
     rclcpp::Duration::from_seconds(1.0);
+
+  // Remove the duplicated human marker published by older controller builds.
+  // Human visualization is owned exclusively by cps_human_workspace.
+  visualization_msgs::msg::Marker legacy_human_marker;
+  legacy_human_marker.header.frame_id = reachable_set_visualization_frame_id_;
+  legacy_human_marker.header.stamp = stamp;
+  legacy_human_marker.ns = kLegacyHumanReachableSetNamespace;
+  legacy_human_marker.id = 0;
+  legacy_human_marker.action = visualization_msgs::msg::Marker::DELETE;
+  marker_array.markers.push_back(std::move(legacy_human_marker));
+
   int marker_id = 0;
   const auto & trace = snapshot.joint_prediction_trace;
   const std::vector<double> zero_alpha(7, 0.0);
@@ -164,7 +177,6 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
 
   auto capsule_intersections = [&](
       const std::vector<cps_safety_monitor::RobotReachCapsule> & capsules,
-      double start_time,
       double goal_time,
       std::vector<bool> * intersections) {
       if (intersections == nullptr) {
@@ -177,22 +189,18 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
         return true;
       }
 
-      const Vector3d human_center_start =
-        snapshot.human_workspace.centerAtTime(
-        snapshot.wall_time + start_time);
-      const Vector3d human_center_end =
-        snapshot.human_workspace.centerAtTime(
+      const auto hand_reach =
+        snapshot.human_workspace.handReachableSetAtTime(
         snapshot.wall_time + goal_time);
-      const double human_radius = snapshot.human_workspace.motionRadius();
       for (std::size_t index = 0; index < capsules.size(); ++index) {
         const std::vector<cps_safety_monitor::RobotReachCapsule>
         single_capsule{capsules[index]};
         const double distance =
           robot_reachability_provider_->minimumSignedDistance(
           single_capsule,
-          human_center_start,
-          human_center_end,
-          human_radius);
+          hand_reach.center,
+          hand_reach.center,
+          hand_reach.radius);
         if (!std::isfinite(distance)) {
           return false;
         }
@@ -235,7 +243,7 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
         0.0,
         zero_alpha,
         &capsules) &&
-        capsule_intersections(capsules, 0.0, 0.0, &intersections))
+        capsule_intersections(capsules, 0.0, &intersections))
       {
         append_interval(
           capsules,
@@ -283,7 +291,7 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
           dynamic_alpha,
           &capsules) &&
         capsule_intersections(
-          capsules, start.t, goal.t, &intersections))
+          capsules, goal.t, &intersections))
       {
         append_interval(
           capsules,

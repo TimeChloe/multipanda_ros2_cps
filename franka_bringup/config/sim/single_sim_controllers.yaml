@@ -233,7 +233,14 @@ reachable_cartesian_impedance_controller:
     pos_stiffness: 1500.0
     rot_stiffness: 500.0
 
-    n_stiffness: 20.0
+    # Global nullspace mode. When false, the effective nullspace stiffness is
+    # zero for intended motion, contact handling and failsafe execution. When
+    # true, the spring remains present in every stage and shares the Lachner
+    # energy-budget stiffness scale with the Cartesian impedance.
+    # Paper-faithful default (Appendix C): K_q = 0. Set both values explicitly
+    # to opt into the fixed-home projected nullspace extension.
+    enable_nullspace: false
+    n_stiffness: 0.0
     # Panda home/ready joint pose used as the nullspace reference when
     # n_stiffness is enabled.
     nullspace_home_pose:
@@ -244,8 +251,6 @@ reachable_cartesian_impedance_controller:
       - 0.0
       - 1.5707963267948966
       - 0.7853981633974483
-    disable_nullspace_in_failsafe: true
-
     enable_safety_monitor: true
 
     energy_budget_joule: 0.12
@@ -254,19 +259,25 @@ reachable_cartesian_impedance_controller:
     # measured-minus-predicted impedance potential-energy residual. They do
     # not inflate collision geometry and must be recalibrated on real Panda.
     kinetic_energy_error_bound_joule: 0.0
-    potential_energy_error_bound_joule: 0.027
-    # Normal safety-monitor mode applies runtime energy scaling when contact
-    # is currently relevant. Disable this only for calibration experiments.
+    potential_energy_error_bound_joule: 0.000
+    # One-sided residual bound for Lachner's joint/nullspace potential
+    # U_n = 0.5 * n_stiffness * ||nullspace_home_pose - q||^2. Calibrate
+    # independently from the Cartesian potential residual above.
+    nullspace_potential_energy_error_bound_joule: 0.0
+    # T + U_x + U_n is measured throughout execution. Lachner Eq. (14) scales
+    # Cartesian and nullspace gains only while the current robot occupancy
+    # overlaps the human workspace. Disable this for calibration experiments.
     enable_runtime_energy_scaling: true
+    # Lachner Eqs. (16)-(17): only while the current robot occupancy overlaps
+    # the human workspace, capture q* when measured joint kinetic energy first
+    # exceeds L_max and apply rho*K_q^*(q*-q) until T <= L_max or overlap ends.
+    enable_overbudget_joint_stabilization: true
+    overbudget_joint_stiffness: 1.0
+    overbudget_joint_scale_omega: 40.0
     # Dense prediction/provenance logging used by the separate calibration
     # action. The ordinary follow_cartesian_via_points action is unchanged.
     enable_calibration_logging: false
-    cartesian_energy_min_pos_stiffness: 0.0
     cartesian_energy_lambda_update_period_sec: 0.001
-    # Lachner Eq. (9a): modal Cartesian damping ratio used with the current
-    # task inertia and the energy-scaled 6D stiffness matrix.
-    cartesian_energy_damping_ratio: 0.8
-
     # Collision model for the safety monitor:
     # center = metal ball center = panda_link8 + [0, 0, 0.03].
     # tcp_offset keeps Cartesian control at the metal-ball TCP
@@ -314,4 +325,4 @@ reachable_cartesian_impedance_controller:
     mujoco_contact_sensor_topic: /panda_metal_ball_touch
     mujoco_contact_threshold: 1.0e-6
 
-    use_dynamic_consistent_impedance: false
+    use_dynamic_consistent_impedance: true

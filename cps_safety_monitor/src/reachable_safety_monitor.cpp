@@ -7,6 +7,85 @@
 
 namespace cps_safety_monitor {
 
+double energyBudgetStiffnessScale(double kinetic_energy,
+                                  double cartesian_potential_energy,
+                                  double nullspace_potential_energy,
+                                  double energy_budget) {
+  if (!std::isfinite(kinetic_energy) ||
+      !std::isfinite(cartesian_potential_energy) ||
+      !std::isfinite(nullspace_potential_energy) ||
+      !std::isfinite(energy_budget)) {
+    return 0.0;
+  }
+
+  const double kinetic = std::max(0.0, kinetic_energy);
+  const double cartesian_potential =
+      std::max(0.0, cartesian_potential_energy);
+  const double nullspace_potential =
+      std::max(0.0, nullspace_potential_energy);
+  const double budget = std::max(0.0, energy_budget);
+  const double total_potential =
+      cartesian_potential + nullspace_potential;
+
+  if (kinetic > budget) {
+    return 0.0;
+  }
+  if (kinetic + total_potential <= budget) {
+    return 1.0;
+  }
+  if (total_potential <= 0.0) {
+    return 0.0;
+  }
+  return std::clamp((budget - kinetic) / total_potential, 0.0, 1.0);
+}
+
+OverbudgetJointStabilizationTerms updateOverbudgetJointStabilization(
+    const Vector7d& q,
+    double kinetic_energy,
+    double energy_budget,
+    double joint_stiffness,
+    double scale_omega,
+    bool enabled,
+    OverbudgetJointStabilizationState* state) {
+  OverbudgetJointStabilizationTerms terms;
+  if (state == nullptr) {
+    return terms;
+  }
+
+  const bool inputs_valid =
+      q.allFinite() && std::isfinite(kinetic_energy) &&
+      std::isfinite(energy_budget) && std::isfinite(joint_stiffness) &&
+      std::isfinite(scale_omega);
+  if (!enabled || !inputs_valid || joint_stiffness <= 0.0 ||
+      scale_omega <= 0.0) {
+    *state = OverbudgetJointStabilizationState{};
+    return terms;
+  }
+
+  const double kinetic = std::max(0.0, kinetic_energy);
+  const double budget = std::max(0.0, energy_budget);
+  if (kinetic <= budget) {
+    *state = OverbudgetJointStabilizationState{};
+    return terms;
+  }
+
+  if (!state->active || !state->reference.allFinite()) {
+    state->active = true;
+    state->reference = q;
+  }
+
+  const double stiffness = std::max(0.0, joint_stiffness);
+  const Vector7d displacement = state->reference - q;
+  terms.active = true;
+  terms.potential_energy =
+      0.5 * stiffness * displacement.squaredNorm();
+  terms.scale_rho =
+      std::max(0.0, scale_omega) * kinetic /
+      std::max(1.0e-12, budget + terms.potential_energy);
+  terms.torque = terms.scale_rho * stiffness * displacement;
+  return terms;
+}
+
 namespace {
 
 constexpr double kMinDt = 1.0e-6;
@@ -73,6 +152,17 @@ double quadraticEnergy(const Vector6d& state,
       0.0, 0.5 * (state.transpose() * metric_psd * state)(0, 0));
 }
 
+double nullspacePotentialEnergy(const Vector7d& q,
+                                const Vector7d& reference,
+                                double stiffness) {
+  if (!q.allFinite() || !reference.allFinite() ||
+      !std::isfinite(stiffness)) {
+    return 0.0;
+  }
+  const Vector7d error = reference - q;
+  return 0.5 * std::max(0.0, stiffness) * error.squaredNorm();
+}
+
 double orientationInducedPositionError(double offset_norm,
                                        double orientation_error_bound) {
   constexpr double kPi = 3.14159265358979323846;
@@ -92,24 +182,31 @@ double trackingGeometryInflation(double position_error_bound,
 
 struct EnergyUpperBound {
   double kinetic{0.0};
-  double potential{0.0};
+  double cartesian_potential{0.0};
+  double nullspace_potential{0.0};
 
-  double total() const { return kinetic + potential; }
+  double total() const {
+    return kinetic + cartesian_potential + nullspace_potential;
+  }
 };
 
 EnergyUpperBound addOneSidedEnergyErrorBounds(
     double nominal_kinetic,
-    double nominal_potential,
+    double nominal_cartesian_potential,
+    double nominal_nullspace_potential,
     double kinetic_error_bound,
-    double potential_error_bound) {
+    double cartesian_potential_error_bound,
+    double nullspace_potential_error_bound) {
   // Tracking-pose tubes intentionally do not enter this function. They are
   // geometry bounds, whereas beta_K and beta_V directly bound the residuals
   // of their corresponding predicted energy terms.
   return EnergyUpperBound{
       std::max(0.0, nominal_kinetic) +
           std::max(0.0, kinetic_error_bound),
-      std::max(0.0, nominal_potential) +
-          std::max(0.0, potential_error_bound)};
+      std::max(0.0, nominal_cartesian_potential) +
+          std::max(0.0, cartesian_potential_error_bound),
+      std::max(0.0, nominal_nullspace_potential) +
+          std::max(0.0, nullspace_potential_error_bound)};
 }
 
 double maxBlockRadius(const Matrix6d& tube, int block_start) {
@@ -158,13 +255,28 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
                                   const SafetyMonitorConfig& config) {
   MonitorResult out;
 
+  // This fallback has no joint trajectory and therefore cannot evaluate the
+  // complete T, U_q, contact-gated Eq. (14) scaling, or Eqs. (16)-(17) joint
+  // torque.
+  // Never authorize a plan by silently omitting any configured joint-space
+  // energy behavior; use verifyReachablePlanJointSpace instead.
+  if (config.nullspace_stiffness > 0.0 ||
+      config.current_nullspace_stiffness > 0.0 ||
+      config.enable_runtime_energy_scaling ||
+      config.enable_overbudget_joint_stabilization) {
+    out.joint_limit_unsafe = true;
+    out.predicted_trigger = true;
+    out.monitored_unsafe = true;
+    return out;
+  }
+
   Vector3d x_pred = current_position;
   Vector3d v_pred = ee_twist.head<3>();
   Quaterniond q_pred = current_orientation.normalized();
   Vector3d w_pred = ee_twist.tail<3>();
 
   const Eigen::LDLT<Matrix7d> inertia_ldlt(inertia);
-  Matrix7d inertia_inv = Matrix7d::Zero();
+  Matrix7d inertia_inv;
   if (inertia_ldlt.info() == Eigen::Success) {
     inertia_inv = inertia_ldlt.solve(Matrix7d::Identity());
   } else {
@@ -356,10 +468,12 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     const EnergyUpperBound energy_ub = addOneSidedEnergyErrorBounds(
         quadraticEnergy(next_twist, cartesian_inertia),
         quadraticEnergy(next_pose_error, K_cartesian),
+        0.0,
         kinetic_energy_error_bound,
-        potential_energy_error_bound);
+        potential_energy_error_bound,
+        0.0);
     const double cartesian_T_ub = energy_ub.kinetic;
-    const double cartesian_V_ub = energy_ub.potential;
+    const double cartesian_V_ub = energy_ub.cartesian_potential;
 
     const bool contact_possible_step = d_segment <= 0.0;
     if (contact_possible_step && out.first_contact_interval_index < 0) {
@@ -446,9 +560,8 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   out.worst_case_total_control_energy_ub = E_contact_max;
   out.terminal_energy_ub = terminal_T_ub + terminal_V_ub;
 
-  // Keep runtime energy adaptation orthogonal to candidate verification:
-  // current geometry gates the runtime stiffness budget, while any predicted
-  // contact in the complete monitored trajectory is still energy-verified.
+  // Current overlap is both a contact-risk diagnostic and the runtime
+  // activation gate for Eq. (14) stiffness scaling.
   out.contact_relevant_for_energy = out.workspace_distance_now <= 0.0;
   const bool predicted_contact_requires_verification =
       out.monitored_contact_possible;
@@ -626,8 +739,8 @@ MonitorResult verifyReachablePlanJointSpace(
       ? config.robot_reachability_provider->secureRadius()
       : 0.0;
   const Vector3d collision_position_now = collisionPosition(state);
-  const Vector3d human_center_now =
-      config.human_workspace.centerAtTime(config.wall_time_sec);
+  const auto human_reach_now =
+      config.human_workspace.handReachableSetAtTime(config.wall_time_sec);
   if (config.assume_human_workspace_clear) {
     out.workspace_distance_now = std::numeric_limits<double>::infinity();
   } else if (use_sara_robot_reach) {
@@ -642,17 +755,19 @@ MonitorResult verifyReachablePlanJointSpace(
     out.workspace_distance_now =
         config.robot_reachability_provider->minimumSignedDistance(
             current_capsules,
-            human_center_now,
-            human_center_now,
-            config.human_workspace.motionRadius(),
+            human_reach_now.center,
+            human_reach_now.center,
+            human_reach_now.radius,
             &out.current_robot_link_index);
   } else {
     const double inflated_contact_radius_now =
         config.human_workspace.inflatedCollisionRadius(
             config.ee_collision_radius, 0.0);
     out.workspace_distance_now =
-        (collision_position_now - human_center_now).norm() -
-        inflated_contact_radius_now;
+        config.human_workspace.signedDistanceToInflatedSphere(
+            collision_position_now,
+            inflated_contact_radius_now,
+            config.wall_time_sec);
   }
   out.workspace_distance_min = out.workspace_distance_now;
 
@@ -679,9 +794,14 @@ MonitorResult verifyReachablePlanJointSpace(
     out.current_cartesian_energy_valid = current_lambda_valid;
     out.current_joint_kinetic_energy =
         jointKineticEnergy(dq_pred, state.inertia);
+    out.current_nullspace_potential_energy = nullspacePotentialEnergy(
+        q_pred,
+        config.nullspace_reference,
+        config.current_nullspace_stiffness);
     out.current_total_control_energy =
         out.current_joint_kinetic_energy +
-        out.current_cartesian_potential_energy;
+        out.current_cartesian_potential_energy +
+        out.current_nullspace_potential_energy;
     out.current_joint_energy_valid = true;
   }
 
@@ -691,6 +811,10 @@ MonitorResult verifyReachablePlanJointSpace(
       std::max(0.0, config.kinetic_energy_error_bound_joule);
   const double potential_energy_error_bound =
       std::max(0.0, config.potential_energy_error_bound_joule);
+  const double nullspace_potential_energy_error_bound =
+      std::max(
+          0.0,
+          config.nullspace_potential_energy_error_bound_joule);
   const double energy_budget_eff =
       std::max(0.0, config.energy_budget_joule);
   double total_contact_energy_max = 0.0;
@@ -715,11 +839,28 @@ MonitorResult verifyReachablePlanJointSpace(
   double previous_edge_potential = quadraticEnergy(
       previous_edge_error_initial,
       positiveSemidefinitePart(plan.anchor.K));
+  double previous_edge_nullspace_potential = nullspacePotentialEnergy(
+      q_pred,
+      config.nullspace_reference,
+      config.current_nullspace_stiffness);
   double previous_edge_total_energy =
-      previous_edge_joint_kinetic + previous_edge_potential;
+      previous_edge_joint_kinetic + previous_edge_potential +
+      previous_edge_nullspace_potential;
   double previous_edge_time = plan.anchor.t;
   double previous_position_error_radius = 0.0;
   double previous_orientation_error_radius = 0.0;
+  OverbudgetJointStabilizationState overbudget_joint_state =
+      config.overbudget_joint_state;
+  OverbudgetJointStabilizationTerms overbudget_joint_terms =
+      updateOverbudgetJointStabilization(
+          q_pred,
+          previous_edge_joint_kinetic,
+          energy_budget_eff,
+          config.overbudget_joint_stiffness,
+          config.overbudget_joint_scale_omega,
+          config.enable_overbudget_joint_stabilization &&
+              out.workspace_distance_now <= 0.0,
+          &overbudget_joint_state);
 
   // SaRA PFL computes one alpha_i vector from the complete monitored
   // trajectory and then reuses it for every interval. Therefore the rollout
@@ -733,6 +874,23 @@ MonitorResult verifyReachablePlanJointSpace(
   initial_prediction.energy_valid = true;
   initial_prediction.joint_kinetic_energy = previous_edge_joint_kinetic;
   initial_prediction.cartesian_potential_energy = previous_edge_potential;
+  initial_prediction.nullspace_potential_energy =
+      previous_edge_nullspace_potential;
+  initial_prediction.nullspace_potential_energy_active =
+      config.current_nullspace_stiffness > 0.0;
+  initial_prediction.energy_scaling_active =
+      config.enable_runtime_energy_scaling &&
+      out.workspace_distance_now <= 0.0;
+  initial_prediction.applied_nullspace_stiffness =
+      config.current_nullspace_stiffness;
+  initial_prediction.overbudget_joint_stabilization_active =
+      overbudget_joint_terms.active;
+  initial_prediction.overbudget_joint_potential_energy =
+      overbudget_joint_terms.potential_energy;
+  initial_prediction.overbudget_joint_scale_rho =
+      overbudget_joint_terms.scale_rho;
+  initial_prediction.overbudget_joint_torque_norm =
+      overbudget_joint_terms.torque.norm();
   rollout_trace.push_back(initial_prediction);
 
   struct PredictedReachInterval {
@@ -744,10 +902,12 @@ MonitorResult verifyReachablePlanJointSpace(
     double start_cartesian_kinetic{0.0};
     double start_joint_kinetic{0.0};
     double start_potential{0.0};
+    double start_nullspace_potential{0.0};
     double start_total_energy{0.0};
     double end_cartesian_kinetic{0.0};
     double end_joint_kinetic{0.0};
     double end_potential{0.0};
+    double end_nullspace_potential{0.0};
     double end_total_energy{0.0};
   };
   std::vector<PredictedReachInterval> predicted_reach_intervals;
@@ -826,8 +986,90 @@ MonitorResult verifyReachablePlanJointSpace(
     desired_acceleration.head<3>() = desired.ddp;
     desired_acceleration.tail<3>() = desired.dw;
 
+    // Reproduce the runtime's current-state overlap gate before calculating
+    // rollout torque. Normal Cartesian and nullspace gains remain unchanged
+    // outside the human collision area; Eq. (14) acts on both inside it.
+    const Vector3d collision_start = collisionPosition(state);
+    double start_distance = std::numeric_limits<double>::infinity();
+    if (!config.assume_human_workspace_clear && use_sara_robot_reach) {
+      std::vector<RobotReachCapsule> start_capsules;
+      if (!config.robot_reachability_provider->reachInterval(
+              q_pred,
+              q_pred,
+              0.0,
+              zero_robot_alpha,
+              &start_capsules)) {
+        markIntervalUnsafe(interval_index);
+        out.joint_limit_unsafe = true;
+        return false;
+      }
+      const auto human_reach =
+          config.human_workspace.handReachableSetAtTime(
+              config.wall_time_sec + t_prev);
+      start_distance =
+          config.robot_reachability_provider->minimumSignedDistance(
+              start_capsules,
+              human_reach.center,
+              human_reach.center,
+              human_reach.radius);
+      if (!std::isfinite(start_distance)) {
+        markIntervalUnsafe(interval_index);
+        out.joint_limit_unsafe = true;
+        return false;
+      }
+    } else if (!config.assume_human_workspace_clear) {
+      start_distance =
+          config.human_workspace.signedDistanceToInflatedSphere(
+              collision_start,
+              config.human_workspace.inflatedCollisionRadius(
+                  config.ee_collision_radius, 0.0),
+              config.wall_time_sec + t_prev);
+    }
+    const bool collision_area_active_for_sample = start_distance <= 0.0;
+    const bool energy_scaling_active_for_sample =
+        config.enable_runtime_energy_scaling &&
+        collision_area_active_for_sample;
+
+    const Matrix6d nominal_stiffness =
+        positiveSemidefinitePart(desired.K);
+    const double nominal_start_joint_kinetic =
+        jointKineticEnergy(dq_pred, state.inertia);
+    const double nominal_start_potential =
+        quadraticEnergy(error, nominal_stiffness);
+    const double nominal_start_nullspace_potential =
+        nullspacePotentialEnergy(
+            q_pred,
+            config.nullspace_reference,
+            config.nullspace_stiffness);
+    const double energy_stiffness_scale =
+        energy_scaling_active_for_sample
+            ? energyBudgetStiffnessScale(
+                  nominal_start_joint_kinetic,
+                  nominal_start_potential,
+                  nominal_start_nullspace_potential,
+                  energy_budget_eff)
+            : 1.0;
+    const Matrix6d applied_stiffness =
+        energy_stiffness_scale * nominal_stiffness;
+    const Matrix6d applied_damping =
+        std::sqrt(energy_stiffness_scale) * desired.D;
+    const double applied_nullspace_stiffness =
+        energy_stiffness_scale *
+        std::max(0.0, config.nullspace_stiffness);
+
+    overbudget_joint_terms = updateOverbudgetJointStabilization(
+        q_pred,
+        nominal_start_joint_kinetic,
+        energy_budget_eff,
+        config.overbudget_joint_stiffness,
+        config.overbudget_joint_scale_omega,
+        config.enable_overbudget_joint_stabilization &&
+            collision_area_active_for_sample,
+        &overbudget_joint_state);
+
     Vector6d wrench =
-        -desired.K * error - desired.D * (twist - desired_twist);
+        -applied_stiffness * error -
+        applied_damping * (twist - desired_twist);
     if (config.use_dynamic_consistent_impedance) {
       wrench += lambda *
                 (desired_acceleration - state.control_jdot_dq);
@@ -835,41 +1077,33 @@ MonitorResult verifyReachablePlanJointSpace(
     const Vector7d tau_task = state.control_jacobian.transpose() * wrench;
 
     Vector7d tau_nullspace = Vector7d::Zero();
-    const Vector3d collision_start = collisionPosition(state);
-    double start_distance = std::numeric_limits<double>::infinity();
-    if (!config.assume_human_workspace_clear && use_sara_robot_reach) {
-      std::vector<RobotReachCapsule> start_capsules;
-      if (config.robot_reachability_provider->reachInterval(
-              q_pred, q_pred, 0.0, zero_robot_alpha, &start_capsules)) {
-        const Vector3d human_center =
-            config.human_workspace.centerAtTime(
-                config.wall_time_sec + t_prev);
-        start_distance =
-            config.robot_reachability_provider->minimumSignedDistance(
-                start_capsules,
-                human_center,
-                human_center,
-                config.human_workspace.motionRadius());
-      } else {
-        markIntervalUnsafe(interval_index);
-        out.joint_limit_unsafe = true;
-        return false;
-      }
-    } else if (!config.assume_human_workspace_clear) {
-      start_distance = config.human_workspace.signedDistanceToInflatedSphere(
-          collision_start,
-          config.human_workspace.inflatedCollisionRadius(
-              config.ee_collision_radius, 0.0),
-          config.wall_time_sec + t_prev);
-    }
+    // Normal nullspace control is a global optional mode. Its stiffness and
+    // damping receive the same Eq. (14) scale as Cartesian impedance whenever
+    // the predicted state is in the human collision area.
     const bool nullspace_enabled_for_sample =
-        config.nullspace_stiffness > 0.0 && start_distance > 0.0 &&
-        !(desired.failsafe && config.disable_nullspace_in_failsafe);
+        applied_nullspace_stiffness > 0.0;
+    previous_edge_cartesian_kinetic =
+        quadraticEnergy(twist, positiveSemidefinitePart(lambda));
+    previous_edge_joint_kinetic =
+        nominal_start_joint_kinetic + kinetic_energy_error_bound;
+    previous_edge_potential =
+        quadraticEnergy(error, applied_stiffness) +
+        potential_energy_error_bound;
+    previous_edge_nullspace_potential = nullspace_enabled_for_sample
+        ? nullspacePotentialEnergy(
+              q_pred,
+              config.nullspace_reference,
+              applied_nullspace_stiffness) +
+              nullspace_potential_energy_error_bound
+        : 0.0;
+    previous_edge_total_energy =
+        previous_edge_joint_kinetic + previous_edge_potential +
+        previous_edge_nullspace_potential;
     if (nullspace_enabled_for_sample) {
       const Vector7d tau_nullspace_raw =
-          config.nullspace_stiffness *
+          applied_nullspace_stiffness *
               (config.nullspace_reference - q_pred) -
-          2.0 * std::sqrt(config.nullspace_stiffness) * dq_pred;
+          2.0 * std::sqrt(applied_nullspace_stiffness) * dq_pred;
       const Eigen::Matrix<double, 7, 6> jbar =
           inertia_inv * state.control_jacobian.transpose() * lambda;
       const Matrix7d nullspace_projector_transpose =
@@ -881,7 +1115,8 @@ MonitorResult verifyReachablePlanJointSpace(
 
     const double h = std::max(dt, kMinDt);
     const Vector7d desired_torque_command =
-        tau_task + tau_nullspace + state.coriolis;
+        tau_task + tau_nullspace + overbudget_joint_terms.torque +
+        state.coriolis;
     Vector7d torque_command = desired_torque_command;
     if (previous_torque_command_valid) {
       const double max_delta =
@@ -930,9 +1165,9 @@ MonitorResult verifyReachablePlanJointSpace(
           tracking_tube,
           task_inertia_inv,
           positiveSemidefinitePart(
-              Matrix3d(desired.K.topLeftCorner<3, 3>())),
+              Matrix3d(applied_stiffness.topLeftCorner<3, 3>())),
           positiveSemidefinitePart(
-              Matrix3d(desired.D.topLeftCorner<3, 3>())),
+              Matrix3d(applied_damping.topLeftCorner<3, 3>())),
           h,
           config.tracking_acc_error_bound);
       next_position_error_radius = maxBlockRadius(tracking_tube_next, 0);
@@ -973,14 +1208,36 @@ MonitorResult verifyReachablePlanJointSpace(
     const double nominal_joint_kinetic =
         jointKineticEnergy(dq_next, next_state.inertia);
     const double nominal_potential = quadraticEnergy(
-        next_error, positiveSemidefinitePart(desired.K));
+        next_error, applied_stiffness);
+    const double nominal_nullspace_potential =
+        nullspace_enabled_for_sample
+            ? nullspacePotentialEnergy(
+                  q_next,
+                  config.nullspace_reference,
+                  applied_nullspace_stiffness)
+            : 0.0;
+    const OverbudgetJointStabilizationTerms endpoint_overbudget_terms =
+        updateOverbudgetJointStabilization(
+            q_next,
+            nominal_joint_kinetic,
+            energy_budget_eff,
+            config.overbudget_joint_stiffness,
+            config.overbudget_joint_scale_omega,
+            config.enable_overbudget_joint_stabilization &&
+                collision_area_active_for_sample,
+            &overbudget_joint_state);
     const EnergyUpperBound energy_ub = addOneSidedEnergyErrorBounds(
         nominal_joint_kinetic,
         nominal_potential,
+        nominal_nullspace_potential,
         kinetic_energy_error_bound,
-        potential_energy_error_bound);
+        potential_energy_error_bound,
+        nullspace_enabled_for_sample
+            ? nullspace_potential_energy_error_bound
+            : 0.0);
     const double joint_kinetic = energy_ub.kinetic;
-    const double potential = energy_ub.potential;
+    const double potential = energy_ub.cartesian_potential;
+    const double nullspace_potential = energy_ub.nullspace_potential;
     const double total_energy = energy_ub.total();
 
     JointPredictionSample endpoint_prediction;
@@ -990,6 +1247,24 @@ MonitorResult verifyReachablePlanJointSpace(
     endpoint_prediction.energy_valid = true;
     endpoint_prediction.joint_kinetic_energy = nominal_joint_kinetic;
     endpoint_prediction.cartesian_potential_energy = nominal_potential;
+    endpoint_prediction.nullspace_potential_energy =
+        nominal_nullspace_potential;
+    endpoint_prediction.nullspace_potential_energy_active =
+        nullspace_enabled_for_sample;
+    endpoint_prediction.energy_scaling_active =
+        energy_scaling_active_for_sample;
+    endpoint_prediction.energy_stiffness_scale =
+        energy_stiffness_scale;
+    endpoint_prediction.applied_nullspace_stiffness =
+        applied_nullspace_stiffness;
+    endpoint_prediction.overbudget_joint_stabilization_active =
+        endpoint_overbudget_terms.active;
+    endpoint_prediction.overbudget_joint_potential_energy =
+        endpoint_overbudget_terms.potential_energy;
+    endpoint_prediction.overbudget_joint_scale_rho =
+        endpoint_overbudget_terms.scale_rho;
+    endpoint_prediction.overbudget_joint_torque_norm =
+        endpoint_overbudget_terms.torque.norm();
     rollout_trace.push_back(endpoint_prediction);
 
     const bool previous_edge_is_worst =
@@ -1007,10 +1282,13 @@ MonitorResult verifyReachablePlanJointSpace(
           previous_edge_cartesian_kinetic;
       interval.start_joint_kinetic = previous_edge_joint_kinetic;
       interval.start_potential = previous_edge_potential;
+      interval.start_nullspace_potential =
+          previous_edge_nullspace_potential;
       interval.start_total_energy = previous_edge_total_energy;
       interval.end_cartesian_kinetic = cartesian_kinetic;
       interval.end_joint_kinetic = joint_kinetic;
       interval.end_potential = potential;
+      interval.end_nullspace_potential = nullspace_potential;
       interval.end_total_energy = total_energy;
       predicted_reach_intervals.push_back(interval);
     } else {
@@ -1041,8 +1319,12 @@ MonitorResult verifyReachablePlanJointSpace(
                 : joint_kinetic;
         out.worst_case_cartesian_potential_energy_ub =
             previous_edge_is_worst ? previous_edge_potential : potential;
-        // Kept for CSV/API compatibility; this now denotes the kinetic metric
-        // that actually gates the paper energy budget plus Cartesian potential.
+        out.worst_case_nullspace_potential_energy_ub =
+            previous_edge_is_worst
+                ? previous_edge_nullspace_potential
+                : nullspace_potential;
+        // Kept for CSV/API compatibility; this now denotes the complete
+        // T + U_x + U_n metric that gates the paper energy budget.
         out.worst_case_cartesian_control_energy_ub = interval_energy;
         out.worst_case_total_control_energy_ub = interval_energy;
       }
@@ -1061,6 +1343,7 @@ MonitorResult verifyReachablePlanJointSpace(
     previous_edge_cartesian_kinetic = cartesian_kinetic;
     previous_edge_joint_kinetic = joint_kinetic;
     previous_edge_potential = potential;
+    previous_edge_nullspace_potential = nullspace_potential;
     previous_edge_total_energy = total_energy;
     previous_edge_time = desired.t;
     if (!use_sara_robot_reach) {
@@ -1201,14 +1484,15 @@ MonitorResult verifyReachablePlanJointSpace(
           }
 
           int segment_robot_link_index = -1;
+          const auto human_reach =
+              config.human_workspace.handReachableSetAtTime(
+                  config.wall_time_sec + interval.end_time);
           const double segment_distance =
               config.robot_reachability_provider->minimumSignedDistance(
                   robot_capsules,
-                  config.human_workspace.centerAtTime(
-                      config.wall_time_sec + interval.start_time),
-                  config.human_workspace.centerAtTime(
-                      config.wall_time_sec + interval.end_time),
-                  config.human_workspace.motionRadius(),
+                  human_reach.center,
+                  human_reach.center,
+                  human_reach.radius,
                   &segment_robot_link_index);
           if (!std::isfinite(segment_distance)) {
             markIntervalUnsafe(interval.index);
@@ -1253,6 +1537,9 @@ MonitorResult verifyReachablePlanJointSpace(
             out.worst_case_cartesian_potential_energy_ub = start_is_worst
                 ? interval.start_potential
                 : interval.end_potential;
+            out.worst_case_nullspace_potential_energy_ub = start_is_worst
+                ? interval.start_nullspace_potential
+                : interval.end_nullspace_potential;
             out.worst_case_cartesian_control_energy_ub = interval_energy;
             out.worst_case_total_control_energy_ub = interval_energy;
           }
@@ -1270,9 +1557,8 @@ MonitorResult verifyReachablePlanJointSpace(
   out.workspace_distance_margin = out.workspace_distance_min;
   out.terminal_energy_ub =
       terminal_sample_found ? terminal_total_energy : 0.0;
-  // Keep runtime energy adaptation orthogonal to candidate verification:
-  // current geometry gates the runtime stiffness budget, while any predicted
-  // contact in the complete monitored trajectory is still energy-verified.
+  // Current overlap is both a contact-risk diagnostic and the runtime
+  // activation gate for Eq. (14) stiffness scaling.
   out.contact_relevant_for_energy = out.workspace_distance_now <= 0.0;
 
   const bool predicted_contact_requires_verification =

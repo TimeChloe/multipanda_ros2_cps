@@ -1,11 +1,23 @@
-sphere_center: [0.306957, -0.16, 0.30]
-# Complete human motion/occupancy radius (old 0.09 + 0.04 split model).
-motion_radius: 0.13
+# Shift the complete y-axis crossing 5 cm along +x, away from the robot base
+# at panda_link0, while preserving the original crossing amplitude and speed.
+sphere_center: [0.356957, -0.16, 0.30]
+# SaRA-Shield TUM configuration uses 0.206 m hand thickness. A single-point
+# BodyPartCombined occupancy adds half the thickness as physical radius.
+motion_radius: 0.103
 
-# Moving reachable-set example inspired by SaRA-Shield's time-interval
-# human reachability checks. The local monitor still uses one conservative
-# human workspace sphere, but its center is evaluated at each monitored
-# trajectory interval.
+# Single measured-hand reachable set. These match the SaRA-Shield TUM hand
+# limits; the velocity-error term grows with the complete prediction time.
+hand_reachability:
+  max_velocity: 2.0
+  max_acceleration: 50.0
+  measurement_error_position: 0.0
+  measurement_error_velocity: 0.1
+  delay: 0.0
+
+# This motion only generates repeatable synthetic hand measurements. The
+# reachable controller receives each current position/velocity snapshot and
+# independently builds a SaRA BodyPartCombined reachable ball for every monitor
+# interval; it does not assume the future sinusoid is known.
 center_motion:
   velocity: [0.0, 0.0, 0.0]
   sinusoid_amplitude: [0.0, 0.16, 0.0]

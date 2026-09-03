@@ -29,6 +29,11 @@ ros2 launch cps_human_workspace human_workspace_visualizer.launch.py \
 human_workspace_config:=human_workspace_dynamic_crossing.yaml \
 use_sim_time:=true
 
+
+ros2 launch cps_human_workspace human_workspace_visualizer.launch.py   human_workspace_config:=human_workspace_dynamic_crossing.yaml   publish_rate:=30.0
+
+
+
 ros2 run franka_simple_publishers clear_mujoco_obstacles
 
 

@@ -68,6 +68,46 @@ bool HumanWorkspace::configureFromConfigFile(
 
     parameters.motion_radius = root["motion_radius"].as<double>();
 
+    const YAML::Node hand_reachability = root["hand_reachability"];
+    if (hand_reachability) {
+      if (!hand_reachability.IsMap()) {
+        RCLCPP_ERROR(
+            logger,
+            "hand_reachability must be a map in %s.",
+            config_path.c_str());
+        return false;
+      }
+      if (hand_reachability["model"]) {
+        RCLCPP_ERROR(
+            logger,
+            "hand_reachability.model is obsolete in %s; this project now "
+            "always uses the SaRA BodyPartCombined generator. Remove the "
+            "model field.",
+            config_path.c_str());
+        return false;
+      }
+      if (hand_reachability["max_velocity"]) {
+        parameters.hand_max_velocity =
+            hand_reachability["max_velocity"].as<double>();
+      }
+      if (hand_reachability["max_acceleration"]) {
+        parameters.hand_max_acceleration =
+            hand_reachability["max_acceleration"].as<double>();
+      }
+      if (hand_reachability["measurement_error_position"]) {
+        parameters.measurement_error_position =
+            hand_reachability["measurement_error_position"].as<double>();
+      }
+      if (hand_reachability["measurement_error_velocity"]) {
+        parameters.measurement_error_velocity =
+            hand_reachability["measurement_error_velocity"].as<double>();
+      }
+      if (hand_reachability["delay"]) {
+        parameters.measurement_delay =
+            hand_reachability["delay"].as<double>();
+      }
+    }
+
     const YAML::Node center_motion =
         root["center_motion"] ? root["center_motion"] : root["motion"];
     if (center_motion) {
@@ -126,10 +166,16 @@ bool HumanWorkspace::configureFromConfigFile(
     }
 
     if (parameters.motion_radius < 0.0 ||
-        parameters.center_sinusoid_frequency_hz < 0.0) {
+        parameters.center_sinusoid_frequency_hz < 0.0 ||
+        parameters.hand_max_velocity < 0.0 ||
+        parameters.hand_max_acceleration <= 0.0 ||
+        parameters.measurement_error_position < 0.0 ||
+        parameters.measurement_error_velocity < 0.0 ||
+        parameters.measurement_delay < 0.0) {
       RCLCPP_ERROR(
           logger,
-          "motion_radius and center sinusoid frequency must be nonnegative.");
+          "Hand radius, frequency, reachability limits, measurement errors "
+          "and delay must be nonnegative; max_acceleration must be positive.");
       return false;
     }
 
@@ -186,6 +232,72 @@ bool HumanWorkspace::hasMovingCenter() const {
           parameters_.center_sinusoid_frequency_hz > 0.0);
 }
 
+HumanWorkspace::ReachableSphere HumanWorkspace::handReachableSetAtTime(
+    double time_sec) const {
+  ReachableSphere reachable;
+  reachable.center = parameters_.sphere_center;
+  reachable.radius = std::max(0.0, parameters_.motion_radius);
+
+  // Exact single-point specialization of SaRA ReachLib's
+  // BodyPartCombined::ry(). sphere_center and center_velocity are the latest
+  // hand observation at center_motion_time_offset_sec. The physical hand
+  // radius corresponds to the upstream body thickness divided by two.
+  const double t =
+      std::max(0.0, time_sec - parameters_.center_motion_time_offset_sec) +
+      parameters_.measurement_delay;
+  const Vector3d velocity = parameters_.center_velocity;
+  const double speed = velocity.norm();
+  const double max_velocity = parameters_.hand_max_velocity;
+  const double max_acceleration = parameters_.hand_max_acceleration;
+
+  if (speed > max_velocity) {
+    // ReachLib falls back to an isotropic constant-speed ball when the
+    // measured speed already exceeds the configured maximum.
+    reachable.center = parameters_.sphere_center;
+    reachable.radius += parameters_.measurement_error_position +
+                        speed * t;
+    return reachable;
+  }
+
+  Vector3d direction = Vector3d::UnitX();
+  if (speed >= 1.0e-12) {
+    direction = velocity / speed;
+  }
+  const double t_up = std::clamp(
+      (max_velocity - speed) / max_acceleration, 0.0, t);
+  const double t_max = std::clamp(
+      max_velocity / max_acceleration, 0.0, t);
+  const double t_down = std::clamp(
+      (max_velocity + speed) / max_acceleration, 0.0, t);
+
+  double reachability_radius = 0.0;
+  if (t_down < t || (t_down >= t && t_up >= t)) {
+    reachability_radius =
+        max_acceleration * (t * t_max - 0.5 * t_max * t_max);
+  } else {
+    const double asymmetric_axis =
+        0.5 *
+        (t * (t_up + t_down) -
+         0.5 * (t_up * t_up + t_down * t_down));
+    const double transverse_axis =
+        t * t_max - 0.5 * t_max * t_max;
+    reachability_radius = max_acceleration * std::sqrt(
+        asymmetric_axis * asymmetric_axis +
+        transverse_axis * transverse_axis);
+  }
+
+  const double center_shift =
+      t * speed +
+      0.5 * max_acceleration *
+          (t * (t_up - t_down) -
+           0.5 * (t_up * t_up - t_down * t_down));
+  reachable.center = parameters_.sphere_center + direction * center_shift;
+  reachable.radius += reachability_radius +
+                      parameters_.measurement_error_position +
+                      parameters_.measurement_error_velocity * t;
+  return reachable;
+}
+
 double HumanWorkspace::inflatedCollisionRadius(
     double ee_collision_radius,
     double position_error_radius) const {
@@ -195,27 +307,13 @@ double HumanWorkspace::inflatedCollisionRadius(
 
 double HumanWorkspace::signedDistanceToInflatedSphere(
     const Vector3d& point,
-    double inflated_radius) const {
-  return (point - parameters_.sphere_center).norm() - inflated_radius;
-}
-
-double HumanWorkspace::signedDistanceToInflatedSphere(
-    const Vector3d& point,
     double inflated_radius,
     double time_sec) const {
-  return (point - centerAtTime(time_sec)).norm() - inflated_radius;
-}
-
-double HumanWorkspace::signedDistanceSegmentToInflatedSphere(
-    const Vector3d& a,
-    const Vector3d& b,
-    double inflated_radius,
-    Vector3d* closest_point) const {
-  const Vector3d closest = closestPointOnSegment(a, b, parameters_.sphere_center);
-  if (closest_point != nullptr) {
-    *closest_point = closest;
-  }
-  return (closest - parameters_.sphere_center).norm() - inflated_radius;
+  const ReachableSphere hand_reach = handReachableSetAtTime(time_sec);
+  const double reachability_inflation =
+      std::max(0.0, hand_reach.radius - parameters_.motion_radius);
+  return (point - hand_reach.center).norm() -
+         (inflated_radius + reachability_inflation);
 }
 
 double HumanWorkspace::signedDistanceSegmentToInflatedSphere(
@@ -226,27 +324,23 @@ double HumanWorkspace::signedDistanceSegmentToInflatedSphere(
     double end_time_sec,
     Vector3d* closest_robot_point,
     Vector3d* closest_human_center) const {
-  const Vector3d center_start = centerAtTime(start_time_sec);
-  const Vector3d center_end = centerAtTime(end_time_sec);
-
-  const Vector3d rel_start = a - center_start;
-  const Vector3d rel_end = b - center_end;
-  const Vector3d rel_delta = rel_end - rel_start;
-  const double denom = rel_delta.squaredNorm();
-  const double alpha =
-      denom < 1e-12
-          ? 0.0
-          : std::clamp(-rel_start.dot(rel_delta) / denom, 0.0, 1.0);
-
-  const Vector3d robot_point = a + alpha * (b - a);
-  const Vector3d human_center = center_start + alpha * (center_end - center_start);
+  (void)start_time_sec;
+  // The COMBINED ball at the end of the interval encloses all admissible
+  // hand motion from the observation through this interval, matching the
+  // single-point BodyPartCombined update used by SaRA-Shield.
+  const ReachableSphere hand_reach = handReachableSetAtTime(end_time_sec);
+  const Vector3d robot_point =
+      closestPointOnSegment(a, b, hand_reach.center);
   if (closest_robot_point != nullptr) {
     *closest_robot_point = robot_point;
   }
   if (closest_human_center != nullptr) {
-    *closest_human_center = human_center;
+    *closest_human_center = hand_reach.center;
   }
-  return (robot_point - human_center).norm() - inflated_radius;
+  const double reachability_inflation =
+      std::max(0.0, hand_reach.radius - parameters_.motion_radius);
+  return (robot_point - hand_reach.center).norm() -
+         (inflated_radius + reachability_inflation);
 }
 
 Vector3d HumanWorkspace::closestPointOnSegment(

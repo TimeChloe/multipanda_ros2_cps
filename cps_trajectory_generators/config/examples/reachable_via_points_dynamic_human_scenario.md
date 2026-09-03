@@ -3,10 +3,17 @@
 This example keeps the reachable Cartesian impedance controller unchanged and
 makes the human reachable set move instead.
 
-The SaRA-Shield reference computes robot and human reachable capsules over
-time intervals, then checks interval collisions. In this repo the monitor
-already uses a simpler end-effector collision-center versus human sphere model,
-so the matching approach is a time-indexed sphere center:
+The monitor computes SaRA robot link capsules and a single-hand SaRA BodyPartCombined
+reachable ball over the same time intervals, then checks their intersections.
+The synthetic sinusoid only provides repeatable current hand measurements; it
+is not used as known future motion by the safety monitor.
+
+The monitor follows the SaRA-Shield Panda interval rule: five 1 ms controller
+samples form one 5 ms robot/human reachable-set interval over the complete
+intended + failsafe trajectory. In RViz, orange is the measured physical hand,
+cyan on `human_workspace/markers` is a one-interval preview, and cyan on the
+controller's `robot_reachable_sets` topic is the exact hand ball paired with
+the robot interval currently selected for visualization.
 
 - human reachable set:
   `cps_human_workspace/config/human_workspace_dynamic_crossing.yaml`
@@ -54,7 +61,7 @@ ros2 launch cps_human_workspace human_workspace_visualizer.launch.py \
 ```
 
 The validation CSV includes `human_center_px`, `human_center_py`, and
-`human_center_pz`. The prediction CSV includes the actual human center plus
-the start and end human centers for each monitored interval, so
-`distance_segment` and `contact_possible` can be checked against the moving
-reachable set along the path.
+`human_center_pz`. The prediction CSV additionally records
+`actual_hand_reach_radius` and each interval's `human_reach_radius`, so
+`distance_segment` and `contact_possible` can be checked against the generated
+single-hand reachable set.

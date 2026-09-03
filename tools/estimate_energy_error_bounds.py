@@ -57,6 +57,8 @@ def load_controls(path: Path) -> Tuple[Dict[int, dict], Dict[int, dict]]:
         "previous_applied_energy_valid",
         "previous_applied_joint_kinetic_energy",
         "previous_applied_cartesian_potential_energy",
+        "previous_applied_nullspace_potential_energy",
+        "previous_applied_nullspace_potential_energy_active",
         "previous_applied_verified_plan_valid",
         "previous_applied_verified_plan_generation",
         "previous_applied_verified_command_stage",
@@ -181,6 +183,10 @@ def write_matched_samples(path: Path, entries: List[dict]) -> None:
         "measured_potential_energy_joule",
         "predicted_potential_energy_joule",
         "potential_residual_joule",
+        "nullspace_potential_active",
+        "measured_nullspace_potential_energy_joule",
+        "predicted_nullspace_potential_energy_joule",
+        "nullspace_potential_residual_joule",
         "joint_position_error_norm_rad",
         "joint_velocity_error_norm_rad_s",
     ]
@@ -227,6 +233,22 @@ def write_matched_samples(path: Path, entries: List[dict]) -> None:
                 ),
                 "potential_residual_joule": energy_residual(
                     entry, "cartesian_potential_energy"
+                ),
+                "nullspace_potential_active": as_bool(
+                    actual[
+                        "previous_applied_nullspace_potential_energy_active"
+                    ]
+                ) and as_bool(
+                    prediction["pred_nullspace_potential_energy_active"]
+                ),
+                "measured_nullspace_potential_energy_joule": float(
+                    actual["previous_applied_nullspace_potential_energy"]
+                ),
+                "predicted_nullspace_potential_energy_joule": float(
+                    prediction["pred_nullspace_potential_energy"]
+                ),
+                "nullspace_potential_residual_joule": energy_residual(
+                    entry, "nullspace_potential_energy"
                 ),
                 "joint_position_error_norm_rad": state_error(
                     prediction, actual, "q"
@@ -305,6 +327,22 @@ def generate_comparison_outputs(
         energy_residual(entry, "cartesian_potential_energy")
         for entry in entries
     ]
+    measured_vn = [
+        float(
+            entry["actual"][
+                "previous_applied_nullspace_potential_energy"
+            ]
+        )
+        for entry in entries
+    ]
+    predicted_vn = [
+        float(entry["prediction"]["pred_nullspace_potential_energy"])
+        for entry in entries
+    ]
+    residual_vn = [
+        energy_residual(entry, "nullspace_potential_energy")
+        for entry in entries
+    ]
     q_norm = [
         state_error(entry["prediction"], entry["actual"], "q")
         for entry in entries
@@ -339,7 +377,7 @@ def generate_comparison_outputs(
     write_matched_samples(csv_path, entries)
     output_paths.append(csv_path)
 
-    figure, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True)
+    figure, axes = plt.subplots(2, 3, figsize=(18, 8), sharex=True)
     for axis in axes.flat:
         add_stage_context(axis, entries)
         axis.grid(True, alpha=0.3)
@@ -389,6 +427,39 @@ def generate_comparison_outputs(
     axes[1, 1].set_title("V residual: measured - predicted")
     axes[1, 1].set_ylabel("residual [J]")
     axes[1, 1].set_xlabel("monitored trajectory index")
+    axes[0, 2].plot(x, measured_vn, label="measured", linewidth=1.8)
+    axes[0, 2].plot(x, predicted_vn, label="predicted", linewidth=1.5)
+    axes[0, 2].set_title("Nullspace potential energy")
+    axes[0, 2].set_ylabel("energy [J]")
+    axes[0, 2].legend()
+    axes[1, 2].plot(x, residual_vn, color="#d62728", linewidth=1.5)
+    axes[1, 2].axhline(0.0, color="black", linewidth=0.9)
+    active_residual_vn = [
+        residual
+        for residual, entry in zip(residual_vn, entries)
+        if as_bool(
+            entry["actual"][
+                "previous_applied_nullspace_potential_energy_active"
+            ]
+        )
+        and as_bool(
+            entry["prediction"]["pred_nullspace_potential_energy_active"]
+        )
+    ]
+    beta_vn = guard_factor * max(
+        0.0, max(active_residual_vn, default=0.0)
+    )
+    if beta_vn > 0.0:
+        axes[1, 2].axhline(
+            beta_vn,
+            color="#9467bd",
+            linestyle=":",
+            label=f"guarded beta_Vn={beta_vn:.4g} J",
+        )
+        axes[1, 2].legend()
+    axes[1, 2].set_title("Vn residual: measured - predicted")
+    axes[1, 2].set_ylabel("residual [J]")
+    axes[1, 2].set_xlabel("monitored trajectory index")
     figure.suptitle(f"Energy comparison: {title_suffix}")
     figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
     energy_path = Path(f"{prefix}_energy_comparison.png")
@@ -545,6 +616,8 @@ def main() -> int:
         "prediction_horizon_steps",
         "pred_joint_kinetic_energy",
         "pred_cartesian_potential_energy",
+        "pred_nullspace_potential_energy",
+        "pred_nullspace_potential_energy_active",
     }
     prediction_required.update(f"pred_q{joint}" for joint in range(1, 8))
     prediction_required.update(f"pred_dq{joint}" for joint in range(1, 8))
@@ -757,6 +830,7 @@ def main() -> int:
 
     kinetic_residuals: List[float] = []
     potential_residuals: List[float] = []
+    nullspace_potential_residuals: List[float] = []
     q_errors: List[float] = []
     dq_errors: List[float] = []
     matched_stages: Counter[str] = Counter()
@@ -772,6 +846,13 @@ def main() -> int:
             float(actual["previous_applied_cartesian_potential_energy"])
             - float(prediction["pred_cartesian_potential_energy"])
         )
+        if as_bool(
+            actual["previous_applied_nullspace_potential_energy_active"]
+        ) and as_bool(prediction["pred_nullspace_potential_energy_active"]):
+            nullspace_potential_residuals.append(
+                float(actual["previous_applied_nullspace_potential_energy"])
+                - float(prediction["pred_nullspace_potential_energy"])
+            )
         q_errors.append(state_error(prediction, actual, "q"))
         dq_errors.append(state_error(prediction, actual, "dq"))
         matched_stages[prediction["stage"]] += 1
@@ -789,6 +870,9 @@ def main() -> int:
 
     beta_k = args.guard_factor * max(0.0, max(kinetic_residuals))
     beta_v = args.guard_factor * max(0.0, max(potential_residuals))
+    beta_vn = args.guard_factor * max(
+        0.0, max(nullspace_potential_residuals, default=0.0)
+    )
     print(f"matched_samples: {len(selected_entries)}")
     print(f"unmatched_prediction_rows: {unmatched}")
     print(f"untrusted_prediction_rows: {schema_filtered}")
@@ -813,11 +897,22 @@ def main() -> int:
     print(f"maximum_matched_horizon_steps: {max(matched_horizons)}")
     print_summary("kinetic_residual_joule", kinetic_residuals)
     print_summary("potential_residual_joule", potential_residuals)
+    if nullspace_potential_residuals:
+        print_summary(
+            "nullspace_potential_residual_joule",
+            nullspace_potential_residuals,
+        )
+    else:
+        print("nullspace_potential_residual_joule: no active matched samples")
     print_summary("joint_position_error_norm_rad", q_errors)
     print_summary("joint_velocity_error_norm_rad_s", dq_errors)
     print("\nPreliminary calibration values (validate on independent runs):")
     print(f"kinetic_energy_error_bound_joule: {beta_k:.9f}")
     print(f"potential_energy_error_bound_joule: {beta_v:.9f}")
+    print(
+        "nullspace_potential_energy_error_bound_joule: "
+        f"{beta_vn:.9f}"
+    )
     if args.plot_dir is not None:
         if not selected_plans:
             raise RuntimeError(
