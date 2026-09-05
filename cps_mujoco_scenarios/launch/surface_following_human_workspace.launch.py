@@ -8,13 +8,10 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    human_workspace_package = LaunchConfiguration('human_workspace_package')
-    human_workspace_config = LaunchConfiguration('human_workspace_config')
-
-    default_config_path = PathJoinSubstitution([
-        FindPackageShare(human_workspace_package),
+    default_config = PathJoinSubstitution([
+        FindPackageShare('cps_mujoco_scenarios'),
         'config',
-        human_workspace_config,
+        'human_workspace_surface_following.yaml',
     ])
     reachable_set_visualizer_launch = PathJoinSubstitution([
         FindPackageShare('cps_human_workspace'),
@@ -24,29 +21,31 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument(
-            'human_workspace_package',
-            default_value='cps_human_workspace',
-            description='ROS package that owns the human workspace config.'),
-        DeclareLaunchArgument(
-            'human_workspace_config',
-            default_value='human_workspace.yaml',
-            description='Config file under <human_workspace_package>/config.'),
-        DeclareLaunchArgument(
             'human_workspace_config_path',
-            default_value=default_config_path,
-            description='Absolute config path. Overrides package/config when set.'),
+            default_value=default_config,
+            description='SaRA BodyPartCombined limits for the surface-following hand.'),
+        DeclareLaunchArgument(
+            'surface_body_name',
+            default_value='human_hand_surface',
+            description='MuJoCo body whose center is used as the measured hand center.'),
+        DeclareLaunchArgument(
+            'body_state_service',
+            default_value='/get_body_state',
+            description='MuJoCo GetBodyState service.'),
         DeclareLaunchArgument(
             'frame_id',
             default_value='panda_link0',
-            description='Frame of the published human observation.'),
+            description=(
+                'MuJoCo body frame used as the output frame. The node reads its '
+                'world pose and transforms surface observations into this frame.')),
         DeclareLaunchArgument(
             'state_topic',
             default_value='human_workspace/state',
-            description='HumanWorkspace state topic consumed by controllers.'),
+            description='Workspace observation topic consumed by the controller.'),
         DeclareLaunchArgument(
             'publish_rate',
-            default_value='10.0',
-            description='Hand-observation publication rate in Hz.'),
+            default_value='50.0',
+            description='MuJoCo surface sampling rate in Hz.'),
         DeclareLaunchArgument(
             'reachable_set_topic',
             default_value='/human_workspace/reachable_set',
@@ -66,17 +65,19 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'use_sim_time',
             default_value='true',
-            description='Use simulated time.'),
+            description='Use MuJoCo simulated time for message stamps.'),
         Node(
-            package='cps_human_workspace',
-            executable='human_workspace_publisher',
-            name='human_workspace_publisher',
+            package='cps_mujoco_scenarios',
+            executable='surface_following_human_workspace',
+            name='surface_following_human_workspace',
             output='screen',
             parameters=[{
                 'use_sim_time': ParameterValue(
                     LaunchConfiguration('use_sim_time'), value_type=bool),
                 'human_workspace_config_path': LaunchConfiguration(
                     'human_workspace_config_path'),
+                'surface_body_name': LaunchConfiguration('surface_body_name'),
+                'body_state_service': LaunchConfiguration('body_state_service'),
                 'frame_id': LaunchConfiguration('frame_id'),
                 'state_topic': LaunchConfiguration('state_topic'),
                 'publish_rate': ParameterValue(

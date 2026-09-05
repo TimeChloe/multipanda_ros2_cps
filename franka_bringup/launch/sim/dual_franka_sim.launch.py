@@ -18,12 +18,10 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.launch_description_sources import FrontendLaunchDescriptionSource
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Shutdown
-from launch.conditions import IfCondition, UnlessCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
+from launch.substitutions import Command, FindExecutable, LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
 def concatenate_ns(ns1, ns2, absolute=False):
     
     if(len(ns1) == 0):
@@ -148,7 +146,6 @@ def generate_launch_description():
                 'use_sim_time': "true",
                 'modelfile': xml_file,
                 'verbose': "true",
-                'ns': ns,
                 'mujoco_plugin_config': mjros_config_file
                 # 'mujoco_plugin_config': os.path.join(mjr2_control_path, 'example', 'ros2_control_plugins_example.yaml')
 

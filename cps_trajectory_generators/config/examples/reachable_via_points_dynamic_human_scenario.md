@@ -10,10 +10,10 @@ is not used as known future motion by the safety monitor.
 
 The monitor follows the SaRA-Shield Panda interval rule: five 1 ms controller
 samples form one 5 ms robot/human reachable-set interval over the complete
-intended + failsafe trajectory. In RViz, orange is the measured physical hand,
-cyan on `human_workspace/markers` is a one-interval preview, and cyan on the
-controller's `robot_reachable_sets` topic is the exact hand ball paired with
-the robot interval currently selected for visualization.
+intended + failsafe trajectory. In RViz, the controller publishes the selected
+robot occupancy and the exact blue human ball used for its intersection check.
+Both displays therefore represent the same selected interval; there is no
+separate fixed-duration hand preview.
 
 - human reachable set:
   `cps_human_workspace/config/human_workspace_dynamic_crossing.yaml`

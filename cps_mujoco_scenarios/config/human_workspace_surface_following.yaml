@@ -1,0 +1,12 @@
+# SaRA-Shield's 0.206 m hand thickness represented as a single-point sphere.
+motion_radius: 0.103
+
+# SaRA ReachLib BodyPartCombined bounds. Each published surface snapshot is a
+# new position/velocity observation; future surface motion is not assumed to
+# be known by the safety monitor.
+hand_reachability:
+  max_velocity: 2.0
+  max_acceleration: 50.0
+  measurement_error_position: 0.0
+  measurement_error_velocity: 0.1
+  delay: 0.0

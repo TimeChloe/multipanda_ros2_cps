@@ -1,6 +1,10 @@
 <mujoco model="table">
   <worldbody>
-    <body name="table" pos="-0.50 0 0.13">
+    <!-- Kinematic parent for the complete scenario fixture. Moving this mocap
+         body keeps the table, visual spring, and compliant pad together while
+         preserving the pad's local spring joint. -->
+    <body name="table_assembly" mocap="true" pos="0 0 0">
+      <body name="table" pos="-0.50 0 0.13">
       <!-- table top -->
       <geom
         name="table_top"
@@ -39,10 +43,10 @@
         pos="-0.23 -0.15 -0.09"
         size="0.02 0.02 0.09"
         rgba="0.35 0.22 0.12 1"/>
-    </body>
+      </body>
 
-    <!-- visual helical spring, display only, no collision -->
-    <body name="hand_surface_spring_visual" pos="-0.30 0 0.160">
+      <!-- visual helical spring, display only, no collision -->
+      <body name="hand_surface_spring_visual" pos="-0.30 0 0.160">
       <geom
         name="spring_seg_01"
         type="capsule"
@@ -132,11 +136,11 @@
         rgba="0.1 0.1 0.1 1"
         contype="0"
         conaffinity="0"/>
-    </body>
+      </body>
 
-    <!-- spring-supported compliant pad simulating human hand surface -->
-    <!-- table top upper surface: z = 0.13 + 0.025 = 0.155 m -->
-    <body name="human_hand_surface" pos="-0.30 0 0.23">
+      <!-- spring-supported compliant pad simulating human hand surface -->
+      <!-- table top upper surface: z = 0.13 + 0.025 = 0.155 m -->
+      <body name="human_hand_surface" pos="-0.30 0 0.23">
       <joint
         name="hand_surface_spring_z"
         type="slide"
@@ -162,6 +166,7 @@
         friction="2.0 0.05 0.001"
         solref="0.001 1"
         solimp="0.995 0.999 0.0001"/>
+      </body>
     </body>
   </worldbody>
 </mujoco>

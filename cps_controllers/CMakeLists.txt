@@ -22,13 +22,11 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(controller_interface REQUIRED)
-find_package(hardware_interface REQUIRED)
 find_package(realtime_tools REQUIRED)
 find_package(franka_semantic_components REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
-find_package(franka_msgs REQUIRED)
 find_package(mujoco_ros_msgs REQUIRED)
 # CMake 3.22's FindBoost does not map python310 to boost/python.hpp.
 set(_Boost_PYTHON310_HEADERS "boost/python.hpp")
@@ -62,7 +60,6 @@ target_include_directories(${PROJECT_NAME}
 
 ament_target_dependencies(${PROJECT_NAME}
   controller_interface
-  hardware_interface
   pluginlib
   rclcpp
   rclcpp_action
@@ -72,7 +69,6 @@ ament_target_dependencies(${PROJECT_NAME}
   std_msgs
   geometry_msgs
   visualization_msgs
-  franka_msgs
   mujoco_ros_msgs
   panda_motion_generator_msgs
   cps_human_workspace
@@ -107,7 +103,6 @@ ament_export_include_directories(include)
 ament_export_libraries(${PROJECT_NAME})
 ament_export_dependencies(
   controller_interface
-  hardware_interface
   pluginlib
   rclcpp
   rclcpp_action
@@ -117,7 +112,7 @@ ament_export_dependencies(
   std_msgs
   geometry_msgs
   visualization_msgs
-  franka_msgs
+  mujoco_ros_msgs
   pinocchio
   panda_motion_generator_msgs
   cps_human_workspace

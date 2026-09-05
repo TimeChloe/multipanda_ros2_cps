@@ -13,7 +13,6 @@ using cps_trajectory_generators::CartesianTrajectorySample;
 using cps_trajectory_generators::LocalCartesianReplanConfig;
 using cps_trajectory_generators::PathConsistentTimedPathConfig;
 using cps_trajectory_generators::TrajectoryGeneratorSettings;
-using cps_trajectory_generators::makeCartesianBrakeTrajectory;
 using cps_trajectory_generators::makePathConsistentTimedPathBrake;
 using cps_trajectory_generators::makePathConsistentTimedPathIntendedPrefix;
 using cps_trajectory_generators::makeRetimedPathState;
@@ -67,7 +66,6 @@ PathConsistentTimedPathConfig makeConfig() {
   PathConsistentTimedPathConfig config;
   config.intended_steps = 100;
   config.dt = 0.001;
-  config.project_start_to_nearest_path_state = false;
   config.max_path_rate = 1.0;
   config.max_path_acceleration = 1.0;
   config.max_path_jerk = 10.0;
@@ -464,37 +462,6 @@ TEST(SmoothViaPointCartesianTrajectory,
   ASSERT_GT(samples.size(), 1u);
   EXPECT_NEAR(samples.front().p.z(), 0.0, 1.0e-12);
   EXPECT_NEAR(samples.back().p.z(), 0.0001, 1.0e-12);
-}
-
-TEST(CartesianBrakeTrajectory, SupportsFullNormAlongAxisAndDiagonal) {
-  LocalCartesianReplanConfig config;
-  config.dt = 0.001;
-  config.max_velocity = 0.3;
-  config.max_acceleration = 0.8;
-  config.max_jerk = 4.0;
-  config.max_angular_velocity = 2.0;
-  config.max_angular_acceleration = 10.0;
-  config.max_angular_jerk = 100.0;
-
-  const std::vector<Eigen::Vector3d> directions{
-      Eigen::Vector3d::UnitX(), Eigen::Vector3d::Ones().normalized()};
-  for (const auto& direction : directions) {
-    CartesianTrajectorySample start;
-    start.dp = config.max_velocity * direction;
-    const auto samples = makeCartesianBrakeTrajectory(start, config);
-
-    ASSERT_FALSE(samples.empty());
-    EXPECT_GT(samples.front().dp.norm(), 0.99 * config.max_velocity);
-    Eigen::Vector3d previous_acceleration = start.ddp;
-    for (const auto& sample : samples) {
-      EXPECT_LE(sample.dp.norm(), config.max_velocity + 1.0e-8);
-      EXPECT_LE(sample.ddp.norm(), config.max_acceleration + 1.0e-6);
-      const double sampled_jerk =
-          (sample.ddp - previous_acceleration).norm() / config.dt;
-      EXPECT_LE(sampled_jerk, config.max_jerk + 1.0e-3);
-      previous_acceleration = sample.ddp;
-    }
-  }
 }
 
 }  // namespace

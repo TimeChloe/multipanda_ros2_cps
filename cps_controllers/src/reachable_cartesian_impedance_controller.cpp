@@ -14,11 +14,9 @@
 //
 // NOTE:
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <cctype>
 #include <cmath>
-#include <cstring>
 #include <cstdint>
 #include <cstddef>
 #include <exception>
@@ -34,7 +32,6 @@
 #include <utility>
 #include <vector>
 
-#include <pthread.h>
 #include <sched.h>
 
 #include <Eigen/Dense>
@@ -56,6 +53,7 @@
 #include <geometry_msgs/msg/pose_array.hpp>
 
 #include <cps_controllers/reachable_cartesian_impedance_controller.hpp>
+#include <cps_human_workspace/human_workspace_message.hpp>
 #include <cps_trajectory_generators/reachable_cartesian_trajectory.hpp>
 
 #include "reachable_cartesian_impedance/math.hpp"
@@ -216,15 +214,6 @@ inline std::string sanitizedFileNameOrDefault(
   const std::filesystem::path path(file_name);
   const std::string sanitized = path.filename().string();
   return sanitized.empty() ? default_file_name : sanitized;
-}
-
-inline Vector3d clampVectorNorm(const Vector3d& v, double max_norm) {
-  const double limit = std::max(max_norm, 0.0);
-  const double norm = v.norm();
-  if (norm <= limit || norm < 1.0e-12) {
-    return v;
-  }
-  return v * (limit / norm);
 }
 
 inline double clamp01(double value) {
@@ -583,43 +572,8 @@ void ReachableCartesianImpedanceController::handleHumanWorkspaceState(
   }
 
   cps_human_workspace::HumanWorkspace::Parameters parameters;
-  parameters.sphere_center = Vector3d(
-      msg->sphere_center.x,
-      msg->sphere_center.y,
-      msg->sphere_center.z);
-  parameters.center_velocity = Vector3d(
-      msg->center_velocity.x,
-      msg->center_velocity.y,
-      msg->center_velocity.z);
-  parameters.center_sinusoid_amplitude.setZero();
-  parameters.center_sinusoid_frequency_hz = 0.0;
-  parameters.center_sinusoid_phase_rad = 0.0;
-  parameters.center_motion_time_offset_sec = 0.0;
-  parameters.motion_radius = msg->motion_radius;
-  parameters.hand_max_velocity = msg->hand_max_velocity;
-  parameters.hand_max_acceleration = msg->hand_max_acceleration;
-  parameters.measurement_error_position =
-      msg->measurement_error_position;
-  parameters.measurement_error_velocity =
-      msg->measurement_error_velocity;
-  parameters.measurement_delay = msg->measurement_delay;
-
-  const bool reachability_parameters_valid =
-      std::isfinite(parameters.hand_max_velocity) &&
-      parameters.hand_max_velocity >= 0.0 &&
-      std::isfinite(parameters.hand_max_acceleration) &&
-      parameters.hand_max_acceleration > 0.0 &&
-      std::isfinite(parameters.measurement_error_position) &&
-      parameters.measurement_error_position >= 0.0 &&
-      std::isfinite(parameters.measurement_error_velocity) &&
-      parameters.measurement_error_velocity >= 0.0 &&
-      std::isfinite(parameters.measurement_delay) &&
-      parameters.measurement_delay >= 0.0;
-  if (parameters.motion_radius < 0.0 ||
-      !std::isfinite(parameters.motion_radius) ||
-      !parameters.sphere_center.allFinite() ||
-      !parameters.center_velocity.allFinite() ||
-      !reachability_parameters_valid) {
+  if (!cps_human_workspace::humanWorkspaceParametersFromMessage(
+          *msg, &parameters)) {
     RCLCPP_WARN_THROTTLE(
         get_node()->get_logger(),
         *get_node()->get_clock(),
@@ -1130,11 +1084,9 @@ bool ReachableCartesianImpedanceController::calibrationExecutionComplete()
 // ============================================================================
 std::vector<ImpedanceSample>
 ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
-    double nominal_guess_time,
     const ImpedanceSample& planning_start_command,
     double initial_path_rate,
     double target_path_rate,
-    double commanded_path_time,
     bool reanchor_path_kinematics,
     double reanchor_path_rate,
     double reanchor_path_acceleration,
@@ -1142,11 +1094,6 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
   if (failure_reason != nullptr) {
     *failure_reason = PlanFailureReason::kNone;
   }
-  // Strict path-consistent execution never reconstructs scalar progress from an
-  // arbitrary Cartesian state.  These time guesses are retained in the caller
-  // interface for logging/backward compatibility, but cannot authorize motion.
-  (void)nominal_guess_time;
-  (void)commanded_path_time;
   CartesianTrajectorySample planning_start;
   planning_start.t = planning_start_command.t;
   planning_start.p = planning_start_command.p;
@@ -1249,8 +1196,6 @@ ReachableCartesianImpedanceController::makeIntendedBufferFromReplanner(
     PathConsistentTimedPathConfig path_config;
     path_config.intended_steps = std::max(1, local_replan_horizon_steps_);
     path_config.dt = local_replan_dt_;
-    path_config.path_lookahead_sec = local_path_lookahead_sec_;
-    path_config.project_start_to_nearest_path_state = false;
     path_config.max_path_rate = std::max(path_time_rate_max_, 1e-4);
     path_config.max_path_acceleration =
         std::max(path_time_acc_limit_, 1e-4);
@@ -1348,15 +1293,11 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     const Vector3d& current_position,
     const Quaterniond& current_orientation,
     const Vector6d& ee_twist,
-    const Matrix7d& inertia,
-    const Matrix37d& Jv,
     const Matrix6d& K_runtime,
     const Matrix6d& D_runtime,
     const std::vector<ImpedanceSample>& intended_samples,
     std::size_t derivative_reanchor_index,
     PlanFailureReason* failure_reason) const {
-  (void)inertia;
-  (void)Jv;
   if (failure_reason != nullptr) {
     *failure_reason = PlanFailureReason::kNone;
   }
@@ -1411,10 +1352,6 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     return plan;
   }
 
-  plan.nominal_time_anchor =
-      intended_samples.back().nominal_path_time_valid
-          ? intended_samples.back().nominal_path_time
-          : intended_samples.back().t;
   const ImpedanceSample freeze_anchor = plan.intended.back();
   // Match SaRA-Shield's separation between the dense controller trajectory
   // and the coarser reachability interval edges: braking remains sampled at
@@ -1440,13 +1377,11 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     if (freeze_anchor.nominal_path_time_valid) {
       PathConsistentTimedPathConfig path_brake_config;
       path_brake_config.dt = failsafe_plan_dt;
-      path_brake_config.path_lookahead_sec = local_path_lookahead_sec_;
       path_brake_config.max_path_rate = std::max(path_time_rate_max_, 1e-4);
       path_brake_config.max_path_acceleration =
           std::max(failsafe_path_time_acc_limit_, 1e-4);
       path_brake_config.max_path_jerk =
           std::max(failsafe_path_time_jerk_limit_, 1e-4);
-      path_brake_config.target_path_rate = 0.0;
       if (freeze_anchor.nominal_path_kinematics_valid) {
         path_brake_config.initial_path_rate =
             freeze_anchor.nominal_path_rate;
@@ -1730,13 +1665,9 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
 
 SafetyMonitorConfig ReachableCartesianImpedanceController::makeSafetyMonitorConfig(
     const cps_human_workspace::HumanWorkspace& human_workspace,
-    const Matrix6d& K_runtime,
-    const Matrix6d& D_runtime,
     double wall_time) const {
   SafetyMonitorConfig config;
   config.human_workspace = human_workspace;
-  config.K_runtime = K_runtime;
-  config.D_runtime = D_runtime;
   config.wall_time_sec = wall_time;
   config.energy_budget_joule = energy_budget_joule_;
   config.kinetic_energy_error_bound_joule =
@@ -1827,7 +1758,6 @@ VerifiedPlan ReachableCartesianImpedanceController::makeSparsePlanForMonitor(
   VerifiedPlan sparse_plan;
   sparse_plan.anchor = dense_plan.anchor;
   sparse_plan.generated_wall_time = dense_plan.generated_wall_time;
-  sparse_plan.nominal_time_anchor = dense_plan.nominal_time_anchor;
   sparse_plan.intended_exec_index = 0;
   sparse_plan.failsafe_exec_index = 0;
 
@@ -1905,8 +1835,6 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
     const Vector7d& coriolis,
     const Vector6d& control_jdot_dq,
     const Vector7d& previous_torque_command,
-    const Matrix6d& K_runtime,
-    const Matrix6d& D_runtime,
     const cps_human_workspace::HumanWorkspace& human_workspace,
     bool human_workspace_active,
     bool human_workspace_assumed_clear,
@@ -1928,10 +1856,7 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
   const VerifiedPlan monitor_plan = makeSparsePlanForMonitor(plan);
 
   SafetyMonitorConfig config = makeSafetyMonitorConfig(
-      human_workspace,
-      K_runtime,
-      D_runtime,
-      plan.generated_wall_time);
+      human_workspace, plan.generated_wall_time);
   config.assume_human_workspace_clear = human_workspace_assumed_clear;
   config.current_energy_reference_valid = current_command_reference_valid;
   if (current_command_reference_valid) {
@@ -2006,7 +1931,7 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
 // Shield decision
 // ============================================================================
 ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
-    double wall_time, double nominal_guess_time,
+    double wall_time,
     const Vector7d& q, const Vector7d& dq,
     const Vector3d& current_position, const Quaterniond& current_orientation,
     const Vector6d& ee_twist, const Matrix7d& inertia, const Matrix67d& J_geo,
@@ -2039,8 +1964,6 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
         coriolis,
         control_jdot_dq,
         tau_cmd_prev_,
-        K_runtime_,
-        D_runtime_,
         human_workspace_,
         human_workspace_active_,
         false,
@@ -2114,11 +2037,9 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     const auto planner_tic = SteadyClock::now();
     const std::vector<ImpedanceSample> intended_buffer =
         makeIntendedBufferFromReplanner(
-            nominal_guess_time,
             planning_start_command,
             commanded_path_rate_,
             path_time_rate_target_,
-            commanded_path_time_,
             reanchor_path_kinematics,
             reanchor_path_rate,
             reanchor_path_acceleration,
@@ -2144,8 +2065,6 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
         current_position,
         current_orientation,
         ee_twist,
-        inertia,
-        J_geo.topRows<3>(),
         K_runtime_,
         D_runtime_,
         intended_segment,
@@ -2341,26 +2260,12 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
 
     planning_start_command.failsafe = false;
 
-    const double nominal_advance_duration =
-        static_cast<double>(input.nominal_advance_steps) *
-        std::max(local_replan_dt_, kMinDt);
-    const double activation_nominal_guess_time =
-        input.nominal_guess_time + nominal_advance_duration;
-    const double activation_commanded_path_time =
-        planning_start_command.nominal_path_time_valid
-            ? planning_start_command.nominal_path_time
-            : input.commanded_path_time +
-                  std::max(0.0, input.commanded_path_rate) *
-                      nominal_advance_duration;
-
     const auto planner_tic = SteadyClock::now();
     const std::vector<ImpedanceSample> intended_buffer =
         makeIntendedBufferFromReplanner(
-            activation_nominal_guess_time,
             planning_start_command,
             input.commanded_path_rate,
             input.target_path_rate,
-            activation_commanded_path_time,
             input.reanchor_path_kinematics,
             input.reanchor_path_rate,
             input.reanchor_path_acceleration,
@@ -2398,8 +2303,6 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
         input.current_position,
         input.current_orientation,
         input.ee_twist,
-        input.inertia,
-        input.Jv,
         input.K_runtime,
         input.D_runtime,
         intended_segment,
@@ -2428,8 +2331,6 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
         input.coriolis,
         input.control_jdot_dq,
         input.previous_torque_command,
-        input.K_runtime,
-        input.D_runtime,
         input.human_workspace,
         input.human_workspace_active,
         input.human_workspace_assumed_clear,
@@ -2891,7 +2792,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       async_input.last_commanded_sample_valid = last_commanded_sample_valid_;
       async_input.last_nullspace_stiffness = last_nullspace_stiffness_;
       async_input.overbudget_joint_state = overbudget_joint_state_;
-      async_input.commanded_path_time = commanded_path_time_;
       async_input.commanded_path_rate = commanded_path_rate_;
       // The nominal generator always requests the configured path rate.
       // Inside the collision area, energy adaptation changes impedance gains
@@ -2949,15 +2849,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           break;
         }
         async_input.committed_prefix.push_back(committed_command);
-      }
-      if (commit_only_remaining_intended) {
-        async_input.nominal_advance_steps =
-            static_cast<std::size_t>(std::count_if(
-                async_input.committed_prefix.begin(),
-                async_input.committed_prefix.end(),
-                [](const ImpedanceSample& command) {
-                  return !command.failsafe;
-                }));
       }
       // Continue from the explicit scalar state of the committed command.
       // Cartesian derivatives cannot recover path rate at a legitimate cusp:
@@ -3390,8 +3281,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     if (do_monitor) {
       const std::uint64_t generation_before_monitor =
           last_verified_plan_generation_;
-      shield_dec = computeShieldDecision(wall_time, nominal_guess_time,
-                                         q, dq,
+      shield_dec = computeShieldDecision(wall_time, q, dq,
                                          current_position, current_orientation,
                                          ee_twist, inertia, J_collision_geo,
                                          coriolis, Jdot_dq_filtered_);
@@ -4108,8 +3998,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
   try {
     auto_declare<std::string>("arm_id", "panda");
     auto_declare<bool>("enable_error_logging", true);
-    auto_declare<std::string>("error_log_path",
-        "");
     auto_declare<std::string>("error_log_root_dir", kDefaultErrorLogRootDir);
     auto_declare<std::string>("error_log_file_name", kDefaultErrorLogFileName);
     auto_declare<bool>("enable_prediction_logging", true);
@@ -4141,9 +4029,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     if (startup_via_points_source != "action") {
       auto_declare<std::vector<double>>(
           "cartesian_via_points",
-          std::vector<double>{std::numeric_limits<double>::quiet_NaN()});
-      auto_declare<std::vector<double>>(
-          "cartesian_via_point_quaternions",
           std::vector<double>{std::numeric_limits<double>::quiet_NaN()});
     }
 
@@ -4186,6 +4071,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<bool>("enable_reachable_set_visualization", true);
     auto_declare<std::string>(
         "reachable_set_visualization_topic", "~/robot_reachable_sets");
+    auto_declare<std::string>(
+        "human_reachable_set_topic",
+        "/human_workspace/reachable_set");
     auto_declare<std::string>("reachable_set_visualization_frame_id", "");
     auto_declare<double>("reachable_set_visualization_period_sec", 0.1);
     auto_declare<double>("reachable_set_visualization_alpha", 0.3);
@@ -4198,7 +4086,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<int>("async_planning_lead_steps", 8);
     auto_declare<int>("async_verified_horizon_steps", 20);
 
-    cps_human_workspace::HumanWorkspace::declareParameters(get_node());
+    auto_declare<std::string>("human_workspace_config_path", "");
     auto_declare<std::string>("human_workspace_topic", "human_workspace/state");
     auto_declare<double>("human_workspace_timeout_sec", 0.5);
 
@@ -4223,7 +4111,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
   try {
     arm_id_ = get_node()->get_parameter("arm_id").as_string();
     enable_error_logging_ = get_node()->get_parameter("enable_error_logging").as_bool();
-    legacy_error_log_path_ = get_node()->get_parameter("error_log_path").as_string();
     error_log_root_dir_ = get_node()->get_parameter("error_log_root_dir").as_string();
     error_log_file_name_ = get_node()->get_parameter("error_log_file_name").as_string();
     enable_prediction_logging_ =
@@ -4251,12 +4138,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     }
     error_log_file_name_ =
         sanitizedFileNameOrDefault(error_log_file_name_, kDefaultErrorLogFileName);
-
-    if (!legacy_error_log_path_.empty()) {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "error_log_path is deprecated and will be ignored. Use error_log_root_dir and error_log_file_name.");
-    }
 
     cartesian_via_points_topic_ =
         get_node()->get_parameter("cartesian_via_points_topic").as_string();
@@ -4294,10 +4175,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
       }
     }
 
-    const bool via_points_are_full_states =
-        !cartesian_via_points.empty() &&
-        (cartesian_via_points.size() % 7) == 0;
-    if (via_points_are_full_states) {
+    if (!cartesian_via_points.empty() &&
+        (cartesian_via_points.size() % 7) == 0) {
       const std::size_t via_point_count = cartesian_via_points.size() / 7;
       cartesian_via_points_.reserve(via_point_count);
       cartesian_via_point_quaternions_.reserve(via_point_count);
@@ -4322,80 +4201,10 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
               normalizedQuaternionOrIdentity(q));
         }
       }
-    } else if (!cartesian_via_points.empty() &&
-               (cartesian_via_points.size() % 3) == 0) {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "cartesian_via_points currently expects 7 values per base-frame state [x, y, z, qx, qy, qz, qw]. Falling back to legacy 3-value base-frame positions and using the activation orientation unless cartesian_via_point_quaternions is set.");
-      const std::size_t via_point_count = cartesian_via_points.size() / 3;
-      cartesian_via_points_.reserve(via_point_count);
-      for (std::size_t i = 0; i < via_point_count; ++i) {
-        cartesian_via_points_.emplace_back(
-            cartesian_via_points[3 * i + 0],
-            cartesian_via_points[3 * i + 1],
-            cartesian_via_points[3 * i + 2]);
-      }
     } else if (!cartesian_via_points.empty()) {
       RCLCPP_WARN(
           get_node()->get_logger(),
           "cartesian_via_points must contain 7-value base-frame states [x, y, z, qx, qy, qz, qw]. Ignoring this value.");
-    }
-
-    std::vector<double> cartesian_via_point_quaternions;
-    if (startup_via_points_source_ != "action") {
-      const rclcpp::Parameter via_quaternions_param =
-          get_node()->get_parameter("cartesian_via_point_quaternions");
-      if (via_quaternions_param.get_type() ==
-          rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY) {
-        cartesian_via_point_quaternions =
-            via_quaternions_param.as_double_array();
-      } else if (via_quaternions_param.get_type() !=
-                 rclcpp::ParameterType::PARAMETER_NOT_SET) {
-        RCLCPP_WARN(
-            get_node()->get_logger(),
-            "cartesian_via_point_quaternions must be a double array. Ignoring this value.");
-      }
-    }
-    if (via_points_are_full_states && !cartesian_via_point_quaternions.empty()) {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "cartesian_via_point_quaternions is deprecated and ignored because cartesian_via_points already contains 7-value Cartesian states.");
-    } else if ((cartesian_via_point_quaternions.size() % 4) != 0) {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "cartesian_via_point_quaternions must contain [x, y, z, w] groups. Ignoring the incomplete tail.");
-    }
-    const std::size_t via_quaternion_count =
-        via_points_are_full_states ? 0 : cartesian_via_point_quaternions.size() / 4;
-    if (!via_points_are_full_states) {
-      cartesian_via_point_quaternions_.reserve(
-          cartesian_via_point_quaternions_.size() + via_quaternion_count);
-      for (std::size_t i = 0; i < via_quaternion_count; ++i) {
-        const Quaterniond q(
-            cartesian_via_point_quaternions[4 * i + 3],
-            cartesian_via_point_quaternions[4 * i + 0],
-            cartesian_via_point_quaternions[4 * i + 1],
-            cartesian_via_point_quaternions[4 * i + 2]);
-        const double norm = q.norm();
-        if (!std::isfinite(norm) || norm < 1.0e-12) {
-          RCLCPP_WARN(
-              get_node()->get_logger(),
-              "cartesian_via_point_quaternions[%zu] is invalid. Using identity quaternion.",
-              i);
-          cartesian_via_point_quaternions_.push_back(Quaterniond::Identity());
-        } else {
-          cartesian_via_point_quaternions_.push_back(
-              normalizedQuaternionOrIdentity(q));
-        }
-      }
-    }
-    if (!cartesian_via_point_quaternions_.empty() &&
-        cartesian_via_point_quaternions_.size() != cartesian_via_points_.size()) {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "cartesian_via_point_quaternions count (%zu) differs from cartesian_via_points count (%zu). Missing orientations keep the activation orientation; extra orientations rotate at the last Cartesian point.",
-          cartesian_via_point_quaternions_.size(),
-          cartesian_via_points_.size());
     }
 
     const double pos_stiffness =
@@ -4499,6 +4308,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     reachable_set_visualization_topic_ =
         get_node()->get_parameter(
             "reachable_set_visualization_topic").as_string();
+    human_reachable_set_topic_ =
+        get_node()->get_parameter(
+            "human_reachable_set_topic").as_string();
     reachable_set_visualization_frame_id_ =
         get_node()->get_parameter(
             "reachable_set_visualization_frame_id").as_string();
@@ -4515,11 +4327,12 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         0.01,
         1.0);
     if (enable_reachable_set_visualization_ &&
-        reachable_set_visualization_topic_.empty()) {
+        (reachable_set_visualization_topic_.empty() ||
+         human_reachable_set_topic_.empty())) {
       RCLCPP_ERROR(
           get_node()->get_logger(),
-          "reachable_set_visualization_topic must not be empty when "
-          "visualization is enabled");
+          "Robot marker and human reachable-set output topics must not be "
+          "empty when reachable-set output is enabled");
       return CallbackReturn::ERROR;
     }
     if (robot_reach_config_path_.empty()) {
@@ -4697,8 +4510,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
         std::max<int64_t>(
             1,
             get_node()->get_parameter("async_verified_horizon_steps").as_int()));
-    local_path_lookahead_sec_ =
-        std::max(trajectory_settings.local_path_lookahead_sec, local_replan_dt_);
     waypoint_merge_position_tolerance_ = std::max(
         0.0, trajectory_settings.waypoint_merge_position_tolerance);
     waypoint_merge_orientation_tolerance_ = std::max(
@@ -4805,14 +4616,23 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
           get_node()->create_publisher<visualization_msgs::msg::MarkerArray>(
               reachable_set_visualization_topic_,
               rclcpp::QoS(1).reliable().transient_local());
+      human_reachable_set_pub_ =
+          get_node()->create_publisher<
+              cps_human_workspace::msg::HumanReachableSet>(
+              human_reachable_set_topic_,
+              rclcpp::QoS(1).reliable().transient_local());
       RCLCPP_INFO(
           get_node()->get_logger(),
-          "Publishing SaRA robot reachable sets on '%s' in frame '%s' "
-          "(safe=last interval, unsafe=first unsafe interval).",
+          "Publishing SaRA robot markers on '%s' and the selected human "
+          "reachable-set data on '%s' in frame '%s' (safe=last interval, "
+          "contact=first contact interval, unsafe=first energy-unsafe "
+          "interval).",
           reachable_set_visualization_topic_.c_str(),
+          human_reachable_set_topic_.c_str(),
           reachable_set_visualization_frame_id_.c_str());
     } else {
       reachable_set_visualization_pub_.reset();
+      human_reachable_set_pub_.reset();
     }
 
     if (!cartesian_via_points_topic_.empty()) {
@@ -5171,6 +4991,11 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
       if (human_workspace_config_path.empty()) {
         human_workspace_config_path = "(none)";
       }
+      const auto& human_parameters = human_workspace_.parameters();
+      const bool human_center_motion_enabled =
+          human_parameters.center_velocity.squaredNorm() > 1.0e-18 ||
+          (human_parameters.center_sinusoid_amplitude.squaredNorm() > 1.0e-18 &&
+           human_parameters.center_sinusoid_frequency_hz > 0.0);
       run_info_file << "run_directory: " << error_log_run_dir_ << "\n"
                     << "csv_file: " << error_log_file_path_ << "\n"
                     << "prediction_csv_file: " << prediction_log_file_path_ << "\n"
@@ -5278,6 +5103,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                          enable_reachable_set_visualization_) << "\n"
                     << "reachable_set_visualization_topic: "
                     << reachable_set_visualization_topic_ << "\n"
+                    << "human_reachable_set_topic: "
+                    << human_reachable_set_topic_ << "\n"
                     << "reachable_set_visualization_frame_id: "
                     << reachable_set_visualization_frame_id_ << "\n"
                     << "reachable_set_visualization_period_sec: "
@@ -5396,39 +5223,39 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << desired_position_.y() << ", "
                     << desired_position_.z() << "]\n"
                     << "human_sphere_center: ["
-                    << human_workspace_.center().x() << ", "
-                    << human_workspace_.center().y() << ", "
-                    << human_workspace_.center().z() << "]\n"
+                    << human_parameters.sphere_center.x() << ", "
+                    << human_parameters.sphere_center.y() << ", "
+                    << human_parameters.sphere_center.z() << "]\n"
                     << "human_center_motion_enabled: "
-                    << static_cast<int>(human_workspace_.hasMovingCenter()) << "\n"
+                    << static_cast<int>(human_center_motion_enabled) << "\n"
                     << "human_center_linear_velocity: ["
-                    << human_workspace_.centerLinearVelocity().x() << ", "
-                    << human_workspace_.centerLinearVelocity().y() << ", "
-                    << human_workspace_.centerLinearVelocity().z() << "]\n"
+                    << human_parameters.center_velocity.x() << ", "
+                    << human_parameters.center_velocity.y() << ", "
+                    << human_parameters.center_velocity.z() << "]\n"
                     << "human_center_sinusoid_amplitude: ["
-                    << human_workspace_.centerSinusoidAmplitude().x() << ", "
-                    << human_workspace_.centerSinusoidAmplitude().y() << ", "
-                    << human_workspace_.centerSinusoidAmplitude().z() << "]\n"
+                    << human_parameters.center_sinusoid_amplitude.x() << ", "
+                    << human_parameters.center_sinusoid_amplitude.y() << ", "
+                    << human_parameters.center_sinusoid_amplitude.z() << "]\n"
                     << "human_center_sinusoid_frequency_hz: "
-                    << human_workspace_.centerSinusoidFrequencyHz() << "\n"
+                    << human_parameters.center_sinusoid_frequency_hz << "\n"
                     << "human_center_sinusoid_phase_rad: "
-                    << human_workspace_.centerSinusoidPhaseRad() << "\n"
+                    << human_parameters.center_sinusoid_phase_rad << "\n"
                     << "human_center_motion_time_offset_sec: "
-                    << human_workspace_.centerMotionTimeOffsetSec() << "\n"
+                    << human_parameters.center_motion_time_offset_sec << "\n"
                     << "human_hand_physical_radius: "
-                    << human_workspace_.motionRadius() << "\n"
+                    << human_parameters.motion_radius << "\n"
                     << "human_reachability_model: "
                     << "sara_body_part_combined_single_hand\n"
                     << "human_hand_max_velocity: "
-                    << human_workspace_.handMaxVelocity() << "\n"
+                    << human_parameters.hand_max_velocity << "\n"
                     << "human_hand_max_acceleration: "
-                    << human_workspace_.handMaxAcceleration() << "\n"
+                    << human_parameters.hand_max_acceleration << "\n"
                     << "human_measurement_error_position: "
-                    << human_workspace_.measurementErrorPosition() << "\n"
+                    << human_parameters.measurement_error_position << "\n"
                     << "human_measurement_error_velocity: "
-                    << human_workspace_.measurementErrorVelocity() << "\n"
+                    << human_parameters.measurement_error_velocity << "\n"
                     << "human_measurement_delay: "
-                    << human_workspace_.measurementDelay() << "\n"
+                    << human_parameters.measurement_delay << "\n"
                     << "human_workspace_config_path: "
                     << human_workspace_config_path << "\n";
     }
@@ -5456,7 +5283,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
 CallbackReturn ReachableCartesianImpedanceController::on_deactivate(
     const rclcpp_lifecycle::State& /*previous_state*/) {
   stopSafetyMonitorWorker();
-  clearRobotReachableSetVisualization();
+  clearReachableSetOutputs();
   stopLogWriters();
   plan_failure_reason_ = PlanFailureReason::kNone;
   human_workspace_active_ = false;

@@ -79,10 +79,28 @@ def test_one_yaml_generates_urdf_mjcf_and_controller_parameters(tmp_path):
     assert float(tool_link.find('inertial/mass').attrib['value']) == pytest.approx(0.2)
 
     scene_root = ET.parse(artifacts.mujoco_scene_path).getroot()
-    robot_include = Path(scene_root.find('include').attrib['file'])
+    scene_includes = scene_root.findall('include')
+    robot_include = Path(scene_includes[0].attrib['file'])
     robot_root = ET.parse(robot_include).getroot()
     assert robot_root.find(".//body[@name='panda_metal_ball']") is not None
     assert robot_root.find("sensor/touch[@name='panda_metal_ball_touch']") is not None
+
+    table_include = Path(scene_includes[1].attrib['file'])
+    table_root = ET.parse(table_include).getroot()
+    table_assembly = table_root.find(
+        "worldbody/body[@name='table_assembly']"
+    )
+    assert table_assembly is not None
+    assert table_assembly.attrib['mocap'] == 'true'
+    assert table_assembly.find("body[@name='table']") is not None
+    assert table_assembly.find(
+        "body[@name='hand_surface_spring_visual']"
+    ) is not None
+    hand_surface = table_assembly.find("body[@name='human_hand_surface']")
+    assert hand_surface is not None
+    assert hand_surface.find(
+        "joint[@name='hand_surface_spring_z']"
+    ) is not None
 
     controller_config = yaml.safe_load(
         Path(artifacts.controller_config_path).read_text(encoding='utf-8')
@@ -142,7 +160,6 @@ def test_relative_mesh_is_shared_by_urdf_and_mujoco(tmp_path):
         monitor_base_urdf_path=str(WORKSPACE / 'model_urdf/panda_ng.urdf'),
         output_root=str(tmp_path / 'generated'),
         mujoco_base_path=str(DESCRIPTION / 'mujoco/franka/panda_ng.xml'),
-        mujoco_table_path=str(DESCRIPTION / 'mujoco/franka/table.xml'),
     )
 
     urdf_root = ET.parse(artifacts.monitor_urdf_path).getroot()

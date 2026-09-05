@@ -9,8 +9,9 @@ from rclpy.action import ActionClient
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 
+from cps_mujoco_scenarios.action import MoveTableAssembly
 from mujoco_ros_msgs.msg import ScalarStamped
-from mujoco_ros_msgs.srv import GetGeomProperties, SetGeomProperties, SetPause
+from mujoco_ros_msgs.srv import SetPause
 from panda_motion_generator_msgs.action import CartesianViaMotion
 
 
@@ -24,25 +25,6 @@ DEFAULT_VIA_POSES = (
     (0.306957, 0.0, 0.029912, 0.923956, -0.382499, 0.0, 0.0),
 )
 
-DISAPPEARING_GEOMS = (
-    "table_top",
-    "table_leg_fl",
-    "table_leg_fr",
-    "table_leg_rl",
-    "table_leg_rr",
-    "hand_surface_pad",
-    "spring_seg_01",
-    "spring_seg_02",
-    "spring_seg_03",
-    "spring_seg_04",
-    "spring_seg_05",
-    "spring_seg_06",
-    "spring_seg_07",
-    "spring_seg_08",
-    "spring_seg_09",
-    "spring_seg_10",
-)
-
 
 class StaticDownCollisionDisappearTest(Node):
     def __init__(self, args):
@@ -51,10 +33,6 @@ class StaticDownCollisionDisappearTest(Node):
         self.contact_seen = False
         self.contact_time = None
         self.disappear_started = False
-        self.disappear_done = False
-        self.geom_index = 0
-        self.failed_geoms = []
-        self.goal_done = False
         self.exit_code = 0
         self.test_started_time = None
 
@@ -66,10 +44,8 @@ class StaticDownCollisionDisappearTest(Node):
 
         self.action_client = ActionClient(
             self, CartesianViaMotion, args.action_name)
-        self.geom_client = self.create_client(
-            SetGeomProperties, args.set_geom_properties_service)
-        self.geom_properties_client = self.create_client(
-            GetGeomProperties, args.get_geom_properties_service)
+        self.scene_action_client = ActionClient(
+            self, MoveTableAssembly, args.scene_action_name)
         self.pause_client = self.create_client(SetPause, args.pause_service)
 
         self.start_timer = self.create_timer(0.1, self.try_start)
@@ -174,11 +150,9 @@ class StaticDownCollisionDisappearTest(Node):
         try:
             result = future.result().result.result
         except Exception as exc:
-            self.goal_done = True
             self.get_logger().warn(f"Could not read action result: {exc}")
             return
 
-        self.goal_done = True
         if result.state == 0:
             self.get_logger().info("Straight-down goal completed.")
             return
@@ -195,8 +169,8 @@ class StaticDownCollisionDisappearTest(Node):
         self.contact_timeout_timer.cancel()
         self.get_logger().info(
             f"Collision detected on {self.args.contact_topic}: {msg.value:.6g}. "
-            f"Waiting {self.args.disappear_delay:.1f}s before hiding the scene geoms.")
-        self.disappear_timer = self.create_timer(0.05, self.maybe_disappear_scene_geoms)
+            f"Waiting {self.args.disappear_delay:.1f}s before lowering the scene.")
+        self.disappear_timer = self.create_timer(0.05, self.maybe_hide_scene)
 
     def check_contact_timeout(self):
         if self.contact_seen or self.test_started_time is None:
@@ -212,7 +186,7 @@ class StaticDownCollisionDisappearTest(Node):
         self.exit_code = 5
         rclpy.shutdown()
 
-    def maybe_disappear_scene_geoms(self):
+    def maybe_hide_scene(self):
         if self.disappear_started or self.contact_time is None:
             return
 
@@ -222,119 +196,69 @@ class StaticDownCollisionDisappearTest(Node):
 
         self.disappear_started = True
         self.disappear_timer.cancel()
-        self.start_disappear_geoms()
+        self.start_hide_scene()
 
-    def start_disappear_geoms(self):
-        if not self.geom_client.wait_for_service(timeout_sec=self.args.service_timeout):
-            self.get_logger().error(
-                "Set-geom-properties service "
-                f"{self.args.set_geom_properties_service} is not available.")
-            self.exit_code = 3
-            rclpy.shutdown()
-            return
-        if not self.geom_properties_client.wait_for_service(
+    def start_hide_scene(self):
+        if not self.scene_action_client.wait_for_server(
                 timeout_sec=self.args.service_timeout):
             self.get_logger().error(
-                "Get-geom-properties service "
-                f"{self.args.get_geom_properties_service} is not available.")
+                f"Scene action {self.args.scene_action_name} is not available.")
             self.exit_code = 3
             rclpy.shutdown()
             return
 
+        goal = MoveTableAssembly.Goal()
+        goal.target_z_offset = self.args.hide_z_offset
+        goal.duration = self.args.hide_duration
         self.get_logger().info(
-            "Shrinking table, spring, and hand-surface geoms to make them disappear.")
-        self.geom_index = 0
-        self.failed_geoms = []
-        self.call_next_disappear_geom()
+            "Moving the complete table/spring/surface assembly to "
+            f"z offset {goal.target_z_offset:.3f} m over {goal.duration:.3f} s.")
+        future = self.scene_action_client.send_goal_async(goal)
+        future.add_done_callback(self.handle_hide_goal_response)
 
-    def call_next_disappear_geom(self):
-        if self.geom_index >= len(DISAPPEARING_GEOMS):
-            if self.failed_geoms:
-                self.get_logger().error(
-                    "Some geoms could not be hidden: " + ", ".join(self.failed_geoms))
-                self.exit_code = 4
-            else:
-                self.disappear_done = True
-                self.get_logger().info(
-                    "Table, spring, and hand surface disappeared.")
+    def handle_hide_goal_response(self, future):
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self.get_logger().error(
+                f"Could not send table hide action: {exc}")
+            self.exit_code = 4
             rclpy.shutdown()
             return
 
-        geom_name = DISAPPEARING_GEOMS[self.geom_index]
+        if not goal_handle.accepted:
+            self.get_logger().error("Table hide action was rejected.")
+            self.exit_code = 4
+            rclpy.shutdown()
+            return
 
-        request = GetGeomProperties.Request()
-        request.geom_name = geom_name
-        request.admin_hash = self.args.admin_hash
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.handle_hide_result)
 
-        future = self.geom_properties_client.call_async(request)
-        future.add_done_callback(
-            lambda done_future, name=geom_name: self.handle_geom_properties_result(
-                name, done_future))
-
-    def handle_geom_properties_result(self, geom_name, future):
+    def handle_hide_result(self, future):
         try:
-            response = future.result()
+            result = future.result().result
         except Exception as exc:
-            self.get_logger().error(
-                f"Get-geom-properties call failed for {geom_name}: {exc}")
-            self.failed_geoms.append(geom_name)
-            self.geom_index += 1
-            self.call_next_disappear_geom()
+            self.get_logger().error(f"Could not read table hide result: {exc}")
+            self.exit_code = 4
+            rclpy.shutdown()
             return
 
-        if not response.success:
-            self.get_logger().error(
-                f"Could not read {geom_name}: {response.status_message}")
-            self.failed_geoms.append(geom_name)
-            self.geom_index += 1
-            self.call_next_disappear_geom()
-            return
-
-        size = self.args.hidden_geom_size
-        sizes = (
-            min(size, max(0.0, response.properties.size_0)),
-            min(size, max(0.0, response.properties.size_1)),
-            min(size, max(0.0, response.properties.size_2)),
-        )
-
-        request = SetGeomProperties.Request()
-        request.properties.name = geom_name
-        request.properties.size_0 = sizes[0]
-        request.properties.size_1 = sizes[1]
-        request.properties.size_2 = sizes[2]
-        request.set_size = True
-        request.admin_hash = self.args.admin_hash
-
-        future = self.geom_client.call_async(request)
-        future.add_done_callback(
-            lambda done_future, name=geom_name: self.handle_disappear_geom_result(
-                name, done_future))
-
-    def handle_disappear_geom_result(self, geom_name, future):
-        try:
-            response = future.result()
-        except Exception as exc:
-            self.get_logger().error(
-                f"Set-geom-properties call failed for {geom_name}: {exc}")
-            self.failed_geoms.append(geom_name)
-            self.geom_index += 1
-            self.call_next_disappear_geom()
-            return
-
-        if not response.success:
-            self.get_logger().error(
-                f"Could not hide {geom_name}: {response.status_message}")
-            self.failed_geoms.append(geom_name)
-
-        self.geom_index += 1
-        self.call_next_disappear_geom()
+        if not result.success:
+            self.get_logger().error(f"Table hide action failed: {result.message}")
+            self.exit_code = 4
+        else:
+            self.get_logger().info(
+                "Table, spring, and hand surface moved below the floor. "
+                "Send target_z_offset=0.0 later to raise them again.")
+        rclpy.shutdown()
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         description=(
             "Send a z-axis straight Cartesian test, wait for MuJoCo touch "
-            "contact, then hide the table/spring/surface after a delay. "
+            "contact, then move the table/spring/surface below the floor. "
             "Launch cps_human_workspace separately for the static workspace."))
     parser.add_argument(
         "--action-name",
@@ -343,13 +267,9 @@ def parse_args(argv):
     parser.add_argument("--contact-threshold", type=float, default=1.0e-6)
     parser.add_argument("--contact-timeout", type=float, default=60.0)
     parser.add_argument("--disappear-delay", type=float, default=3.0)
-    parser.add_argument(
-        "--set-geom-properties-service",
-        default="/set_geom_properties")
-    parser.add_argument(
-        "--get-geom-properties-service",
-        default="/get_geom_properties")
-    parser.add_argument("--hidden-geom-size", type=float, default=1.0e-5)
+    parser.add_argument("--scene-action-name", default="/move_table_assembly")
+    parser.add_argument("--hide-z-offset", type=float, default=-0.5)
+    parser.add_argument("--hide-duration", type=float, default=3.0)
     parser.add_argument("--pause-service", default="/set_pause")
     parser.add_argument(
         "--no-unpause",
@@ -364,7 +284,7 @@ def parse_args(argv):
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     args.contact_timeout = max(args.contact_timeout, 0.1)
-    args.hidden_geom_size = max(args.hidden_geom_size, 1.0e-8)
+    args.hide_duration = max(args.hide_duration, 0.01)
 
     rclpy.init()
     node = StaticDownCollisionDisappearTest(args)

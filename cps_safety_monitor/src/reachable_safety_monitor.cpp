@@ -349,9 +349,6 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
 
   out.workspace_distance_min = out.workspace_distance_now;
 
-  Matrix6d K_exec = config.K_runtime;
-  Matrix6d D_exec = config.D_runtime;
-
   double E_contact_max = 0.0;
 
   double terminal_T_ub = 0.0;
@@ -377,11 +374,10 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
 
   auto eval_sample = [&](const ImpedanceSample& s, double dtp) {
     const int interval_index = monitored_interval_index++;
-    const double segment_start_time_sec = config.wall_time_sec + t_prev;
     const double segment_end_time_sec = config.wall_time_sec + s.t;
 
-    K_exec = s.K;
-    D_exec = s.D;
+    const Matrix6d & K_exec = s.K;
+    const Matrix6d & D_exec = s.D;
 
     const Matrix6d K_cartesian = positiveSemidefinitePart(K_exec);
     const Matrix3d Kp_raw = K_exec.topLeftCorner<3, 3>();
@@ -450,7 +446,6 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
               x_pred,
               x_next,
               inflated_contact_radius_segment,
-              segment_start_time_sec,
               segment_end_time_sec);
     }
 
@@ -613,17 +608,18 @@ MonitorResult verifyReachablePlanJointSpace(
                         const Matrix67d& jacobian,
                         Matrix6d* lambda,
                         Matrix7d* inertia_inv) {
-    if (lambda == nullptr || inertia_inv == nullptr ||
-        !inertia.allFinite() || !jacobian.allFinite()) {
+    if (lambda == nullptr || !inertia.allFinite() ||
+        !jacobian.allFinite()) {
       return false;
     }
     const Eigen::LDLT<Matrix7d> inertia_ldlt(symmetrize7(inertia));
     if (inertia_ldlt.info() != Eigen::Success) {
       return false;
     }
-    *inertia_inv = inertia_ldlt.solve(Matrix7d::Identity());
+    const Matrix7d computed_inertia_inv =
+        inertia_ldlt.solve(Matrix7d::Identity());
     Matrix6d lambda_inv =
-        jacobian * (*inertia_inv) * jacobian.transpose();
+        jacobian * computed_inertia_inv * jacobian.transpose();
     lambda_inv = symmetrized(lambda_inv);
     lambda_inv.diagonal().array() += kLambdaReg;
     const Eigen::LDLT<Matrix6d> lambda_ldlt(lambda_inv);
@@ -631,7 +627,10 @@ MonitorResult verifyReachablePlanJointSpace(
       return false;
     }
     *lambda = symmetrized(lambda_ldlt.solve(Matrix6d::Identity()));
-    return lambda->allFinite() && inertia_inv->allFinite();
+    if (inertia_inv != nullptr) {
+      *inertia_inv = computed_inertia_inv;
+    }
+    return lambda->allFinite() && computed_inertia_inv.allFinite();
   };
   auto collisionPosition = [&](const JointDynamicsSample& state) -> Vector3d {
     return state.control_position +
@@ -772,10 +771,9 @@ MonitorResult verifyReachablePlanJointSpace(
   out.workspace_distance_min = out.workspace_distance_now;
 
   Matrix6d current_lambda = Matrix6d::Zero();
-  Matrix7d current_inertia_inv = Matrix7d::Zero();
   const bool current_lambda_valid = taskInertia(
       state.inertia, state.control_jacobian,
-      &current_lambda, &current_inertia_inv);
+      &current_lambda, nullptr);
   if (config.current_energy_reference_valid) {
     const Vector6d current_error =
         poseError(state, config.current_energy_reference);
@@ -825,15 +823,9 @@ MonitorResult verifyReachablePlanJointSpace(
   bool previous_torque_command_valid =
       config.previous_torque_command_valid;
 
-  const Vector6d previous_edge_twist_initial =
-      state.control_jacobian * dq_pred;
   const Vector6d previous_edge_error_initial =
       poseError(state, plan.anchor);
-  double previous_edge_cartesian_kinetic = current_lambda_valid
-      ? quadraticEnergy(
-            previous_edge_twist_initial,
-            positiveSemidefinitePart(current_lambda))
-      : 0.0;
+  double previous_edge_cartesian_kinetic = 0.0;
   double previous_edge_joint_kinetic =
       jointKineticEnergy(dq_pred, state.inertia);
   double previous_edge_potential = quadraticEnergy(
@@ -1185,7 +1177,6 @@ MonitorResult verifyReachablePlanJointSpace(
               collision_end,
               config.human_workspace.inflatedCollisionRadius(
                   config.ee_collision_radius, rho_p),
-              config.wall_time_sec + t_prev,
               config.wall_time_sec + desired.t);
     }
     if (segment_distance < out.workspace_distance_min) {
@@ -1195,10 +1186,9 @@ MonitorResult verifyReachablePlanJointSpace(
 
     const Vector6d next_error = poseError(next_state, desired);
     Matrix6d next_lambda = Matrix6d::Zero();
-    Matrix7d next_inertia_inv = Matrix7d::Zero();
     const bool next_lambda_valid = taskInertia(
         next_state.inertia, next_state.control_jacobian,
-        &next_lambda, &next_inertia_inv);
+        &next_lambda, nullptr);
     const Vector6d next_twist =
         next_state.control_jacobian * dq_next;
     const double cartesian_kinetic = next_lambda_valid

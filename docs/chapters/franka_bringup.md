@@ -105,13 +105,6 @@ mujoco_server:
         - mujoco_ros2_control
       mujoco_ros2_control:
         type: mujoco_ros2_control::MujocoRos2ControlPlugin
-        hardware: # Not used
-          type: mujoco_ros_control/RobotHW
-          control_period: 0.001
-        params: # Not used
-          namespace: ""
-          robot_description_node: "robot_state_publisher"
-          robot_description: "robot_description"
 ```
 For the most part, you would not need to change anything about this block.
 

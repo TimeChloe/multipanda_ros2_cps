@@ -6,16 +6,6 @@ mujoco_server:
         - mujoco_ros2_sensors
       mujoco_ros2_control:
         type: mujoco_ros2_control::MujocoRos2ControlPlugin
-        hardware:
-          type: mujoco_ros_control/RobotHW
-          control_period: 0.001
-        params:
-          namespace: ""
-          robot_description_node: "robot_state_publisher"
-          robot_description: "robot_description"
-          # Options: "friction" keeps MJCF joint damping/frictionloss;
-          # "no_friction" zeros damping/frictionloss on Panda arm joints.
-          panda_model_variant: "friction"
       mujoco_ros2_sensors:
         type: mujoco_ros::sensors::MujocoRos2SensorsPlugin
 
@@ -136,7 +126,6 @@ nonlinear_impedance_controller:
 
 free_motion_external_wrench_controller:
   ros__parameters:
-    type: cps_controllers/FreeMotionExternalWrenchController
     arm_id: panda
 
     joint_damping: [0.12, 0.12, 0.10, 0.08, 0.05, 0.05, 0.04]
@@ -300,12 +289,14 @@ reachable_cartesian_impedance_controller:
     # complete intended + failsafe prediction, matching SaRA Shield PFL mode.
     # Leave sara_robot_config_path unset to use the installed SaRA Panda YAML.
     sara_secure_radius: 0.00
-    # Match SaRA-Shield visualization: show only the final interval when the
-    # plan is safe, or the first unsafe interval when verification rejects it.
+    # Match SaRA-Shield interval selection. The controller publishes robot
+    # markers plus the selected human reachable-set data; cps_human_workspace
+    # converts only the latter into the RViz marker.
     enable_reachable_set_visualization: true
     reachable_set_visualization_topic: "~/robot_reachable_sets"
+    human_reachable_set_topic: "/human_workspace/reachable_set"
     reachable_set_visualization_frame_id: panda_link0
-    reachable_set_visualization_period_sec: 0.1
+    reachable_set_visualization_period_sec: 0.02
     reachable_set_visualization_alpha: 0.3
     async_safety_monitor: true
     # Pin the 200 Hz worker away from the main ROS/MuJoCo scheduling traffic on

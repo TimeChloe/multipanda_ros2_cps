@@ -56,6 +56,7 @@ def _launch_setup(context):
     tool_config = LaunchConfiguration('tool_config').perform(context)
     output_root = LaunchConfiguration('tool_output_dir').perform(context)
     use_rviz = LaunchConfiguration('use_rviz')
+    verbose = LaunchConfiguration('verbose')
 
     description_share = get_package_share_directory('franka_description')
     bringup_share = get_package_share_directory('franka_bringup')
@@ -88,7 +89,7 @@ def _launch_setup(context):
         monitor_base_urdf_path=monitor_base,
         output_root=output_root,
         mujoco_base_path=mujoco_base,
-        mujoco_table_path=table_model,
+        mujoco_table_path=table_model if scene == 'table_spring' else None,
         include_table=scene == 'table_spring',
         controller_config_path=controller_config,
     )
@@ -100,7 +101,7 @@ def _launch_setup(context):
     )
     tool_name = artifacts.tool.name if artifacts.tool else 'none'
 
-    return [
+    launch_actions = [
         LogInfo(
             msg=(
                 f"Unified tool model: {tool_name}; "
@@ -120,8 +121,7 @@ def _launch_setup(context):
             launch_arguments={
                 'use_sim_time': 'true',
                 'modelfile': artifacts.mujoco_scene_path,
-                'verbose': 'true',
-                'ns': ns,
+                'verbose': verbose,
                 'mujoco_plugin_config': artifacts.controller_config_path,
             }.items(),
         ),
@@ -161,6 +161,19 @@ def _launch_setup(context):
         ),
     ]
 
+    if scene == 'table_spring':
+        launch_actions.append(Node(
+            package='cps_mujoco_scenarios',
+            executable='table_assembly_action_server',
+            name='table_assembly_action_server',
+            output='screen',
+            parameters=[{
+                'use_sim_time': True,
+            }],
+        ))
+
+    return launch_actions
+
 
 def generate_launch_description():
     bringup_share = get_package_share_directory('franka_bringup')
@@ -170,6 +183,14 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(
             'use_rviz', default_value='true', description='Visualize the robot in Rviz.'
+        ),
+        DeclareLaunchArgument(
+            'verbose',
+            default_value='false',
+            description=(
+                'Enable MuJoCo server, plugin-loader and viewer DEBUG logs. '
+                'The default INFO level suppresses per-request debug messages.'
+            ),
         ),
         DeclareLaunchArgument(
             'arm_id',

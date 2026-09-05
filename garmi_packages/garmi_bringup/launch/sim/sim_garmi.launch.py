@@ -1,14 +1,11 @@
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.launch_description_sources import FrontendLaunchDescriptionSource
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Shutdown
-from launch.conditions import IfCondition, UnlessCondition
-from launch.substitutions import Command, FindExecutable, LaunchConfiguration, PathJoinSubstitution
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
+from launch.substitutions import Command, FindExecutable, LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
 import os
-
-import xacro
 def concatenate_ns(ns1, ns2, absolute=False):
     
     if(len(ns1) == 0):
@@ -50,7 +47,7 @@ def generate_launch_description():
     if(load_gripper): # mujoco scene file must be manually adjusted since there's no way to pass parameters
         if(load_lidars):
             scene_file = 'garmi_lidar.xml'
-            yaml_config = 'sim_garmi_lidarless.yaml'
+            yaml_config = 'sim_garmi_lidar.yaml'
         else:
             scene_file = 'garmi.xml'
     else:
@@ -60,8 +57,7 @@ def generate_launch_description():
     xml_path = os.path.join(get_package_share_directory('garmi_description'), 'mujoco', 'garmi', 'assets', 'xml', scene_file)
     mjros_config_file = os.path.join(get_package_share_directory('garmi_bringup'), 'config', 'sim',
                                      yaml_config)
-    ns = ''     # this must match the namespace argument under mujoco_ros2_control in the plugin's parameter yaml file. 
-                # See the ros2_control_plugins_example_with_ns.yaml file for more details.
+    ns = ''
 
     # Robot state publisher setup
     robot_description = Command(
@@ -124,7 +120,6 @@ def generate_launch_description():
                 'use_sim_time': "true",
                 'modelfile': xml_path,
                 'verbose': "true",
-                'ns': ns,
                 'mujoco_plugin_config': mjros_config_file
 
             }.items()

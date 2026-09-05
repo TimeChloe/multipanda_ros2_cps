@@ -5,8 +5,9 @@ Cartesian controller and safety monitor.
 
 The intended split is:
 
-- `cps_human_workspace`: C++ model, YAML parser, RViz visualizer, and default
-  example configs.
+- `cps_human_workspace`: C++ BodyPartCombined model, YAML parser, common ROS
+  observation adapter, observation publisher, human reachable-set visualizer,
+  and default example configs.
 - Scenario or lab packages: config-only ROS packages that install one or more
   human workspace YAML files under `config/`.
 
@@ -62,7 +63,28 @@ as a timestamped observation and generates a SaRA BodyPartCombined reachable bal
 each monitor interval until `human_workspace_timeout_sec` expires. A zero or
 invalid timestamp falls back to receipt time.
 
-## Start The Visualizer
+All providers use the public `makeHumanWorkspaceMessage()` adapter. The
+controller uses the matching `humanWorkspaceParametersFromMessage()` parser,
+which applies one validation policy and removes any source-specific future
+motion. Consequently the static YAML source, synthetic crossing source, and
+MuJoCo surface source enter exactly the same BodyPartCombined calculation:
+
+```text
+static/dynamic YAML ─┐
+                    ├─ common HumanWorkspace message ─ BodyPartCombined ─ monitor
+MuJoCo observation ─┘                                      │
+                                                           └─ HumanReachableSet
+                                                                      │
+                                  cps_human_workspace visualizer ─────┘
+                                                │
+                                                └─ blue RViz sphere
+```
+
+There is no provider-specific reachable-set marker or calculation. The source
+only determines the latest measured center and velocity plus the configured
+physical/error bounds.
+
+## Start An Observation Provider
 
 Use the built-in configs:
 
@@ -71,28 +93,35 @@ ros2 launch cps_human_workspace human_workspace_visualizer.launch.py \
   human_workspace_config:=human_workspace_dynamic_crossing.yaml
 ```
 
-Markers expire automatically after `marker_lifetime_sec` seconds once the
-visualizer stops publishing. Set `marker_lifetime_sec:=0.0` if you want RViz to
-keep the last marker forever.
+This launch starts two separate nodes. `human_workspace_publisher` publishes
+only timestamped hand observations. The reachable controller evaluates
+successive 5 ms robot/human intervals over the complete intended + failsafe
+trajectory, publishes its robot markers, and publishes the selected human
+occupancy as `cps_human_workspace/msg/HumanReachableSet`. The independent
+`human_reachable_set_visualizer` in this package converts that result into the
+blue RViz sphere on `/human_workspace/markers`; no human Marker is constructed
+inside the controller.
 
-The `Human Hand Reachable Set` RViz display shows only the cyan preview of one
-SaRA BodyPartCombined interval. It intentionally contains no separate physical-hand
-sphere or text label. SaRA's Panda trajectory configuration uses
-`reachability_set_interval_size: 5`; with this project's `1 ms` sample time,
-the interval is therefore `5 ms`:
+The selected interval remains synchronized with the robot display: the final
+interval for a clear trajectory, the first contact interval for an energy-safe
+contact, or the first energy-unsafe contact interval. The visualizer does not
+run another reachability model and therefore cannot diverge from the sphere
+published by the controller.
+
+The robot and human generators remain independent, as in SaRA: RobotArmReach
+builds robot capsules from joint states, while BodyPartCombined builds the
+human sphere from the timestamped hand observation. Sharing an interval for
+calculation and visualization does not mix the two models.
+
+To start only the presentation node, for example when the observation provider
+is launched by a scenario package:
 
 ```bash
-ros2 launch cps_human_workspace human_workspace_visualizer.launch.py \
-  human_workspace_config:=human_workspace_dynamic_crossing.yaml \
-  reachability_set_interval_sec:=0.005
+ros2 launch cps_human_workspace human_reachable_set_visualizer.launch.py
 ```
 
-The preview is not the complete braking horizon. The controller evaluates
-successive 5 ms intervals over its complete intended + failsafe trajectory.
-The `SaRA Robot Reachable Sets` RViz display publishes only the selected robot
-interval. Human markers remain owned by the `Human Hand Reachable Set` display;
-the safety monitor is the layer that intersects the independently generated
-robot and human occupancies.
+Its input is `/human_workspace/reachable_set`, and its only output is the
+`/human_workspace/markers` MarkerArray consumed by RViz.
 
 Use a config from another ROS package:
 
@@ -101,12 +130,6 @@ ros2 launch cps_human_workspace human_workspace_visualizer.launch.py \
   human_workspace_package:=my_lab_workspace \
   human_workspace_config:=table_corner.yaml
 ```
-
-The default EE collision marker is centered on `panda_metal_ball_link`, which
-is the metal ball center in the simulated Panda model. `ee_collision_radius`
-sets the radius expanded around that center. If you visualize from
-`panda_link8` instead, pass `ee_frame_id:=panda_link8` and
-`ee_collision_center_offset_z:=0.03`.
 
 ## Create A New Workspace Package
 

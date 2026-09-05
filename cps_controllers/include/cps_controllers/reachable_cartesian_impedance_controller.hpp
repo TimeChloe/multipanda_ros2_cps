@@ -25,6 +25,7 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 
 #include "cps_human_workspace/human_workspace.hpp"
+#include "cps_human_workspace/msg/human_reachable_set.hpp"
 #include "cps_human_workspace/msg/human_workspace.hpp"
 #include "cps_controllers/bounded_async_file_writer.hpp"
 #include "cps_controllers/latest_value_mailbox.hpp"
@@ -88,11 +89,9 @@ class ReachableCartesianImpedanceController
   bool anchorLastCommandedSampleToPathStart();
 
   std::vector<ImpedanceSample> makeIntendedBufferFromReplanner(
-      double nominal_guess_time,
       const ImpedanceSample& planning_start_command,
       double initial_path_rate,
       double target_path_rate,
-      double commanded_path_time,
       bool reanchor_path_kinematics,
       double reanchor_path_rate,
       double reanchor_path_acceleration,
@@ -103,8 +102,6 @@ class ReachableCartesianImpedanceController
       const Vector3d& current_position,
       const Quaterniond& current_orientation,
       const Vector6d& ee_twist,
-      const Matrix7d& inertia,
-      const Matrix37d& Jv,
       const Matrix6d& K_runtime,
       const Matrix6d& D_runtime,
       const std::vector<ImpedanceSample>& intended_samples,
@@ -122,8 +119,6 @@ class ReachableCartesianImpedanceController
                                       const Vector7d& coriolis,
                                       const Vector6d& control_jdot_dq,
                                       const Vector7d& previous_torque_command,
-                                      const Matrix6d& K_runtime,
-                                      const Matrix6d& D_runtime,
                                       const cps_human_workspace::HumanWorkspace& human_workspace,
                                       bool human_workspace_active,
                                       bool human_workspace_assumed_clear,
@@ -152,7 +147,6 @@ class ReachableCartesianImpedanceController
                                              const Vector3d& cartesian_velocity) const;
 
   ShieldDecision computeShieldDecision(double wall_time,
-                                       double nominal_guess_time,
                                        const Vector7d& q,
                                        const Vector7d& dq,
                                        const Vector3d& current_position,
@@ -165,8 +159,6 @@ class ReachableCartesianImpedanceController
 
   SafetyMonitorConfig makeSafetyMonitorConfig(
       const cps_human_workspace::HumanWorkspace& human_workspace,
-      const Matrix6d& K_runtime,
-      const Matrix6d& D_runtime,
       double wall_time) const;
 
   struct AsyncMonitorInput {
@@ -201,13 +193,11 @@ class ReachableCartesianImpedanceController
     double last_nullspace_stiffness{0.0};
     cps_safety_monitor::OverbudgetJointStabilizationState
         overbudget_joint_state;
-    double commanded_path_time{0.0};
     double commanded_path_rate{0.0};
     double target_path_rate{1.0};
     bool reanchor_path_kinematics{false};
     double reanchor_path_rate{0.0};
     double reanchor_path_acceleration{0.0};
-    std::size_t nominal_advance_steps{0};
     std::vector<ImpedanceSample> committed_prefix;
   };
 
@@ -289,7 +279,7 @@ class ReachableCartesianImpedanceController
       bool calibration_execution);
   void safetyMonitorWorkerLoop();
 
-  struct ReachableSetVisualizationSnapshot {
+  struct ReachableSetOutputSnapshot {
     double wall_time{0.0};
     Vector7d current_q{Vector7d::Zero()};
     cps_human_workspace::HumanWorkspace human_workspace;
@@ -301,9 +291,8 @@ class ReachableCartesianImpedanceController
     std::vector<JointPredictionSample> joint_prediction_trace;
   };
 
-  void publishRobotReachableSetVisualization(
-      const ReachableSetVisualizationSnapshot& snapshot);
-  void clearRobotReachableSetVisualization();
+  void publishReachableSetOutputs(const ReachableSetOutputSnapshot& snapshot);
+  void clearReachableSetOutputs();
   void startSafetyMonitorWorker();
   void stopSafetyMonitorWorker();
   void handleCartesianViaPoints(
@@ -483,7 +472,6 @@ class ReachableCartesianImpedanceController
   bool enable_error_logging_{false};
   std::string error_log_root_dir_{"/home/developer/multipanda_ws/src/data_log"};
   std::string error_log_file_name_{"reachable_cartesian_impedance_validation.csv"};
-  std::string legacy_error_log_path_;
   std::string error_log_run_dir_;
   std::string error_log_file_path_;
   bool command_recording_active_{false};
@@ -544,6 +532,7 @@ class ReachableCartesianImpedanceController
   double robot_secure_radius_{0.02};
   bool enable_reachable_set_visualization_{true};
   std::string reachable_set_visualization_topic_{"~/robot_reachable_sets"};
+  std::string human_reachable_set_topic_{"/human_workspace/reachable_set"};
   std::string reachable_set_visualization_frame_id_;
   double reachable_set_visualization_period_sec_{0.1};
   double reachable_set_visualization_alpha_{0.3};
@@ -551,6 +540,8 @@ class ReachableCartesianImpedanceController
   std::size_t last_reachable_set_visualization_marker_count_{0};
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr
       reachable_set_visualization_pub_;
+  rclcpp::Publisher<cps_human_workspace::msg::HumanReachableSet>::SharedPtr
+      human_reachable_set_pub_;
   // Constant joint-space inertia added only by the Pinocchio prediction
   // backend. This represents simulator armature/rotor inertia that is absent
   // from the URDF. The real Franka model interface ignores this value.
@@ -656,7 +647,6 @@ class ReachableCartesianImpedanceController
 
   int local_replan_horizon_steps_{64};
   double local_replan_dt_{0.001};
-  double local_path_lookahead_sec_{0.08};
   double waypoint_merge_position_tolerance_{0.001};
   double waypoint_merge_orientation_tolerance_{0.005};
   double local_replan_max_velocity_{0.08};

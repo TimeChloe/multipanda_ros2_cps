@@ -11,11 +11,22 @@
   <buildtool_depend>ament_cmake_python</buildtool_depend>
 
   <exec_depend>franka_description</exec_depend>
+  <exec_depend>franka_control2</exec_depend>
   <exec_depend>franka_hardware</exec_depend>
+  <exec_depend>franka_example_controllers</exec_depend>
+  <exec_depend>franka_robot_state_broadcaster</exec_depend>
   <exec_depend>joint_state_publisher</exec_depend>
+  <exec_depend>cps_controllers</exec_depend>
+  <exec_depend>cps_mujoco_scenarios</exec_depend>
+  <exec_depend>multi_mode_controller</exec_depend>
+  <exec_depend>mujoco_ros</exec_depend>
+  <exec_depend>mujoco_ros2_control</exec_depend>
+  <exec_depend>mujoco_ros2_sensors</exec_depend>
+  <exec_depend>panda_motion_generators</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>controller_manager</exec_depend>
   <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>joint_trajectory_controller</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>xacro</exec_depend>
   <exec_depend>ament_index_python</exec_depend>

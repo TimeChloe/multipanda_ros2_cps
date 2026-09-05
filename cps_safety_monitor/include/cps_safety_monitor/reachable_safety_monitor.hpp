@@ -301,7 +301,6 @@ struct VerifiedPlan {
   std::size_t failsafe_exec_index{0};
 
   double generated_wall_time{0.0};
-  double nominal_time_anchor{0.0};
 };
 
 struct SafetyMonitorConfig {
@@ -313,9 +312,6 @@ struct SafetyMonitorConfig {
   // explicit non-safety calibration mode; missing workspace data is not
   // evidence that no human is present.
   bool assume_human_workspace_clear{false};
-
-  Matrix6d K_runtime{Matrix6d::Zero()};
-  Matrix6d D_runtime{Matrix6d::Zero()};
 
   // Command that was actually being executed when the measured state used by
   // this monitor snapshot was captured. It must be expressed at the same

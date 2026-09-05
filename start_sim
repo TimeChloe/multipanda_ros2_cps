@@ -85,4 +85,12 @@ potential_energy_error_bound_joule: 0.027
 enable_runtime_energy_scaling: true
 enable_calibration_logging: false
 calibration_assume_no_human: false
+
+
+ros2 action send_goal /move_table_assembly \
+  cps_mujoco_scenarios/action/MoveTableAssembly \
+  "{target_z_offset: 0.5, duration: 5.0}" --feedback
+
+
+ros2 launch cps_mujoco_scenarios surface_following_human_workspace.launch.py
   

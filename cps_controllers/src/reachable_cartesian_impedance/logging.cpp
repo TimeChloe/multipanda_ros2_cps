@@ -247,7 +247,6 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       int index,
       const ImpedanceSample & collision_sample,
       double dtp) {
-      const double segment_start_time_sec = wall_time + t_prev;
       const double segment_end_time_sec = wall_time + collision_sample.t;
       K_exec = collision_sample.K;
       D_exec = collision_sample.D;
@@ -369,7 +368,6 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
           x_next,
           human_workspace.inflatedCollisionRadius(
             ee_collision_radius_, 0.0),
-          segment_start_time_sec,
           segment_end_time_sec);
       }
       row.contact_possible = row.d_segment <= 0.0;

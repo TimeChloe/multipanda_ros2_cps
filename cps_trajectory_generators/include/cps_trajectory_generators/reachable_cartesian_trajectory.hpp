@@ -25,9 +25,7 @@ struct CartesianTrajectorySample {
 };
 
 struct LocalCartesianReplanConfig {
-  int horizon_steps{200};
   double dt{0.001};
-  double path_lookahead_sec{0.08};
   // Consecutive intermediate waypoints inside both tolerances are merged.
   // The final target is always retained.
   double waypoint_merge_position_tolerance{0.001};
@@ -44,11 +42,6 @@ struct LocalCartesianReplanConfig {
 struct PathConsistentTimedPathConfig {
   int intended_steps{1};
   double dt{0.001};
-  double path_lookahead_sec{0.08};
-  // Reprojection is useful when reconnecting an arbitrary Cartesian state.
-  // It must be disabled when the caller already owns an exact verified scalar
-  // path state, otherwise nearby/crossing path branches can be skipped.
-  bool project_start_to_nearest_path_state{true};
   double max_path_rate{1.0};
   double max_path_acceleration{0.5};
   double max_path_jerk{5.0};
@@ -68,7 +61,6 @@ struct TrajectoryGeneratorSettings {
 
   int local_replan_horizon_steps{64};
   double local_replan_dt{0.001};
-  double local_path_lookahead_sec{0.50};
   double waypoint_merge_position_tolerance{0.001};
   double waypoint_merge_orientation_tolerance{0.005};
   double local_replan_max_velocity{0.5};
@@ -109,23 +101,11 @@ std::vector<CartesianTrajectorySample> makeSmoothViaPointCartesianTrajectory(
     const std::vector<Eigen::Quaterniond>& waypoint_orientations,
     const LocalCartesianReplanConfig& config);
 
-std::vector<CartesianTrajectorySample> makeLocalCartesianReplanFromTimedPath(
-    double min_path_time,
-    const CartesianTrajectorySample& planning_start,
-    const std::vector<CartesianTrajectorySample>& timed_path,
-    const LocalCartesianReplanConfig& config);
-
 CartesianTrajectorySample makeRetimedPathState(
     const std::vector<CartesianTrajectorySample>& timed_path,
     double path_time,
     double path_rate,
     double path_acceleration);
-
-std::vector<CartesianTrajectorySample> makePathConsistentTimedPathReplan(
-    double min_path_time,
-    const CartesianTrajectorySample& planning_start,
-    const std::vector<CartesianTrajectorySample>& timed_path,
-    const PathConsistentTimedPathConfig& config);
 
 std::vector<CartesianTrajectorySample> makePathConsistentTimedPathIntendedPrefix(
     double min_path_time,
@@ -138,9 +118,5 @@ std::vector<CartesianTrajectorySample> makePathConsistentTimedPathBrake(
     const CartesianTrajectorySample& brake_start,
     const std::vector<CartesianTrajectorySample>& timed_path,
     const PathConsistentTimedPathConfig& config);
-
-std::vector<CartesianTrajectorySample> makeCartesianBrakeTrajectory(
-    const CartesianTrajectorySample& brake_start,
-    const LocalCartesianReplanConfig& config);
 
 }  // namespace cps_trajectory_generators

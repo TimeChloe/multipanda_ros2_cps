@@ -89,9 +89,18 @@ ros2 launch cps_human_workspace human_workspace_visualizer.launch.py \
 
 Then run this helper. It unpauses MuJoCo, sends the straight-down goal above,
 watches `/panda_metal_ball_touch`, waits 3 seconds after first contact, then
-uses `/set_geom_properties` to shrink the table, spring, and hand-surface geoms
-so they disappear without reloading the MuJoCo model:
+sends `/move_table_assembly` to lower the complete table, spring, and
+hand-surface assembly 0.5 m below the floor:
 
 ```bash
 python3 tools/static_down_collision_disappear_test.py
+```
+
+Restore the complete assembly later with a second action goal. It rises 0.5 m
+over 5 seconds and then holds its original pose:
+
+```bash
+ros2 action send_goal /move_table_assembly \
+  cps_mujoco_scenarios/action/MoveTableAssembly \
+  "{target_z_offset: 0.0, duration: 5.0}" --feedback
 ```

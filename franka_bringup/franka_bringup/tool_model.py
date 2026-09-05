@@ -565,10 +565,18 @@ def _render_mujoco_robot(
     return ET.tostring(root, encoding="unicode", xml_declaration=True)
 
 
-def _render_scene(robot_mjcf_path: str, table_path: str, include_table: bool) -> str:
+def _render_scene(
+    robot_mjcf_path: str,
+    table_path: Optional[str],
+    include_table: bool,
+) -> str:
     root = ET.Element("mujoco", {"model": "panda scene"})
     ET.SubElement(root, "include", {"file": str(Path(robot_mjcf_path).resolve())})
     if include_table:
+        if not table_path:
+            raise ToolModelError(
+                "mujoco_table_path is required when include_table is true"
+            )
         ET.SubElement(root, "include", {"file": str(Path(table_path).resolve())})
     ET.SubElement(root, "statistic", {"center": "0.3 0 0.4", "extent": "1"})
     visual = ET.SubElement(root, "visual")
@@ -686,7 +694,10 @@ def generate_tool_artifacts(
     inputs = [robot_xacro_path, monitor_base_urdf_path]
     if tool_config_path:
         inputs.append(tool_config_path)
-    for optional_path in (mujoco_base_path, mujoco_table_path, controller_config_path):
+    optional_paths = [mujoco_base_path, controller_config_path]
+    if include_table:
+        optional_paths.append(mujoco_table_path)
+    for optional_path in optional_paths:
         if optional_path:
             inputs.append(optional_path)
     digest = hashlib.sha256()
@@ -710,8 +721,6 @@ def generate_tool_artifacts(
         robot_mjcf = _render_mujoco_robot(mujoco_base_path, tool, arm_id)
         robot_mjcf_path = output_directory / "panda_with_tool.xml"
         robot_mjcf_path.write_text(robot_mjcf, encoding="utf-8")
-        if not mujoco_table_path:
-            raise ToolModelError("mujoco_table_path is required when generating a scene")
         scene_path = output_directory / "scene_with_tool.xml"
         scene_path.write_text(
             _render_scene(str(robot_mjcf_path), mujoco_table_path, include_table),

@@ -20,8 +20,6 @@ namespace
 
 constexpr double kMinimumCapsuleLength = 1.0e-9;
 constexpr char kReachableSetNamespace[] = "sara_robot_reachable_set";
-constexpr char kLegacyHumanReachableSetNamespace[] =
-  "sara_human_hand_reachable_set";
 
 enum class ReachableSetContactState
 {
@@ -60,11 +58,12 @@ std_msgs::msg::ColorRGBA saraReachableSetColor(
 namespace cps_controllers
 {
 
-void ReachableCartesianImpedanceController::publishRobotReachableSetVisualization(
-  const ReachableSetVisualizationSnapshot & snapshot)
+void ReachableCartesianImpedanceController::publishReachableSetOutputs(
+  const ReachableSetOutputSnapshot & snapshot)
 {
   if (!enable_reachable_set_visualization_ ||
     !reachable_set_visualization_pub_ ||
+    !human_reachable_set_pub_ ||
     !robot_reachability_provider_)
   {
     return;
@@ -84,20 +83,13 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
   const auto marker_lifetime =
     rclcpp::Duration::from_seconds(1.0);
 
-  // Remove the duplicated human marker published by older controller builds.
-  // Human visualization is owned exclusively by cps_human_workspace.
-  visualization_msgs::msg::Marker legacy_human_marker;
-  legacy_human_marker.header.frame_id = reachable_set_visualization_frame_id_;
-  legacy_human_marker.header.stamp = stamp;
-  legacy_human_marker.ns = kLegacyHumanReachableSetNamespace;
-  legacy_human_marker.id = 0;
-  legacy_human_marker.action = visualization_msgs::msg::Marker::DELETE;
-  marker_array.markers.push_back(std::move(legacy_human_marker));
-
   int marker_id = 0;
   const auto & trace = snapshot.joint_prediction_trace;
   const std::vector<double> zero_alpha(7, 0.0);
   std::vector<double> dynamic_alpha;
+  cps_human_workspace::HumanWorkspace::ReachableSphere selected_human_reach;
+  bool selected_human_reach_valid = false;
+  bool selected_interval_valid = false;
   const bool dynamic_alpha_valid = trace.size() >= 2 &&
     robot_reachability_provider_->calculateTrajectoryAlpha(
     trace, &dynamic_alpha);
@@ -168,17 +160,17 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
       std::vector<cps_safety_monitor::RobotReachCapsule> * capsules) {
       return capsules != nullptr &&
              robot_reachability_provider_->reachInterval(
-          start_q,
-          goal_q,
-          std::max(0.0, goal_time - start_time),
-          alpha_i,
-          capsules);
+        start_q,
+        goal_q,
+        std::max(0.0, goal_time - start_time),
+        alpha_i,
+        capsules);
     };
 
   auto capsule_intersections = [&](
-      const std::vector<cps_safety_monitor::RobotReachCapsule> & capsules,
-      double goal_time,
-      std::vector<bool> * intersections) {
+    const std::vector<cps_safety_monitor::RobotReachCapsule> & capsules,
+    double goal_time,
+    std::vector<bool> * intersections) {
       if (intersections == nullptr) {
         return false;
       }
@@ -192,6 +184,13 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
       const auto hand_reach =
         snapshot.human_workspace.handReachableSetAtTime(
         snapshot.wall_time + goal_time);
+      if (!hand_reach.center.allFinite() ||
+        !std::isfinite(hand_reach.radius) || hand_reach.radius < 0.0)
+      {
+        return false;
+      }
+      selected_human_reach = hand_reach;
+      selected_human_reach_valid = true;
       for (std::size_t index = 0; index < capsules.size(); ++index) {
         const std::vector<cps_safety_monitor::RobotReachCapsule>
         single_capsule{capsules[index]};
@@ -210,9 +209,9 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
     };
 
   auto append_interval = [this, &append_capsule](
-      const std::vector<cps_safety_monitor::RobotReachCapsule> & capsules,
-      const std::vector<bool> & intersections,
-      bool contact_energy_unsafe) {
+    const std::vector<cps_safety_monitor::RobotReachCapsule> & capsules,
+    const std::vector<bool> & intersections,
+    bool contact_energy_unsafe) {
       if (intersections.size() != capsules.size()) {
         return;
       }
@@ -220,9 +219,9 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
       for (std::size_t index = 0; index < capsules.size(); ++index) {
         ReachableSetContactState state = ReachableSetContactState::kClear;
         if (intersections[index]) {
-          state = contact_energy_unsafe
-            ? ReachableSetContactState::kContactEnergyUnsafe
-            : ReachableSetContactState::kContactEnergySafe;
+          state = contact_energy_unsafe ?
+            ReachableSetContactState::kContactEnergyUnsafe :
+            ReachableSetContactState::kContactEnergySafe;
         }
         append_capsule(
           capsules[index],
@@ -237,18 +236,19 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
       std::vector<cps_safety_monitor::RobotReachCapsule> capsules;
       std::vector<bool> intersections;
       if (interval_capsules(
-        snapshot.current_q,
-        snapshot.current_q,
-        0.0,
-        0.0,
-        zero_alpha,
-        &capsules) &&
+          snapshot.current_q,
+          snapshot.current_q,
+          0.0,
+          0.0,
+          zero_alpha,
+          &capsules) &&
         capsule_intersections(capsules, 0.0, &intersections))
       {
         append_interval(
           capsules,
           intersections,
           snapshot.current_contact_energy_unsafe);
+        selected_interval_valid = true;
       }
     }
   } else if (dynamic_alpha_valid) {
@@ -262,7 +262,7 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
     {
       selected_interval =
         static_cast<std::size_t>(
-          snapshot.first_energy_unsafe_contact_interval_index);
+        snapshot.first_energy_unsafe_contact_interval_index);
       selected_contact_energy_unsafe = true;
     } else if (snapshot.first_contact_interval_index >= 0 &&
       static_cast<std::size_t>(snapshot.first_contact_interval_index) <
@@ -297,6 +297,7 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
           capsules,
           intersections,
           selected_contact_energy_unsafe);
+        selected_interval_valid = true;
       }
     }
   }
@@ -320,21 +321,46 @@ void ReachableCartesianImpedanceController::publishRobotReachableSetVisualizatio
   if (!marker_array.markers.empty()) {
     reachable_set_visualization_pub_->publish(marker_array);
   }
+
+  cps_human_workspace::msg::HumanReachableSet human_reachable_set;
+  human_reachable_set.header.frame_id =
+    reachable_set_visualization_frame_id_;
+  human_reachable_set.header.stamp = stamp;
+  if (selected_interval_valid && selected_human_reach_valid &&
+    snapshot.human_workspace_active &&
+    !snapshot.human_workspace_assumed_clear)
+  {
+    human_reachable_set.center.x = selected_human_reach.center.x();
+    human_reachable_set.center.y = selected_human_reach.center.y();
+    human_reachable_set.center.z = selected_human_reach.center.z();
+    human_reachable_set.radius = selected_human_reach.radius;
+    human_reachable_set.valid = true;
+  }
+  human_reachable_set_pub_->publish(human_reachable_set);
 }
 
-void ReachableCartesianImpedanceController::clearRobotReachableSetVisualization()
+void ReachableCartesianImpedanceController::clearReachableSetOutputs()
 {
-  if (!reachable_set_visualization_pub_) {
-    return;
+  const rclcpp::Time stamp = get_node()->now();
+  if (reachable_set_visualization_pub_) {
+    visualization_msgs::msg::MarkerArray marker_array;
+    visualization_msgs::msg::Marker marker;
+    marker.header.frame_id = reachable_set_visualization_frame_id_;
+    marker.header.stamp = stamp;
+    marker.ns = kReachableSetNamespace;
+    marker.action = visualization_msgs::msg::Marker::DELETEALL;
+    marker_array.markers.push_back(std::move(marker));
+    reachable_set_visualization_pub_->publish(marker_array);
   }
-  visualization_msgs::msg::MarkerArray marker_array;
-  visualization_msgs::msg::Marker marker;
-  marker.header.frame_id = reachable_set_visualization_frame_id_;
-  marker.header.stamp = get_node()->now();
-  marker.ns = kReachableSetNamespace;
-  marker.action = visualization_msgs::msg::Marker::DELETEALL;
-  marker_array.markers.push_back(std::move(marker));
-  reachable_set_visualization_pub_->publish(marker_array);
+
+  if (human_reachable_set_pub_) {
+    cps_human_workspace::msg::HumanReachableSet human_reachable_set;
+    human_reachable_set.header.frame_id =
+      reachable_set_visualization_frame_id_;
+    human_reachable_set.header.stamp = stamp;
+    human_reachable_set.valid = false;
+    human_reachable_set_pub_->publish(human_reachable_set);
+  }
   last_reachable_set_visualization_marker_count_ = 0;
 }
 

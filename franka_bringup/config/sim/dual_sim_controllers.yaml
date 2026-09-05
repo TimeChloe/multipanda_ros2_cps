@@ -5,16 +5,6 @@ mujoco_server:
         - mujoco_ros2_control
       mujoco_ros2_control:
         type: mujoco_ros2_control::MujocoRos2ControlPlugin
-        hardware:
-          type: mujoco_ros_control/RobotHW
-          control_period: 0.001
-        params:
-          namespace: ""
-          robot_description_node: "robot_state_publisher"
-          robot_description: "robot_description"
-          # Options: "friction" keeps MJCF joint damping/frictionloss;
-          # "no_friction" zeros damping/frictionloss on Panda arm joints.
-          panda_model_variant: "friction"
 
 controller_manager:
   ros__parameters:

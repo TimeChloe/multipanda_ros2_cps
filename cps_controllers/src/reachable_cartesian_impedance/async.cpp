@@ -2,11 +2,9 @@
 // Action handling, command ingress, and asynchronous monitor worker.
 
 #include <algorithm>
-#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -140,9 +138,7 @@ ReachableCartesianImpedanceController::buildCartesianViaPointPath(
   }
 
   LocalCartesianReplanConfig via_config;
-  via_config.horizon_steps = local_replan_horizon_steps_;
   via_config.dt = local_replan_dt_;
-  via_config.path_lookahead_sec = local_path_lookahead_sec_;
   via_config.waypoint_merge_position_tolerance =
     waypoint_merge_position_tolerance_;
   via_config.waypoint_merge_orientation_tolerance =
@@ -781,32 +777,33 @@ void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop()
     output.decision =
       computeShieldDecisionForAsyncInput(input, last_verified_plan);
 
-    const bool visualization_due =
+    const bool reachable_set_output_due =
       enable_reachable_set_visualization_ &&
       reachable_set_visualization_pub_ &&
+      human_reachable_set_pub_ &&
       (last_reachable_set_visualization_wall_time_ < 0.0 ||
       input.wall_time < last_reachable_set_visualization_wall_time_ ||
       input.wall_time - last_reachable_set_visualization_wall_time_ >=
       reachable_set_visualization_period_sec_);
-    ReachableSetVisualizationSnapshot visualization_snapshot;
-    if (visualization_due) {
-      visualization_snapshot.wall_time = input.wall_time;
-      visualization_snapshot.current_q = input.q;
-      visualization_snapshot.human_workspace = input.human_workspace;
-      visualization_snapshot.human_workspace_active =
+    ReachableSetOutputSnapshot reachable_set_snapshot;
+    if (reachable_set_output_due) {
+      reachable_set_snapshot.wall_time = input.wall_time;
+      reachable_set_snapshot.current_q = input.q;
+      reachable_set_snapshot.human_workspace = input.human_workspace;
+      reachable_set_snapshot.human_workspace_active =
         input.human_workspace_active;
-      visualization_snapshot.human_workspace_assumed_clear =
+      reachable_set_snapshot.human_workspace_assumed_clear =
         input.human_workspace_assumed_clear;
-      visualization_snapshot.current_contact_energy_unsafe =
+      reachable_set_snapshot.current_contact_energy_unsafe =
         output.decision.monitor.contact_relevant_for_energy &&
         output.decision.monitor.current_joint_energy_valid &&
         output.decision.monitor.current_total_control_energy >
         std::max(0.0, energy_budget_joule_);
-      visualization_snapshot.first_contact_interval_index =
+      reachable_set_snapshot.first_contact_interval_index =
         output.decision.monitor.first_contact_interval_index;
-      visualization_snapshot.first_energy_unsafe_contact_interval_index =
+      reachable_set_snapshot.first_energy_unsafe_contact_interval_index =
         output.decision.monitor.first_energy_unsafe_contact_interval_index;
-      visualization_snapshot.joint_prediction_trace =
+      reachable_set_snapshot.joint_prediction_trace =
         output.decision.joint_prediction_trace;
     }
 
@@ -829,10 +826,10 @@ void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop()
       async_monitor_output_overwrite_count_.fetch_add(
         discarded_outputs, std::memory_order_relaxed);
     }
-    // The safety result is handed off before RViz marker construction. This
-    // keeps visualization latency out of the controller's acceptance path.
-    if (visualization_due) {
-      publishRobotReachableSetVisualization(visualization_snapshot);
+    // The safety result is handed off before reachable-set output generation.
+    // This keeps visualization-related latency out of the acceptance path.
+    if (reachable_set_output_due) {
+      publishReachableSetOutputs(reachable_set_snapshot);
     }
   }
 }

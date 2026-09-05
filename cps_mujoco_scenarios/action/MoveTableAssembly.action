@@ -1,0 +1,15 @@
+# Absolute target height of the complete table/spring/surface assembly relative
+# to its loaded pose. The configured default range is [-0.5, 0.5] m; 0.0 always
+# restores the loaded pose.
+float64 target_z_offset
+
+# Wall-clock motion duration in seconds. The server uses a C2-smooth quintic
+# interpolation and holds the final pose after completion.
+float64 duration
+---
+bool success
+string message
+float64 final_z_offset
+---
+float64 progress
+float64 current_z_offset

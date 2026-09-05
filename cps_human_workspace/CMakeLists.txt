@@ -14,21 +14,24 @@ find_package(Eigen3 REQUIRED)
 find_package(ament_index_cpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
-find_package(rclcpp_lifecycle REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
-find_package(tf2 REQUIRED)
-find_package(tf2_ros REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/HumanReachableSet.msg"
   "msg/HumanWorkspace.msg"
   DEPENDENCIES geometry_msgs std_msgs
 )
 
+rosidl_get_typesupport_target(cpp_typesupport_target
+  ${PROJECT_NAME}
+  "rosidl_typesupport_cpp")
+
 add_library(${HUMAN_WORKSPACE_MODEL_TARGET} SHARED
   src/human_workspace.cpp
+  src/human_workspace_message.cpp
 )
 
 set_target_properties(${HUMAN_WORKSPACE_MODEL_TARGET}
@@ -44,45 +47,42 @@ target_include_directories(${HUMAN_WORKSPACE_MODEL_TARGET}
 )
 
 ament_target_dependencies(${HUMAN_WORKSPACE_MODEL_TARGET}
-  ament_index_cpp
+  geometry_msgs
   rclcpp
-  rclcpp_lifecycle
+  std_msgs
 )
 
 target_link_libraries(${HUMAN_WORKSPACE_MODEL_TARGET}
   Eigen3::Eigen
   yaml-cpp
+  ${cpp_typesupport_target}
 )
 
-add_executable(human_workspace_visualizer
-  src/human_workspace_visualizer_node.cpp
+add_executable(human_workspace_publisher
+  src/human_workspace_publisher_node.cpp
 )
 
-target_include_directories(human_workspace_visualizer
-  PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
+add_executable(human_reachable_set_visualizer
+  src/human_reachable_set_visualizer_node.cpp
 )
 
-ament_target_dependencies(human_workspace_visualizer
-  geometry_msgs
+ament_target_dependencies(human_workspace_publisher
+  ament_index_cpp
   rclcpp
   std_msgs
-  tf2
-  tf2_ros
+)
+
+target_link_libraries(human_workspace_publisher
+  ${HUMAN_WORKSPACE_MODEL_TARGET}
+  ${cpp_typesupport_target}
+)
+
+ament_target_dependencies(human_reachable_set_visualizer
+  rclcpp
   visualization_msgs
 )
 
-target_link_libraries(human_workspace_visualizer
-  ${HUMAN_WORKSPACE_MODEL_TARGET}
-  Eigen3::Eigen
-)
-
-rosidl_get_typesupport_target(cpp_typesupport_target
-  ${PROJECT_NAME}
-  "rosidl_typesupport_cpp")
-
-target_link_libraries(human_workspace_visualizer
+target_link_libraries(human_reachable_set_visualizer
   ${cpp_typesupport_target}
 )
 
@@ -95,7 +95,9 @@ install(
 )
 
 install(
-  TARGETS human_workspace_visualizer
+  TARGETS
+    human_reachable_set_visualizer
+    human_workspace_publisher
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -120,15 +122,10 @@ ament_export_libraries(${HUMAN_WORKSPACE_MODEL_TARGET})
 ament_export_targets(export_${PROJECT_NAME})
 ament_export_dependencies(
   Eigen3
-  ament_index_cpp
   geometry_msgs
   rclcpp
-  rclcpp_lifecycle
   rosidl_default_runtime
   std_msgs
-  tf2
-  tf2_ros
-  visualization_msgs
 )
 
 if(BUILD_TESTING)
@@ -142,6 +139,14 @@ if(BUILD_TESTING)
     test/test_human_workspace.cpp
   )
   target_link_libraries(test_human_workspace
+    ${HUMAN_WORKSPACE_MODEL_TARGET}
+    Eigen3::Eigen
+  )
+
+  ament_add_gtest(test_human_workspace_message
+    test/test_human_workspace_message.cpp
+  )
+  target_link_libraries(test_human_workspace_message
     ${HUMAN_WORKSPACE_MODEL_TARGET}
     Eigen3::Eigen
   )

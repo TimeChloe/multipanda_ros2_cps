@@ -2,7 +2,7 @@ sphere_center: [0.3, 0.0, 0.25]
 # Known-stationary hand: the center is fixed and the motion/velocity-error
 # bounds are zero, so the SaRA BodyPartCombined sphere stays at physical size
 # for every prediction horizon.
-motion_radius: 0.103
+motion_radius: 10.0
 
 hand_reachability:
   max_velocity: 0.0
