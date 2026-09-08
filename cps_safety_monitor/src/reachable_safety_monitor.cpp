@@ -39,51 +39,105 @@ double energyBudgetStiffnessScale(double kinetic_energy,
   return std::clamp((budget - kinetic) / total_potential, 0.0, 1.0);
 }
 
-OverbudgetJointStabilizationTerms updateOverbudgetJointStabilization(
-    const Vector7d& q,
-    double kinetic_energy,
-    double energy_budget,
-    double joint_stiffness,
-    double scale_omega,
-    bool enabled,
-    OverbudgetJointStabilizationState* state) {
-  OverbudgetJointStabilizationTerms terms;
+EnergyRecoveryTerms updateEnergyRecovery(
+    double kinetic_energy, double cartesian_potential_energy,
+    double nullspace_potential_energy, double energy_budget,
+    double exit_energy_fraction, bool enabled, bool workspace_available,
+    bool current_overlap, bool motion_within_limits,
+    bool normal_operation_verified, EnergyRecoveryState* state,
+    bool nominal_gains_restored) {
+  EnergyRecoveryTerms terms;
   if (state == nullptr) {
+    terms.scaling_active = enabled;
+    terms.scale = enabled ? 0.0 : 1.0;
     return terms;
   }
-
-  const bool inputs_valid =
-      q.allFinite() && std::isfinite(kinetic_energy) &&
-      std::isfinite(energy_budget) && std::isfinite(joint_stiffness) &&
-      std::isfinite(scale_omega);
-  if (!enabled || !inputs_valid || joint_stiffness <= 0.0 ||
-      scale_omega <= 0.0) {
-    *state = OverbudgetJointStabilizationState{};
+  if (!enabled) {
+    *state = EnergyRecoveryState{};
     return terms;
   }
-
-  const double kinetic = std::max(0.0, kinetic_energy);
-  const double budget = std::max(0.0, energy_budget);
-  if (kinetic <= budget) {
-    *state = OverbudgetJointStabilizationState{};
-    return terms;
+  const bool was_recovering = state->phase == EnergyControlPhase::kRecovering;
+  const double previous_scale = state->last_scale;
+  if (workspace_available && current_overlap) {
+    state->phase = EnergyControlPhase::kLimited;
+  } else if (!workspace_available || state->phase != EnergyControlPhase::kNormal) {
+    state->phase = EnergyControlPhase::kRecovering;
   }
-
-  if (!state->active || !state->reference.allFinite()) {
-    state->active = true;
-    state->reference = q;
+  terms.scaling_active = state->phase != EnergyControlPhase::kNormal;
+  if (terms.scaling_active) {
+    terms.scale = energyBudgetStiffnessScale(
+        kinetic_energy, cartesian_potential_energy,
+        nullspace_potential_energy, energy_budget);
+    const double nominal_energy = std::max(0.0, kinetic_energy) +
+        std::max(0.0, cartesian_potential_energy) +
+        std::max(0.0, nullspace_potential_energy);
+    const bool energy_valid = std::isfinite(kinetic_energy) &&
+        std::isfinite(cartesian_potential_energy) &&
+        std::isfinite(nullspace_potential_energy) &&
+        std::isfinite(energy_budget) && energy_budget >= 0.0 &&
+        std::isfinite(exit_energy_fraction) &&
+        exit_energy_fraction > 0.0 && exit_energy_fraction <= 1.0;
+    terms.exit_ready = was_recovering && workspace_available &&
+        !current_overlap && motion_within_limits && energy_valid &&
+        nominal_gains_restored && state->last_nominal_gains_restored &&
+        previous_scale == 1.0 && terms.scale == 1.0 &&
+        nominal_energy <= exit_energy_fraction * energy_budget;
+    if (terms.exit_ready && normal_operation_verified) {
+      state->phase = EnergyControlPhase::kNormal;
+      terms.exited = true;
+    }
   }
-
-  const double stiffness = std::max(0.0, joint_stiffness);
-  const Vector7d displacement = state->reference - q;
-  terms.active = true;
-  terms.potential_energy =
-      0.5 * stiffness * displacement.squaredNorm();
-  terms.scale_rho =
-      std::max(0.0, scale_omega) * kinetic /
-      std::max(1.0e-12, budget + terms.potential_energy);
-  terms.torque = terms.scale_rho * stiffness * displacement;
+  state->last_scale = terms.scale;
+  state->last_nominal_gains_restored = nominal_gains_restored;
   return terms;
+}
+
+bool jointStateWithinLimits(const Vector7d& q, const Vector7d& dq,
+                            const JointDynamicsLimits& limits) {
+  return q.allFinite() && dq.allFinite() &&
+      (q.array() >= limits.position_lower.array()).all() &&
+      (q.array() <= limits.position_upper.array()).all() &&
+      (dq.array().abs() <= limits.velocity.array()).all();
+}
+
+bool energyRecoveryExitPermitted(const ImpedanceSample& command,
+                                std::uint64_t current_epoch) {
+  return command.energy_recovery_exit_allowed &&
+      command.energy_recovery_epoch == current_epoch;
+}
+
+void restrictEnergyRecoveryExitPermissions(
+    VerifiedPlan* plan, const std::vector<JointPredictionSample>& prediction,
+    std::size_t committed_intended_steps) {
+  if (plan == nullptr) {
+    return;
+  }
+  auto restrict_permission = [&](ImpedanceSample& command) {
+    constexpr double kCommandTimeTolerance = 1e-9;
+    const auto endpoint = std::lower_bound(
+        prediction.begin(), prediction.end(), command.t - kCommandTimeTolerance,
+        [](const JointPredictionSample& sample, double t) { return sample.t < t; });
+    command.energy_recovery_exit_allowed = command.energy_recovery_exit_allowed &&
+        endpoint != prediction.end() && endpoint->energy_valid &&
+        std::abs(endpoint->t - command.t) <= kCommandTimeTolerance &&
+        endpoint->energy_recovery_exited &&
+        endpoint->energy_control_phase == EnergyControlPhase::kNormal &&
+        endpoint->energy_stiffness_scale == 1.0 &&
+        endpoint->energy_nominal_gains_restored;
+  };
+  for (std::size_t i = committed_intended_steps; i < plan->intended.size(); ++i) {
+    restrict_permission(plan->intended[i]);
+  }
+  for (auto& command : plan->failsafe) {
+    restrict_permission(command);
+  }
+}
+
+bool energyRecoveryStateMatchesPrediction(const JointPredictionSample& prediction,
+                                         const EnergyRecoveryState& actual) {
+  return prediction.energy_control_phase == actual.phase &&
+      (prediction.energy_recovery_runtime_scale == 1.0) == (actual.last_scale == 1.0) &&
+      prediction.energy_nominal_gains_restored == actual.last_nominal_gains_restored;
 }
 
 namespace {
@@ -244,6 +298,18 @@ Matrix6d propagateTrackingTube(
   return symmetrized(propagated);
 }
 
+const Matrix6d& monitorStiffness(const ImpedanceSample& command,
+                               const SafetyMonitorConfig& config) {
+  return config.energy_recovery_nominal_gains_valid
+      ? config.energy_recovery_nominal_stiffness : command.K;
+}
+
+const Matrix6d& monitorDamping(const ImpedanceSample& command,
+                             const SafetyMonitorConfig& config) {
+  return config.energy_recovery_nominal_gains_valid
+      ? config.energy_recovery_nominal_damping : command.D;
+}
+
 }  // namespace
 
 MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
@@ -256,14 +322,12 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   MonitorResult out;
 
   // This fallback has no joint trajectory and therefore cannot evaluate the
-  // complete T, U_q, contact-gated Eq. (14) scaling, or Eqs. (16)-(17) joint
-  // torque.
+  // complete T, U_q, or the runtime energy-scaling/recovery state.
   // Never authorize a plan by silently omitting any configured joint-space
   // energy behavior; use verifyReachablePlanJointSpace instead.
   if (config.nullspace_stiffness > 0.0 ||
       config.current_nullspace_stiffness > 0.0 ||
-      config.enable_runtime_energy_scaling ||
-      config.enable_overbudget_joint_stabilization) {
+      config.enable_runtime_energy_scaling) {
     out.joint_limit_unsafe = true;
     out.predicted_trigger = true;
     out.monitored_unsafe = true;
@@ -320,7 +384,7 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     current_error.tail<3>() =
         orientationError(current_orientation, current_reference.q);
     const Matrix6d current_stiffness =
-        positiveSemidefinitePart(current_reference.K);
+        positiveSemidefinitePart(monitorStiffness(current_reference, config));
     out.current_cartesian_kinetic_energy =
         quadraticEnergy(ee_twist, cartesian_inertia);
     out.current_cartesian_potential_energy =
@@ -364,7 +428,7 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
   double previous_edge_T_ub =
       quadraticEnergy(previous_edge_twist, cartesian_inertia);
   double previous_edge_V_ub = quadraticEnergy(
-      previous_edge_error, positiveSemidefinitePart(plan.anchor.K));
+      previous_edge_error, positiveSemidefinitePart(monitorStiffness(plan.anchor, config)));
   double previous_edge_energy_ub =
       previous_edge_T_ub + previous_edge_V_ub;
   double previous_edge_time = plan.anchor.t;
@@ -376,8 +440,8 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     const int interval_index = monitored_interval_index++;
     const double segment_end_time_sec = config.wall_time_sec + s.t;
 
-    const Matrix6d & K_exec = s.K;
-    const Matrix6d & D_exec = s.D;
+    const Matrix6d & K_exec = monitorStiffness(s, config);
+    const Matrix6d & D_exec = monitorDamping(s, config);
 
     const Matrix6d K_cartesian = positiveSemidefinitePart(K_exec);
     const Matrix3d Kp_raw = K_exec.topLeftCorner<3, 3>();
@@ -768,6 +832,13 @@ MonitorResult verifyReachablePlanJointSpace(
             inflated_contact_radius_now,
             config.wall_time_sec);
   }
+  if (!config.assume_human_workspace_clear &&
+      !std::isfinite(out.workspace_distance_now)) {
+    out.joint_limit_unsafe = true;
+    out.predicted_trigger = true;
+    out.monitored_unsafe = true;
+    return out;
+  }
   out.workspace_distance_min = out.workspace_distance_now;
 
   Matrix6d current_lambda = Matrix6d::Zero();
@@ -778,7 +849,7 @@ MonitorResult verifyReachablePlanJointSpace(
     const Vector6d current_error =
         poseError(state, config.current_energy_reference);
     const Matrix6d current_stiffness = positiveSemidefinitePart(
-        config.current_energy_reference.K);
+        monitorStiffness(config.current_energy_reference, config));
     const Vector6d current_twist = state.control_jacobian * dq_pred;
     if (current_lambda_valid) {
       out.current_cartesian_kinetic_energy = quadraticEnergy(
@@ -795,7 +866,7 @@ MonitorResult verifyReachablePlanJointSpace(
     out.current_nullspace_potential_energy = nullspacePotentialEnergy(
         q_pred,
         config.nullspace_reference,
-        config.current_nullspace_stiffness);
+        config.nullspace_stiffness);
     out.current_total_control_energy =
         out.current_joint_kinetic_energy +
         out.current_cartesian_potential_energy +
@@ -830,30 +901,25 @@ MonitorResult verifyReachablePlanJointSpace(
       jointKineticEnergy(dq_pred, state.inertia);
   double previous_edge_potential = quadraticEnergy(
       previous_edge_error_initial,
-      positiveSemidefinitePart(plan.anchor.K));
+      positiveSemidefinitePart(monitorStiffness(plan.anchor, config)));
   double previous_edge_nullspace_potential = nullspacePotentialEnergy(
       q_pred,
       config.nullspace_reference,
-      config.current_nullspace_stiffness);
+      config.nullspace_stiffness);
   double previous_edge_total_energy =
       previous_edge_joint_kinetic + previous_edge_potential +
       previous_edge_nullspace_potential;
   double previous_edge_time = plan.anchor.t;
   double previous_position_error_radius = 0.0;
   double previous_orientation_error_radius = 0.0;
-  OverbudgetJointStabilizationState overbudget_joint_state =
-      config.overbudget_joint_state;
-  OverbudgetJointStabilizationTerms overbudget_joint_terms =
-      updateOverbudgetJointStabilization(
-          q_pred,
-          previous_edge_joint_kinetic,
-          energy_budget_eff,
-          config.overbudget_joint_stiffness,
-          config.overbudget_joint_scale_omega,
-          config.enable_overbudget_joint_stabilization &&
-              out.workspace_distance_now <= 0.0,
-          &overbudget_joint_state);
-
+  EnergyRecoveryState energy_recovery_state = config.energy_recovery_state;
+  // A candidate that starts protected stays energy-gated for its complete
+  // intended + failsafe horizon, even if the human has gone or a hypothetical
+  // exit occurs inside the rollout. Only a later snapshot in Normal releases
+  // this gate. Keep geometric contact diagnostics unchanged.
+  out.recovery_energy_check_active = config.enable_runtime_energy_scaling &&
+      (energy_recovery_state.phase != EnergyControlPhase::kNormal ||
+       out.workspace_distance_now <= 0.0);
   // SaRA PFL computes one alpha_i vector from the complete monitored
   // trajectory and then reuses it for every interval. Therefore the rollout
   // trace must exist even when the caller does not request it as an output.
@@ -869,20 +935,12 @@ MonitorResult verifyReachablePlanJointSpace(
   initial_prediction.nullspace_potential_energy =
       previous_edge_nullspace_potential;
   initial_prediction.nullspace_potential_energy_active =
-      config.current_nullspace_stiffness > 0.0;
-  initial_prediction.energy_scaling_active =
-      config.enable_runtime_energy_scaling &&
-      out.workspace_distance_now <= 0.0;
-  initial_prediction.applied_nullspace_stiffness =
-      config.current_nullspace_stiffness;
-  initial_prediction.overbudget_joint_stabilization_active =
-      overbudget_joint_terms.active;
-  initial_prediction.overbudget_joint_potential_energy =
-      overbudget_joint_terms.potential_energy;
-  initial_prediction.overbudget_joint_scale_rho =
-      overbudget_joint_terms.scale_rho;
-  initial_prediction.overbudget_joint_torque_norm =
-      overbudget_joint_terms.torque.norm();
+      config.nullspace_stiffness > 0.0;
+  initial_prediction.energy_control_phase = energy_recovery_state.phase;
+  initial_prediction.energy_recovery_runtime_scale = energy_recovery_state.last_scale;
+  initial_prediction.energy_nominal_gains_restored =
+      energy_recovery_state.last_nominal_gains_restored;
+  initial_prediction.applied_nullspace_stiffness = config.nullspace_stiffness;
   rollout_trace.push_back(initial_prediction);
 
   struct PredictedReachInterval {
@@ -978,9 +1036,8 @@ MonitorResult verifyReachablePlanJointSpace(
     desired_acceleration.head<3>() = desired.ddp;
     desired_acceleration.tail<3>() = desired.dw;
 
-    // Reproduce the runtime's current-state overlap gate before calculating
-    // rollout torque. Normal Cartesian and nullspace gains remain unchanged
-    // outside the human collision area; Eq. (14) acts on both inside it.
+    // Track possible recovery exits along the nominal trajectory. The shared
+    // gain law supplies authorization metadata only, not rollout gains.
     const Vector3d collision_start = collisionPosition(state);
     double start_distance = std::numeric_limits<double>::infinity();
     if (!config.assume_human_workspace_clear && use_sara_robot_reach) {
@@ -1004,11 +1061,6 @@ MonitorResult verifyReachablePlanJointSpace(
               human_reach.center,
               human_reach.center,
               human_reach.radius);
-      if (!std::isfinite(start_distance)) {
-        markIntervalUnsafe(interval_index);
-        out.joint_limit_unsafe = true;
-        return false;
-      }
     } else if (!config.assume_human_workspace_clear) {
       start_distance =
           config.human_workspace.signedDistanceToInflatedSphere(
@@ -1017,13 +1069,15 @@ MonitorResult verifyReachablePlanJointSpace(
                   config.ee_collision_radius, 0.0),
               config.wall_time_sec + t_prev);
     }
+    if (!config.assume_human_workspace_clear && !std::isfinite(start_distance)) {
+      markIntervalUnsafe(interval_index);
+      out.joint_limit_unsafe = true;
+      return false;
+    }
     const bool collision_area_active_for_sample = start_distance <= 0.0;
-    const bool energy_scaling_active_for_sample =
-        config.enable_runtime_energy_scaling &&
-        collision_area_active_for_sample;
 
     const Matrix6d nominal_stiffness =
-        positiveSemidefinitePart(desired.K);
+        positiveSemidefinitePart(monitorStiffness(desired, config));
     const double nominal_start_joint_kinetic =
         jointKineticEnergy(dq_pred, state.inertia);
     const double nominal_start_potential =
@@ -1033,31 +1087,23 @@ MonitorResult verifyReachablePlanJointSpace(
             q_pred,
             config.nullspace_reference,
             config.nullspace_stiffness);
-    const double energy_stiffness_scale =
-        energy_scaling_active_for_sample
-            ? energyBudgetStiffnessScale(
-                  nominal_start_joint_kinetic,
-                  nominal_start_potential,
-                  nominal_start_nullspace_potential,
-                  energy_budget_eff)
-            : 1.0;
-    const Matrix6d applied_stiffness =
-        energy_stiffness_scale * nominal_stiffness;
-    const Matrix6d applied_damping =
-        std::sqrt(energy_stiffness_scale) * desired.D;
+    const EnergyRecoveryTerms recovery_terms = updateEnergyRecovery(
+        nominal_start_joint_kinetic, nominal_start_potential,
+        nominal_start_nullspace_potential, energy_budget_eff,
+        config.energy_recovery_exit_energy_fraction,
+        config.enable_runtime_energy_scaling, true,
+        collision_area_active_for_sample,
+        jointStateWithinLimits(q_pred, dq_pred, limits),
+        energyRecoveryExitPermitted(desired, config.energy_recovery_epoch),
+        &energy_recovery_state,
+        !config.energy_recovery_nominal_gains_valid ||
+            (desired.K.isApprox(config.energy_recovery_nominal_stiffness, 1e-9) &&
+             desired.D.isApprox(config.energy_recovery_nominal_damping, 1e-9)));
+    // Candidate safety must not be justified by a softer runtime controller.
+    const Matrix6d applied_stiffness = nominal_stiffness;
+    const Matrix6d applied_damping = monitorDamping(desired, config);
     const double applied_nullspace_stiffness =
-        energy_stiffness_scale *
         std::max(0.0, config.nullspace_stiffness);
-
-    overbudget_joint_terms = updateOverbudgetJointStabilization(
-        q_pred,
-        nominal_start_joint_kinetic,
-        energy_budget_eff,
-        config.overbudget_joint_stiffness,
-        config.overbudget_joint_scale_omega,
-        config.enable_overbudget_joint_stabilization &&
-            collision_area_active_for_sample,
-        &overbudget_joint_state);
 
     Vector6d wrench =
         -applied_stiffness * error -
@@ -1107,8 +1153,7 @@ MonitorResult verifyReachablePlanJointSpace(
 
     const double h = std::max(dt, kMinDt);
     const Vector7d desired_torque_command =
-        tau_task + tau_nullspace + overbudget_joint_terms.torque +
-        state.coriolis;
+        tau_task + tau_nullspace + state.coriolis;
     Vector7d torque_command = desired_torque_command;
     if (previous_torque_command_valid) {
       const double max_delta =
@@ -1206,16 +1251,6 @@ MonitorResult verifyReachablePlanJointSpace(
                   config.nullspace_reference,
                   applied_nullspace_stiffness)
             : 0.0;
-    const OverbudgetJointStabilizationTerms endpoint_overbudget_terms =
-        updateOverbudgetJointStabilization(
-            q_next,
-            nominal_joint_kinetic,
-            energy_budget_eff,
-            config.overbudget_joint_stiffness,
-            config.overbudget_joint_scale_omega,
-            config.enable_overbudget_joint_stabilization &&
-                collision_area_active_for_sample,
-            &overbudget_joint_state);
     const EnergyUpperBound energy_ub = addOneSidedEnergyErrorBounds(
         nominal_joint_kinetic,
         nominal_potential,
@@ -1241,20 +1276,14 @@ MonitorResult verifyReachablePlanJointSpace(
         nominal_nullspace_potential;
     endpoint_prediction.nullspace_potential_energy_active =
         nullspace_enabled_for_sample;
-    endpoint_prediction.energy_scaling_active =
-        energy_scaling_active_for_sample;
-    endpoint_prediction.energy_stiffness_scale =
-        energy_stiffness_scale;
+    endpoint_prediction.energy_control_phase = energy_recovery_state.phase;
+    endpoint_prediction.energy_recovery_exit_ready = recovery_terms.exit_ready;
+    endpoint_prediction.energy_recovery_exited = recovery_terms.exited;
+    endpoint_prediction.energy_nominal_gains_restored =
+        energy_recovery_state.last_nominal_gains_restored;
+    endpoint_prediction.energy_recovery_runtime_scale = recovery_terms.scale;
     endpoint_prediction.applied_nullspace_stiffness =
         applied_nullspace_stiffness;
-    endpoint_prediction.overbudget_joint_stabilization_active =
-        endpoint_overbudget_terms.active;
-    endpoint_prediction.overbudget_joint_potential_energy =
-        endpoint_overbudget_terms.potential_energy;
-    endpoint_prediction.overbudget_joint_scale_rho =
-        endpoint_overbudget_terms.scale_rho;
-    endpoint_prediction.overbudget_joint_torque_norm =
-        endpoint_overbudget_terms.torque.norm();
     rollout_trace.push_back(endpoint_prediction);
 
     const bool previous_edge_is_worst =
@@ -1286,13 +1315,15 @@ MonitorResult verifyReachablePlanJointSpace(
           out.first_contact_interval_index < 0) {
         out.first_contact_interval_index = interval_index;
       }
-      if (segment_distance <= 0.0 && interval_energy > energy_budget_eff) {
+      const bool energy_check_required =
+          segment_distance <= 0.0 || out.recovery_energy_check_active;
+      if (energy_check_required && interval_energy > energy_budget_eff) {
         if (out.first_energy_unsafe_contact_interval_index < 0) {
           out.first_energy_unsafe_contact_interval_index = interval_index;
         }
         markIntervalUnsafe(interval_index);
       }
-      if (segment_distance <= 0.0 &&
+      if (energy_check_required &&
           interval_energy > total_contact_energy_max) {
         total_contact_energy_max = interval_energy;
         out.worst_case_contact_time =
@@ -1388,6 +1419,8 @@ MonitorResult verifyReachablePlanJointSpace(
     sample.K = (1.0 - u) * start.K + u * end.K;
     sample.D = (1.0 - u) * start.D + u * end.D;
     sample.failsafe = end.failsafe;
+    sample.energy_recovery_exit_allowed = end.energy_recovery_exit_allowed;
+    sample.energy_recovery_epoch = end.energy_recovery_epoch;
     return sample;
   };
 
@@ -1455,84 +1488,87 @@ MonitorResult verifyReachablePlanJointSpace(
         out.robot_reach_alpha(i) = dynamic_alpha[static_cast<std::size_t>(i)];
       }
 
-      if (!config.assume_human_workspace_clear) {
-        for (const auto& interval : predicted_reach_intervals) {
-          const double interval_duration =
-              interval.end_time - interval.start_time;
-          std::vector<RobotReachCapsule> robot_capsules;
-          if (!std::isfinite(interval_duration) ||
-              interval_duration <= 0.0 ||
-              !config.robot_reachability_provider->reachInterval(
-                  interval.start_q,
-                  interval.end_q,
-                  interval_duration,
-                  dynamic_alpha,
-                  &robot_capsules)) {
-            markIntervalUnsafe(interval.index);
-            out.joint_limit_unsafe = true;
-            break;
-          }
+      for (const auto& interval : predicted_reach_intervals) {
+        const double interval_duration =
+            interval.end_time - interval.start_time;
+        std::vector<RobotReachCapsule> robot_capsules;
+        if (!std::isfinite(interval_duration) ||
+            interval_duration <= 0.0 ||
+            !config.robot_reachability_provider->reachInterval(
+                interval.start_q,
+                interval.end_q,
+                interval_duration,
+                dynamic_alpha,
+                &robot_capsules)) {
+          markIntervalUnsafe(interval.index);
+          out.joint_limit_unsafe = true;
+          break;
+        }
 
-          int segment_robot_link_index = -1;
+        int segment_robot_link_index = -1;
+        double segment_distance = std::numeric_limits<double>::infinity();
+        if (!config.assume_human_workspace_clear) {
           const auto human_reach =
               config.human_workspace.handReachableSetAtTime(
                   config.wall_time_sec + interval.end_time);
-          const double segment_distance =
+          segment_distance =
               config.robot_reachability_provider->minimumSignedDistance(
                   robot_capsules,
                   human_reach.center,
                   human_reach.center,
                   human_reach.radius,
                   &segment_robot_link_index);
-          if (!std::isfinite(segment_distance)) {
-            markIntervalUnsafe(interval.index);
-            out.joint_limit_unsafe = true;
-            break;
-          }
-          if (segment_distance < out.workspace_distance_min) {
-            out.workspace_distance_min = segment_distance;
-            out.worst_case_robot_link_index = segment_robot_link_index;
-          }
-          if (segment_distance <= 0.0 &&
-              out.first_contact_interval_index < 0) {
-            out.first_contact_interval_index = interval.index;
-          }
+        }
+        if (!config.assume_human_workspace_clear && !std::isfinite(segment_distance)) {
+          markIntervalUnsafe(interval.index);
+          out.joint_limit_unsafe = true;
+          break;
+        }
+        if (segment_distance < out.workspace_distance_min) {
+          out.workspace_distance_min = segment_distance;
+          out.worst_case_robot_link_index = segment_robot_link_index;
+        }
+        if (segment_distance <= 0.0 &&
+            out.first_contact_interval_index < 0) {
+          out.first_contact_interval_index = interval.index;
+        }
 
-          const bool start_is_worst =
-              interval.start_total_energy >= interval.end_total_energy;
-          const double interval_energy = std::max(
-              interval.start_total_energy, interval.end_total_energy);
-          if (segment_distance <= 0.0 &&
-              interval_energy > energy_budget_eff) {
-            if (out.first_energy_unsafe_contact_interval_index < 0) {
-              out.first_energy_unsafe_contact_interval_index = interval.index;
-            }
-            markIntervalUnsafe(interval.index);
+        const bool start_is_worst =
+            interval.start_total_energy >= interval.end_total_energy;
+        const double interval_energy = std::max(
+            interval.start_total_energy, interval.end_total_energy);
+        const bool energy_check_required =
+            segment_distance <= 0.0 || out.recovery_energy_check_active;
+        if (energy_check_required &&
+            interval_energy > energy_budget_eff) {
+          if (out.first_energy_unsafe_contact_interval_index < 0) {
+            out.first_energy_unsafe_contact_interval_index = interval.index;
           }
-          if (segment_distance <= 0.0 &&
-              interval_energy > total_contact_energy_max) {
-            total_contact_energy_max = interval_energy;
-            out.worst_case_contact_time = start_is_worst
-                ? interval.start_time
-                : interval.end_time;
-            out.worst_case_workspace_distance_at_candidate =
-                segment_distance;
-            out.worst_case_robot_link_index = segment_robot_link_index;
-            out.worst_case_cartesian_kinetic_energy_ub = start_is_worst
-                ? interval.start_cartesian_kinetic
-                : interval.end_cartesian_kinetic;
-            out.worst_case_joint_kinetic_energy_ub = start_is_worst
-                ? interval.start_joint_kinetic
-                : interval.end_joint_kinetic;
-            out.worst_case_cartesian_potential_energy_ub = start_is_worst
-                ? interval.start_potential
-                : interval.end_potential;
-            out.worst_case_nullspace_potential_energy_ub = start_is_worst
-                ? interval.start_nullspace_potential
-                : interval.end_nullspace_potential;
-            out.worst_case_cartesian_control_energy_ub = interval_energy;
-            out.worst_case_total_control_energy_ub = interval_energy;
-          }
+          markIntervalUnsafe(interval.index);
+        }
+        if (energy_check_required &&
+            interval_energy > total_contact_energy_max) {
+          total_contact_energy_max = interval_energy;
+          out.worst_case_contact_time = start_is_worst
+              ? interval.start_time
+              : interval.end_time;
+          out.worst_case_workspace_distance_at_candidate =
+              segment_distance;
+          out.worst_case_robot_link_index = segment_robot_link_index;
+          out.worst_case_cartesian_kinetic_energy_ub = start_is_worst
+              ? interval.start_cartesian_kinetic
+              : interval.end_cartesian_kinetic;
+          out.worst_case_joint_kinetic_energy_ub = start_is_worst
+              ? interval.start_joint_kinetic
+              : interval.end_joint_kinetic;
+          out.worst_case_cartesian_potential_energy_ub = start_is_worst
+              ? interval.start_potential
+              : interval.end_potential;
+          out.worst_case_nullspace_potential_energy_ub = start_is_worst
+              ? interval.start_nullspace_potential
+              : interval.end_nullspace_potential;
+          out.worst_case_cartesian_control_energy_ub = interval_energy;
+          out.worst_case_total_control_energy_ub = interval_energy;
         }
       }
     }
@@ -1552,9 +1588,9 @@ MonitorResult verifyReachablePlanJointSpace(
   out.contact_relevant_for_energy = out.workspace_distance_now <= 0.0;
 
   const bool predicted_contact_requires_verification =
-      out.monitored_contact_possible;
+      out.monitored_contact_possible || out.recovery_energy_check_active;
   const bool current_collision_energy_unsafe =
-      out.contact_relevant_for_energy &&
+      (out.contact_relevant_for_energy || out.recovery_energy_check_active) &&
       out.current_joint_energy_valid &&
       out.current_total_control_energy > energy_budget_eff;
   const bool predicted_contact_energy_unsafe =

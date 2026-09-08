@@ -287,6 +287,9 @@ void ReachableCartesianImpedanceController::resetViaPointExecutionState(
   commanded_path_rate_ = path_time_rate_target_;
   mode_ = SafetyMode::kNominal;
 
+  // A goal/cancel changes the path, not the physical energy-recovery state.
+  // Keep its latch and last applied scale until the shared gain law releases it.
+
   last_verified_plan_ = VerifiedPlan{};
   ++last_verified_plan_generation_;
   last_verified_command_stage_ = 0;

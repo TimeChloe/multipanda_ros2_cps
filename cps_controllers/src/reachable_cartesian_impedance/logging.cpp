@@ -187,12 +187,13 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     double nullspace_potential_energy{0.0};
     bool nullspace_potential_energy_active{false};
     bool energy_scaling_active{false};
+    cps_safety_monitor::EnergyControlPhase energy_control_phase{
+      cps_safety_monitor::EnergyControlPhase::kNormal};
+    bool energy_recovery_exit_ready{false};
+    bool energy_recovery_exited{false};
     double energy_stiffness_scale{1.0};
+    double energy_recovery_runtime_scale{1.0};
     double applied_nullspace_stiffness{0.0};
-    bool overbudget_joint_stabilization_active{false};
-    double overbudget_joint_potential_energy{0.0};
-    double overbudget_joint_scale_rho{1.0};
-    double overbudget_joint_torque_norm{0.0};
     Vector7d joint_q{Vector7d::Constant(
         std::numeric_limits<double>::quiet_NaN())};
     Vector7d joint_dq{Vector7d::Constant(
@@ -227,8 +228,12 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
 
   Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
   task_inertia_inv.diagonal().array() += kSmallPositive;
-  Matrix6d K_exec = K_runtime;
-  Matrix6d D_exec = D_runtime;
+  // Runtime gains may be reduced. All prediction plots must report the
+  // nominal gains actually used by the monitor, including the anchor.
+  (void)K_runtime;
+  (void)D_runtime;
+  const Matrix6d K_exec = K_base_;
+  const Matrix6d D_exec = D_base_;
 
   Vector3d x_pred = collision_center;
   Vector3d v_pred = collision_twist.head<3>();
@@ -248,8 +253,6 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       const ImpedanceSample & collision_sample,
       double dtp) {
       const double segment_end_time_sec = wall_time + collision_sample.t;
-      K_exec = collision_sample.K;
-      D_exec = collision_sample.D;
 
       const Matrix3d Kp_raw = K_exec.topLeftCorner<3, 3>();
       const Matrix3d Dp_raw = D_exec.topLeftCorner<3, 3>();
@@ -310,18 +313,15 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
             joint_sample.nullspace_potential_energy_active;
           row.energy_scaling_active =
             joint_sample.energy_scaling_active;
+          row.energy_control_phase = joint_sample.energy_control_phase;
+          row.energy_recovery_exit_ready = joint_sample.energy_recovery_exit_ready;
+          row.energy_recovery_exited = joint_sample.energy_recovery_exited;
           row.energy_stiffness_scale =
             joint_sample.energy_stiffness_scale;
+          row.energy_recovery_runtime_scale =
+            joint_sample.energy_recovery_runtime_scale;
           row.applied_nullspace_stiffness =
             joint_sample.applied_nullspace_stiffness;
-          row.overbudget_joint_stabilization_active =
-            joint_sample.overbudget_joint_stabilization_active;
-          row.overbudget_joint_potential_energy =
-            joint_sample.overbudget_joint_potential_energy;
-          row.overbudget_joint_scale_rho =
-            joint_sample.overbudget_joint_scale_rho;
-          row.overbudget_joint_torque_norm =
-            joint_sample.overbudget_joint_torque_norm;
           if (async_timing.valid) {
             row.horizon_steps = static_cast<std::size_t>(std::max<long long>(
                 0,
@@ -451,6 +451,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << async_timing.committed_prefix_steps << ","
       << static_cast<int>(
         async_timing.source_plan_matches_at_handoff) << ","
+      << static_cast<int>(async_timing.recovery_epoch_matches_at_handoff) << ","
+      << static_cast<int>(async_timing.recovery_state_matches_at_handoff) << ","
       << static_cast<int>(async_timing.output_usable) << ","
       << async_timing.scheduled_control_loop_sequence << ","
       << async_timing.publish_lateness_cycles << ","
@@ -504,13 +506,12 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << row.nullspace_potential_energy << ","
       << static_cast<int>(row.nullspace_potential_energy_active) << ","
       << static_cast<int>(row.energy_scaling_active) << ","
+      << static_cast<int>(row.energy_control_phase) << ","
+      << static_cast<int>(row.energy_recovery_exit_ready) << ","
+      << static_cast<int>(row.energy_recovery_exited) << ","
       << row.energy_stiffness_scale << ","
+      << row.energy_recovery_runtime_scale << ","
       << row.applied_nullspace_stiffness << ","
-      << static_cast<int>(
-        row.overbudget_joint_stabilization_active) << ","
-      << row.overbudget_joint_potential_energy << ","
-      << row.overbudget_joint_scale_rho << ","
-      << row.overbudget_joint_torque_norm << ","
       << row.joint_kinetic_energy + row.cartesian_potential_energy +
         row.nullspace_potential_energy << ","
       << row.joint_kinetic_energy +
@@ -573,7 +574,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << monitor.joint_position_violation << ","
       << monitor.joint_velocity_violation << ","
       << monitor.joint_acceleration_violation << ","
-      << monitor.joint_torque_violation << "\n";
+      << monitor.joint_torque_violation << ","
+      << static_cast<int>(monitor.recovery_energy_check_active) << "\n";
   }
 }
 
@@ -602,7 +604,7 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "collision_center_vx,collision_center_vy,collision_center_vz,"
     "des_vx,des_vy,des_vz,err_px,err_py,err_pz,err_rx,err_ry,err_rz,"
     "tau_cmd_norm,tau_task_norm,tau_nullspace_raw_norm,"
-    "tau_nullspace_projected_norm,tau_overbudget_joint_norm,coriolis_norm,"
+    "tau_nullspace_projected_norm,coriolis_norm,"
     "tau_desired_before_rate_limit_norm,torque_rate_limited,"
     "torque_rate_max_ratio,Kx,Ky,Kz,Dx,Dy,Dz,"
     "worst_case_contact_time,worst_case_workspace_distance_at_candidate,"
@@ -665,21 +667,17 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "nullspace_enabled,nullspace_stiffness_before_scaling,"
     "nullspace_stiffness_after_scaling,"
     "total_control_energy_after_scaling,"
-    "overbudget_joint_stabilization_enabled,"
-    "overbudget_joint_stabilization_active,"
-    "overbudget_joint_stiffness,overbudget_joint_scale_omega,"
-    "overbudget_joint_potential_energy,overbudget_joint_scale_rho,"
-    "overbudget_joint_reference_q1,overbudget_joint_reference_q2,"
-    "overbudget_joint_reference_q3,overbudget_joint_reference_q4,"
-    "overbudget_joint_reference_q5,overbudget_joint_reference_q6,"
-    "overbudget_joint_reference_q7,"
     "previous_applied_energy_valid,"
     "previous_applied_joint_kinetic_energy,"
     "previous_applied_cartesian_potential_energy,"
     "previous_applied_nullspace_potential_energy,"
     "previous_applied_nullspace_potential_energy_active,"
     "previous_applied_total_energy,energy_budget_joule,mujoco_contact_value,"
-    "mujoco_contact_active,mujoco_contact_sample_age_sec";
+    "mujoco_contact_active,mujoco_contact_sample_age_sec,"
+    "energy_control_phase,energy_recovery_exit_ready,energy_recovery_exited,"
+    "energy_recovery_exit_verified,energy_recovery_epoch,energy_recovery_environment,"
+    "async_recovery_epoch_matches_at_handoff,async_recovery_state_matches_at_handoff,"
+    "monitor_recovery_energy_check_active";
 
   const std::size_t expected_control_columns =
     1 + static_cast<std::size_t>(
@@ -732,7 +730,8 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "human_workspace_assumed_clear,async_timing_valid,"
       "monitor_input_sequence,monitor_input_control_loop_sequence,"
       "monitor_source_plan_generation,committed_prefix_steps,"
-      "source_plan_matches_at_handoff,async_output_usable,"
+      "source_plan_matches_at_handoff,recovery_epoch_matches_at_handoff,"
+      "recovery_state_matches_at_handoff,async_output_usable,"
       "monitor_scheduled_control_loop_sequence,monitor_publish_lateness_cycles,"
       "worker_queue_wait_ms,worker_compute_ms,output_handoff_ms,"
       "monitor_end_to_end_ms,monitor_total_ms,planner_ms,"
@@ -757,11 +756,10 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "pred_energy_valid,pred_joint_kinetic_energy,"
       "pred_cartesian_potential_energy,pred_nullspace_potential_energy,"
       "pred_nullspace_potential_energy_active,pred_energy_scaling_active,"
-      "pred_energy_stiffness_scale,"
+      "pred_energy_control_phase,pred_energy_recovery_exit_ready,"
+      "pred_energy_recovery_exited,"
+      "pred_energy_stiffness_scale,pred_energy_recovery_runtime_scale,"
       "pred_applied_nullspace_stiffness,"
-      "pred_overbudget_joint_stabilization_active,"
-      "pred_overbudget_joint_potential_energy,"
-      "pred_overbudget_joint_scale_rho,pred_overbudget_joint_torque_norm,"
       "pred_total_energy,"
       "pred_joint_kinetic_energy_ub,pred_cartesian_potential_energy_ub,"
       "pred_nullspace_potential_energy_ub,"
@@ -800,7 +798,8 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "inertia_model_max_energy_ratio,"
       "joint_limit_unsafe,"
       "joint_limit_index,joint_position_violation,joint_velocity_violation,"
-      "joint_acceleration_violation,joint_torque_violation";
+      "joint_acceleration_violation,joint_torque_violation,"
+      "monitor_recovery_energy_check_active";
     const std::size_t reserved_plan_steps = std::max<std::size_t>(
       128,
       std::max<std::size_t>(

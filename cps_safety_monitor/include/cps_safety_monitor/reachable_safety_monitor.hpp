@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
@@ -32,31 +33,34 @@ double energyBudgetStiffnessScale(double kinetic_energy,
                                   double nullspace_potential_energy,
                                   double energy_budget);
 
-// Lachner et al. Eqs. (16)-(17). Callers enable this only in the human
-// collision area. q_star is captured on the first enabled cycle for which
-// T > L_max and retained until the budget is recovered or the area is exited.
-// This additional joint potential is distinct from the normal projected
-// nullspace potential U_q.
-struct OverbudgetJointStabilizationState {
-  bool active{false};
-  Vector7d reference{Vector7d::Zero()};
+enum class EnergyControlPhase { kNormal = 0, kLimited = 1, kRecovering = 2 };
+
+// State of the gain law, not of the path generator. Copy this with the measured
+// state into every rollout; a new action must not clear an ongoing recovery.
+struct EnergyRecoveryState {
+  EnergyControlPhase phase{EnergyControlPhase::kNormal};
+  double last_scale{1.0};
+  bool last_nominal_gains_restored{true};
 };
 
-struct OverbudgetJointStabilizationTerms {
-  bool active{false};
-  double potential_energy{0.0};
-  double scale_rho{1.0};
-  Vector7d torque{Vector7d::Zero()};
+struct EnergyRecoveryTerms {
+  bool scaling_active{false};
+  bool exit_ready{false};
+  bool exited{false};
+  double scale{1.0};
 };
 
-OverbudgetJointStabilizationTerms updateOverbudgetJointStabilization(
-    const Vector7d& q,
-    double kinetic_energy,
-    double energy_budget,
-    double joint_stiffness,
-    double scale_omega,
-    bool enabled,
-    OverbudgetJointStabilizationState* state);
+// Recovery retains Eq. (14) after overlap ends or observations become invalid.
+// Exit requires nominal (unscaled) energy below the hysteresis threshold and
+// an already fully restored gain on the preceding command. Verification is
+// supplied by the caller; an absent/old plan cannot authorize recovery exit.
+EnergyRecoveryTerms updateEnergyRecovery(
+    double kinetic_energy, double cartesian_potential_energy,
+    double nullspace_potential_energy, double energy_budget,
+    double exit_energy_fraction, bool enabled, bool workspace_available,
+    bool current_overlap, bool motion_within_limits,
+    bool normal_operation_verified, EnergyRecoveryState* state,
+    bool nominal_gains_restored = true);
 
 // Robot-model quantities evaluated at one predicted joint state.  The safety
 // monitor deliberately depends on this small interface instead of a concrete
@@ -85,6 +89,9 @@ struct JointDynamicsLimits {
       std::numeric_limits<double>::infinity())};
 };
 
+bool jointStateWithinLimits(const Vector7d& q, const Vector7d& dq,
+                            const JointDynamicsLimits& limits);
+
 // One state from the joint-space rollout.  This is an optional diagnostic
 // trace: control decisions never depend on whether the trace is requested.
 struct JointPredictionSample {
@@ -99,16 +106,23 @@ struct JointPredictionSample {
   double cartesian_potential_energy{0.0};
   double nullspace_potential_energy{0.0};
   bool nullspace_potential_energy_active{false};
-  // True when Eq. (14) was active for the rollout interval ending at this
-  // sample. For the initial sample it records the current-state gate.
+  // Verification always rolls out nominal gains: false and 1 respectively.
   bool energy_scaling_active{false};
+  EnergyControlPhase energy_control_phase{EnergyControlPhase::kNormal};
+  bool energy_recovery_exit_ready{false};
+  bool energy_recovery_exited{false};
+  bool energy_nominal_gains_restored{true};
   double energy_stiffness_scale{1.0};
+  // Hypothetical runtime gain-law state evaluated along the nominal rollout,
+  // used only for exit authorization/handoff, never for predicted torque.
+  double energy_recovery_runtime_scale{1.0};
   double applied_nullspace_stiffness{0.0};
-  bool overbudget_joint_stabilization_active{false};
-  double overbudget_joint_potential_energy{0.0};
-  double overbudget_joint_scale_rho{1.0};
-  double overbudget_joint_torque_norm{0.0};
 };
+
+// The transition law uses the discrete phase and whether gains were fully
+// restored, not the continuous previous scale. Compare that state at handoff.
+bool energyRecoveryStateMatchesPrediction(const JointPredictionSample& prediction,
+                                         const EnergyRecoveryState& actual);
 
 class JointDynamicsProvider {
  public:
@@ -178,7 +192,7 @@ std::string defaultSaraPandaRobotConfigPath();
 struct MonitorResult {
   bool monitored_contact_possible{false};
   // Current measured collision geometry overlaps the human workspace. This
-  // is also the runtime activation gate for Eq. (14) stiffness scaling.
+  // starts Eq. (14) stiffness scaling; recovery can retain scaling outside it.
   bool contact_relevant_for_energy{false};
   bool monitored_unsafe{false};
   // Predicted collision energy exceeds the configured budget, or a predicted
@@ -194,9 +208,9 @@ struct MonitorResult {
   // workspace, regardless of whether its energy is within the PFL budget.
   // This is diagnostic metadata and does not affect candidate acceptance.
   int first_contact_interval_index{-1};
-  // First geometrically intersecting interval whose energy exceeds the PFL
-  // budget. Unlike collision_interval_index, this never denotes a joint-limit
-  // or invalid-rollout failure.
+  // First energy-gated interval exceeding the PFL budget: real intersection
+  // or the retained recovery gate. Unlike collision_interval_index, this
+  // never denotes a joint-limit or invalid-rollout failure.
   int first_energy_unsafe_contact_interval_index{-1};
 
   double workspace_distance_now{0.0};
@@ -222,6 +236,8 @@ struct MonitorResult {
   double worst_case_total_control_energy_ub{0.0};
 
   double workspace_distance_margin{0.0};
+  // Retained energy gate, distinct from actual human/robot intersection.
+  bool recovery_energy_check_active{false};
 
   double current_cartesian_kinetic_energy{0.0};
   double current_cartesian_potential_energy{0.0};
@@ -288,7 +304,15 @@ struct ImpedanceSample {
   Matrix6d D{Matrix6d::Zero()};
 
   bool failsafe{false};
+  // A candidate may model recovery exit only on commands that are not already
+  // committed. Runtime may use this permission only after plan verification,
+  // and only while the observed clear/overlap/unknown episode is unchanged.
+  bool energy_recovery_exit_allowed{false};
+  std::uint64_t energy_recovery_epoch{0};
 };
+
+bool energyRecoveryExitPermitted(const ImpedanceSample& command,
+                                std::uint64_t current_epoch);
 
 struct VerifiedPlan {
   bool valid{false};
@@ -302,6 +326,14 @@ struct VerifiedPlan {
 
   double generated_wall_time{0.0};
 };
+
+// After verifying a dense command-grid rollout, retain exit permission only
+// on commands where that rollout actually exited recovery. Do not modify the
+// already committed prefix. A generally safe plan is not blanket permission
+// for runtime to switch control laws at an unpredicted command.
+void restrictEnergyRecoveryExitPermissions(
+    VerifiedPlan* plan, const std::vector<JointPredictionSample>& prediction,
+    std::size_t committed_intended_steps = 0);
 
 struct SafetyMonitorConfig {
   cps_human_workspace::HumanWorkspace human_workspace;
@@ -352,20 +384,22 @@ struct SafetyMonitorConfig {
   // Effective nominal stiffness. A value of zero means nullspace control is
   // globally disabled for the complete intended and fail-safe execution.
   double nullspace_stiffness{0.0};
-  // Actual (possibly energy-scaled) stiffness that produced the measured
-  // current state. Future rollout samples use nullspace_stiffness.
+  // Actual stiffness retained in the snapshot for API compatibility and the
+  // Cartesian fallback guard. Nominal verification uses nullspace_stiffness
+  // for current/anchor energy as well as all future samples.
   double current_nullspace_stiffness{0.0};
-  // Model the same contact-gated Eq. (14) stiffness adaptation used by the
-  // runtime controller. Each rollout state evaluates its own workspace
-  // overlap before selecting the gains for the following interval.
+  // Track runtime recovery for exit authorization and retain the contact
+  // energy gate during recovery. This NEVER scales the monitor's gains.
   bool enable_runtime_energy_scaling{false};
-  // Contact-gated Eqs. (16)-(17) emergency joint stabilization state and
-  // parameters. Each rollout state uses the same current-overlap gate as the
-  // runtime controller.
-  bool enable_overbudget_joint_stabilization{false};
-  double overbudget_joint_stiffness{1.0};
-  double overbudget_joint_scale_omega{40.0};
-  OverbudgetJointStabilizationState overbudget_joint_state;
+  EnergyRecoveryState energy_recovery_state;
+  std::uint64_t energy_recovery_epoch{0};
+  double energy_recovery_exit_energy_fraction{0.95};
+  // Configured nominal gains used for ALL monitor dynamics/energy, including
+  // anchors and committed commands with reduced gains. If not supplied, the
+  // caller must supply unscaled nominal gains in each command.
+  bool energy_recovery_nominal_gains_valid{false};
+  Matrix6d energy_recovery_nominal_stiffness{Matrix6d::Zero()};
+  Matrix6d energy_recovery_nominal_damping{Matrix6d::Zero()};
   Vector7d previous_torque_command{Vector7d::Zero()};
   bool previous_torque_command_valid{false};
   double torque_rate_limit{1000.0};
@@ -384,7 +418,7 @@ MonitorResult verifyReachablePlanJointSpace(
 // Cartesian-only fallback for configurations without a joint dynamics
 // provider. It fails closed for every configured joint-space energy feature
 // because a Cartesian state cannot represent complete joint kinetic energy,
-// U_q, or the Eq. (16)-(17) q_star stabilizer.
+// or U_q.
 MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
                                   const Vector3d& current_position,
                                   const Quaterniond& current_orientation,

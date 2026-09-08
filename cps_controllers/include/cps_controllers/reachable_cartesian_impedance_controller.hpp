@@ -125,9 +125,9 @@ class ReachableCartesianImpedanceController
                                       const ImpedanceSample& current_command_reference,
                                       bool current_command_reference_valid,
                                       double current_nullspace_stiffness,
-                                      const cps_safety_monitor::
-                                          OverbudgetJointStabilizationState&
-                                              overbudget_joint_state,
+                                      const cps_safety_monitor::EnergyRecoveryState&
+                                          energy_recovery_state,
+                                      std::uint64_t energy_recovery_epoch,
                                       std::vector<JointPredictionSample>*
                                           joint_prediction_trace = nullptr) const;
 
@@ -191,8 +191,8 @@ class ReachableCartesianImpedanceController
     ImpedanceSample last_commanded_sample;
     bool last_commanded_sample_valid{false};
     double last_nullspace_stiffness{0.0};
-    cps_safety_monitor::OverbudgetJointStabilizationState
-        overbudget_joint_state;
+    cps_safety_monitor::EnergyRecoveryState energy_recovery_state;
+    std::uint64_t energy_recovery_epoch{0};
     double commanded_path_rate{0.0};
     double target_path_rate{1.0};
     bool reanchor_path_kinematics{false};
@@ -208,6 +208,8 @@ class ReachableCartesianImpedanceController
     std::uint64_t source_plan_generation{0};
     std::size_t committed_prefix_steps{0};
     bool source_plan_matches_at_handoff{false};
+    bool recovery_epoch_matches_at_handoff{false};
+    bool recovery_state_matches_at_handoff{false};
     bool output_usable{false};
     std::uint64_t scheduled_control_loop_sequence{0};
     std::uint64_t publish_lateness_cycles{0};
@@ -390,7 +392,7 @@ class ReachableCartesianImpedanceController
 
   struct ControlLogRecord {
     // Keep spare capacity for diagnostics added to the fixed, allocation-free
-    // real-time log record. The current schema uses 203 columns.
+    // real-time log record, including recovery diagnostics.
     static constexpr std::size_t kMaxValues = 224;
     std::array<double, kMaxValues> values{};
     std::size_t value_count{0};
@@ -408,7 +410,6 @@ class ReachableCartesianImpedanceController
                                   const Quaterniond& current_orientation,
                                   const ImpedanceSample& cmd,
                                   double nullspace_stiffness,
-                                  const Vector7d& overbudget_joint_torque,
                                   double dt);
 
   ImpedanceSample getNextFailsafeCommandFromCache(bool advance_index);
@@ -447,14 +448,13 @@ class ReachableCartesianImpedanceController
     double nullspace_potential_energy{0.0};
     double nullspace_stiffness{0.0};
     double total_energy{0.0};
+    bool recovery_exit_ready{false};
+    bool recovery_exited{false};
   };
 
   bool shouldRejectCandidateWithMonitor(const MonitorResult& monitor) const;
   bool shouldRejectCandidateWithMonitor(const MonitorResult& monitor,
                                         bool human_workspace_available) const;
-
-  bool shouldApplyEnergyBudget(
-      const MonitorResult& monitor) const;
 
   bool computeTaskInertia(const Matrix7d& inertia,
                           const Matrix67d& J_geo,
@@ -466,8 +466,11 @@ class ReachableCartesianImpedanceController
       double potential_energy,
       double nullspace_potential_energy,
       bool energy_valid,
-      bool active,
-      EnergyBudgetInfo* info) const;
+      bool workspace_available,
+      bool current_overlap,
+      bool motion_within_limits,
+      bool normal_operation_verified,
+      EnergyBudgetInfo* info);
 
   bool enable_error_logging_{false};
   std::string error_log_root_dir_{"/home/developer/multipanda_ws/src/data_log"};
@@ -573,12 +576,6 @@ class ReachableCartesianImpedanceController
   // Effective nominal stiffness. It is forced to zero when
   // enable_nullspace is false and otherwise remains active in every stage.
   double n_stiffness_{0.0};
-  bool enable_overbudget_joint_stabilization_{true};
-  double overbudget_joint_stiffness_{1.0};
-  double overbudget_joint_scale_omega_{40.0};
-  cps_safety_monitor::OverbudgetJointStabilizationState
-      overbudget_joint_state_;
-
   bool enable_safety_monitor_{true};
 
   double energy_budget_joule_{0.05};
@@ -586,6 +583,10 @@ class ReachableCartesianImpedanceController
   double potential_energy_error_bound_joule_{0.0};
   double nullspace_potential_energy_error_bound_joule_{0.0};
   bool enable_runtime_energy_scaling_{true};
+  double energy_recovery_exit_energy_fraction_{0.95};
+  cps_safety_monitor::EnergyRecoveryState energy_recovery_state_;
+  std::uint64_t energy_recovery_epoch_{0};
+  int energy_recovery_environment_{-1};  // 0=clear, 1=overlap, 2=unknown
   // Passive calibration logging only. This never changes scheduling, plan
   // acceptance, command selection, gains, or the normal safety state machine.
   bool enable_calibration_logging_{false};
@@ -765,9 +766,6 @@ class ReachableCartesianImpedanceController
   double last_total_control_energy_before_scaling_{0.0};
   double last_cartesian_potential_energy_{0.0};
   double last_total_control_energy_{0.0};
-  double last_overbudget_joint_potential_energy_{0.0};
-  double last_overbudget_joint_scale_rho_{1.0};
-  double last_overbudget_joint_torque_norm_{0.0};
   double last_tau_task_norm_{0.0};
   double last_tau_nullspace_raw_norm_{0.0};
   double last_tau_nullspace_projected_norm_{0.0};

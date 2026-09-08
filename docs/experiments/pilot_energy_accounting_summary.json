@@ -1,0 +1,30 @@
+{
+  "run": "data_log/20260905_120613_343284",
+  "interpretation": "Pilot diagnostics only; energies are model-based; contact flag is cached and not independently synchronized ground truth. Counts are controller rows, not independent trials or physical durations.",
+  "rows": 55038,
+  "logged_ros_duration_sec": 54.734999999,
+  "control_sequence_gaps": 0,
+  "repeated_ros_timestamps": 8558,
+  "budget_joule": 0.12,
+  "contact_flag_rows": 36752,
+  "max_contact_post_scaling_energy_joule": 0.12,
+  "max_contact_previous_applied_energy_joule": 0.139763244,
+  "contact_previous_applied_overbudget_rows_tolerance_1e_6J": 5911,
+  "max_overlap_previous_applied_energy_joule": 29.923983315,
+  "max_overlap_joint_kinetic_energy_joule": 0.450781373,
+  "overlap_post_scaling_overbudget_rows_tolerance_1e_6J": 188,
+  "max_cached_contact_sample_age_sec": 0.037,
+  "max_contact_sensor_value_units_not_verified": 143.969009399,
+  "execution_stage_row_counts": {
+    "2.0": 51272,
+    "0.0": 3263,
+    "1.0": 502,
+    "3.0": 1
+  },
+  "monitor_latency_ms_deduplicated_by_input_sequence": {
+    "0.5": 1.547683,
+    "0.95": 6.220754200000005,
+    "0.99": 9.693905339999999,
+    "1.0": 22.976032
+  }
+}

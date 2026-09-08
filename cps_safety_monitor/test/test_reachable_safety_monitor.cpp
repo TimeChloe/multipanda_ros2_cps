@@ -129,37 +129,497 @@ TEST(EnergyBudgetStiffnessScale, ImplementsLachnerEquation14) {
       1.0e-12);
 }
 
-TEST(OverbudgetJointStabilization, ImplementsLachnerEquations16And17) {
-  OverbudgetJointStabilizationState state;
-  const Vector7d q_capture = Vector7d::Zero();
-  const auto capture = updateOverbudgetJointStabilization(
-      q_capture, 0.7, 0.6, 1.0, 40.0, true, &state);
-
-  ASSERT_TRUE(state.active);
-  EXPECT_TRUE(capture.active);
-  EXPECT_NEAR((state.reference - q_capture).norm(), 0.0, 1.0e-12);
-  EXPECT_NEAR(capture.potential_energy, 0.0, 1.0e-12);
-  EXPECT_NEAR(capture.scale_rho, 40.0 * 0.7 / 0.6, 1.0e-12);
-  EXPECT_NEAR(capture.torque.norm(), 0.0, 1.0e-12);
-
-  Vector7d q_displaced = q_capture;
-  q_displaced(0) = 0.1;
-  const auto displaced = updateOverbudgetJointStabilization(
-      q_displaced, 0.7, 0.6, 1.0, 40.0, true, &state);
-  EXPECT_TRUE(displaced.active);
-  EXPECT_NEAR(displaced.potential_energy, 0.005, 1.0e-12);
-  EXPECT_NEAR(
-      displaced.scale_rho, 40.0 * 0.7 / 0.605, 1.0e-12);
-  EXPECT_LT(displaced.torque(0), 0.0);
-
-  const auto cleared = updateOverbudgetJointStabilization(
-      q_displaced, 0.6, 0.6, 1.0, 40.0, true, &state);
-  EXPECT_FALSE(state.active);
-  EXPECT_FALSE(cleared.active);
-  EXPECT_NEAR(cleared.torque.norm(), 0.0, 1.0e-12);
+TEST(EnergyRecovery, RemovalRetainsBudgetForLargeReferenceError) {
+  EnergyRecoveryState state;
+  // K=1500 N/m, e=0.2 m: nominal potential is 30 J, budget 0.12 J.
+  const auto contact = updateEnergyRecovery(
+      0.0, 30.0, 0.0, 0.12, 0.95, true, true, true, true, true, &state);
+  EXPECT_EQ(state.phase, EnergyControlPhase::kLimited);
+  EXPECT_NEAR(contact.scale, 0.004, 1e-12);
+  for (int cycle = 0; cycle < 100; ++cycle) {
+    const auto released = updateEnergyRecovery(
+        0.0, 30.0, 0.0, 0.12, 0.95, true, true, false, true, true, &state);
+    EXPECT_EQ(state.phase, EnergyControlPhase::kRecovering);
+    EXPECT_NEAR(released.scale, contact.scale, 1e-12);
+    EXPECT_FALSE(released.exit_ready);
+  }
 }
 
-TEST(ReachableSafetyMonitor, RolloutAppliesEnergyScalingInsideCollisionArea) {
+TEST(EnergyRecovery, ExitRequiresRestoredGainAndVerifiedNominalEnergy) {
+  EnergyRecoveryState state{EnergyControlPhase::kRecovering, 0.004};
+  auto terms = updateEnergyRecovery(
+      0.01, 0.09, 0.0, 0.12, 0.95, true, true, false, true, true, &state);
+  EXPECT_DOUBLE_EQ(terms.scale, 1.0);
+  EXPECT_FALSE(terms.exited);  // The preceding command was still scaled.
+  terms = updateEnergyRecovery(
+      0.01, 0.09, 0.0, 0.12, 0.95, true, true, false, true, false, &state);
+  EXPECT_TRUE(terms.exit_ready);
+  EXPECT_FALSE(terms.exited);  // Full gain alone is not verification.
+  terms = updateEnergyRecovery(
+      0.01, 0.09, 0.0, 0.12, 0.95, true, true, false, false, true, &state);
+  EXPECT_FALSE(terms.exited);  // Invalid motion state prevents release.
+  terms = updateEnergyRecovery(
+      0.01, 0.109, 0.0, 0.12, 0.95, true, true, false, true, true, &state);
+  EXPECT_DOUBLE_EQ(terms.scale, 1.0);
+  EXPECT_FALSE(terms.exited);  // Hysteresis uses nominal energy.
+  terms = updateEnergyRecovery(
+      0.01, 0.09, 0.0, 0.12, 0.95, true, true, false, true, true, &state);
+  EXPECT_TRUE(terms.exited);
+  EXPECT_DOUBLE_EQ(terms.scale, 1.0);
+  EXPECT_EQ(state.phase, EnergyControlPhase::kNormal);
+}
+
+TEST(EnergyRecovery, MissingObservationsCannotRestoreGainsOrRelease) {
+  EnergyRecoveryState state{EnergyControlPhase::kLimited, 0.004};
+  auto terms = updateEnergyRecovery(
+      0.0, 30.0, 0.0, 0.12, 0.95, true, false, false, true, true, &state);
+  EXPECT_NEAR(terms.scale, 0.004, 1e-12);
+  EXPECT_EQ(state.phase, EnergyControlPhase::kRecovering);
+  for (int i = 0; i < 3; ++i) {
+    terms = updateEnergyRecovery(
+        0.0, 0.01, 0.0, 0.12, 0.95, true, false, false, true, true, &state);
+    EXPECT_FALSE(terms.exited);
+    EXPECT_TRUE(terms.scaling_active);
+  }
+  // Missing observations at startup must also engage protection.
+  state = EnergyRecoveryState{};
+  terms = updateEnergyRecovery(
+      0.0, 30.0, 0.0, 0.12, 0.95, true, false, false, true, false, &state);
+  EXPECT_NEAR(terms.scale, 0.004, 1e-12);
+}
+
+TEST(EnergyRecovery, UnitScaleDuringScheduledGainBlendDoesNotMeanFullStiffness) {
+  EnergyRecoveryState state{EnergyControlPhase::kRecovering, 1.0};
+  auto terms = updateEnergyRecovery(
+      0.0, 0.01, 0.0, 0.12, 0.95, true, true, false, true, true, &state, false);
+  EXPECT_DOUBLE_EQ(terms.scale, 1.0);
+  EXPECT_FALSE(terms.exited);
+  terms = updateEnergyRecovery(
+      0.0, 0.01, 0.0, 0.12, 0.95, true, true, false, true, true, &state, true);
+  EXPECT_FALSE(terms.exited);  // The preceding scheduled gains were lower.
+  terms = updateEnergyRecovery(
+      0.0, 0.01, 0.0, 0.12, 0.95, true, true, false, true, true, &state, true);
+  EXPECT_TRUE(terms.exited);
+}
+
+TEST(EnergyRecovery, ReentryAndHighKineticEnergyKeepProtection) {
+  EnergyRecoveryState state{EnergyControlPhase::kRecovering, 1.0};
+  auto terms = updateEnergyRecovery(
+      0.0, 0.01, 0.0, 0.12, 0.95, true, true, true, true, true, &state);
+  EXPECT_EQ(state.phase, EnergyControlPhase::kLimited);
+  EXPECT_FALSE(terms.exited);
+  terms = updateEnergyRecovery(
+      0.2, 0.01, 0.0, 0.12, 0.95, true, true, false, true, true, &state);
+  EXPECT_EQ(state.phase, EnergyControlPhase::kRecovering);
+  EXPECT_DOUBLE_EQ(terms.scale, 0.0);
+  EXPECT_FALSE(terms.exited);
+}
+
+TEST(EnergyRecovery, NullspaceAndInvalidEnergyCannotBypassRecovery) {
+  EnergyRecoveryState state{EnergyControlPhase::kRecovering, 1.0};
+  auto terms = updateEnergyRecovery(
+      0.01, 0.01, 1.0, 0.12, 0.95, true, true, false, true, true, &state);
+  EXPECT_LT(terms.scale, 1.0);
+  EXPECT_FALSE(terms.exited);
+  terms = updateEnergyRecovery(
+      std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0, 0.12,
+      0.95, true, true, false, true, true, &state);
+  EXPECT_DOUBLE_EQ(terms.scale, 0.0);
+  EXPECT_FALSE(terms.exited);
+}
+
+TEST(EnergyRecovery, FreeMotionAndCalibrationRetainExistingGainPolicy) {
+  EnergyRecoveryState state;
+  auto terms = updateEnergyRecovery(
+      0.0, 30.0, 0.0, 0.12, 0.95, true, true, false, true, true, &state);
+  EXPECT_FALSE(terms.scaling_active);
+  EXPECT_DOUBLE_EQ(terms.scale, 1.0);
+  state.phase = EnergyControlPhase::kLimited;
+  terms = updateEnergyRecovery(
+      0.0, 30.0, 0.0, 0.12, 0.95, false, false, true, true, false, &state);
+  EXPECT_FALSE(terms.scaling_active);
+  EXPECT_EQ(state.phase, EnergyControlPhase::kNormal);
+}
+
+TEST(EnergyRecovery, OldOrUnverifiedCommandsCannotAuthorizeExit) {
+  ImpedanceSample command;
+  command.energy_recovery_epoch = 2;
+  EXPECT_FALSE(energyRecoveryExitPermitted(command, 2));
+  command.energy_recovery_exit_allowed = true;
+  EXPECT_TRUE(energyRecoveryExitPermitted(command, 2));
+  EXPECT_FALSE(energyRecoveryExitPermitted(command, 3));
+}
+
+TEST(EnergyRecovery, HandoffRejectsDifferentTransitionState) {
+  EnergyRecoveryState actual{EnergyControlPhase::kRecovering, 0.2};
+  JointPredictionSample prediction;
+  prediction.energy_control_phase = EnergyControlPhase::kNormal;
+  EXPECT_FALSE(energyRecoveryStateMatchesPrediction(prediction, actual));
+  prediction.energy_control_phase = EnergyControlPhase::kRecovering;
+  prediction.energy_recovery_runtime_scale = 0.3;
+  EXPECT_TRUE(energyRecoveryStateMatchesPrediction(prediction, actual));
+  prediction.energy_recovery_runtime_scale = 1.0;
+  EXPECT_FALSE(energyRecoveryStateMatchesPrediction(prediction, actual));
+  actual.last_scale = 1.0;
+  EXPECT_TRUE(energyRecoveryStateMatchesPrediction(prediction, actual));
+  actual.last_nominal_gains_restored = false;
+  EXPECT_FALSE(energyRecoveryStateMatchesPrediction(prediction, actual));
+}
+
+TEST(EnergyRecovery, VerifiedPlanOnlyAuthorizesThePredictedExitCommand) {
+  VerifiedPlan plan;
+  ImpedanceSample command;
+  command.energy_recovery_exit_allowed = true;
+  command.energy_recovery_epoch = 7;
+  command.t = 0.001;
+  plan.intended.push_back(command);
+  command.t = 0.002;
+  plan.intended.push_back(command);
+  command.t = 0.003;
+  plan.failsafe.push_back(command);
+  std::vector<JointPredictionSample> trace(3);
+  for (std::size_t i = 0; i < trace.size(); ++i) {
+    trace[i].t = (i + 1) * 0.001;
+    trace[i].energy_valid = true;
+    trace[i].energy_control_phase = EnergyControlPhase::kRecovering;
+  }
+  trace[1].energy_control_phase = EnergyControlPhase::kNormal;
+  trace[1].energy_recovery_exited = true;
+  trace[2].energy_control_phase = EnergyControlPhase::kNormal;
+
+  restrictEnergyRecoveryExitPermissions(&plan, trace);
+  EXPECT_FALSE(plan.intended[0].energy_recovery_exit_allowed);
+  EXPECT_TRUE(plan.intended[1].energy_recovery_exit_allowed);
+  EXPECT_FALSE(plan.failsafe[0].energy_recovery_exit_allowed);
+
+  // Even if measured energy becomes small earlier than predicted, a safe
+  // candidate must not authorize an earlier, unmodelled control-law switch.
+  EnergyRecoveryState actual{EnergyControlPhase::kRecovering, 1.0};
+  auto terms = updateEnergyRecovery(
+      0.0, 0.01, 0.0, 0.12, 0.95, true, true, false, true,
+      energyRecoveryExitPermitted(plan.intended[0], 7), &actual);
+  EXPECT_TRUE(terms.exit_ready);
+  EXPECT_FALSE(terms.exited);
+  terms = updateEnergyRecovery(
+      0.0, 0.01, 0.0, 0.12, 0.95, true, true, false, true,
+      energyRecoveryExitPermitted(plan.intended[1], 7), &actual);
+  EXPECT_TRUE(terms.exited);
+}
+
+TEST(EnergyRecovery, ExitAuthorizationPreservesCommitmentsAndRequiresValidEndpoint) {
+  VerifiedPlan plan;
+  ImpedanceSample command;
+  command.energy_recovery_exit_allowed = true;
+  command.energy_recovery_epoch = 4;
+  command.t = 0.001;
+  plan.intended.push_back(command);
+  command.energy_recovery_epoch = 5;
+  command.t = 0.002;
+  plan.intended.push_back(command);
+  command.t = 0.003;
+  plan.failsafe.push_back(command);
+  JointPredictionSample endpoint;
+  endpoint.t = 0.003;
+  endpoint.energy_valid = true;
+  endpoint.energy_recovery_exited = true;
+
+  restrictEnergyRecoveryExitPermissions(&plan, {endpoint}, 1);
+  EXPECT_TRUE(plan.intended[0].energy_recovery_exit_allowed);
+  EXPECT_EQ(plan.intended[0].energy_recovery_epoch, 4U);
+  EXPECT_FALSE(plan.intended[1].energy_recovery_exit_allowed);  // Missing endpoint.
+  EXPECT_TRUE(plan.failsafe[0].energy_recovery_exit_allowed);
+  EXPECT_EQ(plan.failsafe[0].energy_recovery_epoch, 5U);
+
+  endpoint.energy_valid = false;
+  restrictEnergyRecoveryExitPermissions(&plan, {endpoint}, 1);
+  EXPECT_FALSE(plan.failsafe[0].energy_recovery_exit_allowed);
+  restrictEnergyRecoveryExitPermissions(&plan, {}, 0);
+  EXPECT_FALSE(plan.intended[0].energy_recovery_exit_allowed);
+}
+
+TEST(EnergyRecovery, JointStateGateChecksPositionsVelocitiesAndFiniteValues) {
+  JointDynamicsLimits limits;
+  limits.position_lower.setConstant(-1.0);
+  limits.position_upper.setConstant(1.0);
+  limits.velocity.setConstant(2.0);
+  Vector7d q = Vector7d::Zero();
+  Vector7d dq = Vector7d::Zero();
+  EXPECT_TRUE(jointStateWithinLimits(q, dq, limits));
+  q(6) = 1.1;
+  EXPECT_FALSE(jointStateWithinLimits(q, dq, limits));
+  q(6) = 0.0;
+  dq(4) = -2.1;
+  EXPECT_FALSE(jointStateWithinLimits(q, dq, limits));
+  dq(4) = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(jointStateWithinLimits(q, dq, limits));
+}
+
+TEST(ReachableSafetyMonitor, RecoveryPersistsThroughIntendedAndFailsafeOutsideHuman) {
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  config.energy_budget_joule = 0.12;
+  config.enable_runtime_energy_scaling = true;
+  config.energy_recovery_state = {EnergyControlPhase::kLimited, 0.004};
+  config.assume_human_workspace_clear = true;
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.t = 0.001;
+  sample.p.x() = 0.2;
+  sample.K(0, 0) = 1500.0;
+  sample.energy_recovery_exit_allowed = true;
+  plan.intended.push_back(sample);
+  sample.t = 0.002;
+  sample.failsafe = true;
+  plan.failsafe.push_back(sample);
+  std::vector<JointPredictionSample> trace;
+  const auto result = verifyReachablePlanJointSpace(
+      plan, Vector7d::Zero(), Vector7d::Zero(), dynamics, config, &trace);
+  EXPECT_FALSE(result.monitored_contact_possible);
+  ASSERT_EQ(trace.size(), 3U);
+  for (std::size_t i = 1; i < trace.size(); ++i) {
+    EXPECT_EQ(trace[i].energy_control_phase, EnergyControlPhase::kRecovering);
+    EXPECT_FALSE(trace[i].energy_scaling_active);
+    EXPECT_DOUBLE_EQ(trace[i].energy_stiffness_scale, 1.0);
+    EXPECT_LE(trace[i].energy_recovery_runtime_scale, 0.004 + 1e-12);
+  }
+  EXPECT_TRUE(result.recovery_energy_check_active);
+  EXPECT_TRUE(result.predicted_trigger);
+  EXPECT_GE(result.worst_case_total_control_energy_ub, 30.0);
+  const auto recovery_trace = trace;
+  // The latch changes acceptance, never nominal rollout dynamics.
+  config.energy_recovery_state = EnergyRecoveryState{};
+  verifyReachablePlanJointSpace(
+      plan, Vector7d::Zero(), Vector7d::Zero(), dynamics, config, &trace);
+  EXPECT_DOUBLE_EQ(trace[1].energy_stiffness_scale, 1.0);
+  EXPECT_NEAR(trace[1].dq(0), 0.3, 1e-12);
+  EXPECT_TRUE(trace.back().dq.isApprox(recovery_trace.back().dq, 1e-12));
+}
+
+TEST(ReachableSafetyMonitor, NominalGainsOverrideReducedAnchorAndCommandGains) {
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  config.assume_human_workspace_clear = true;
+  config.enable_runtime_energy_scaling = true;
+  config.energy_recovery_nominal_gains_valid = true;
+  config.energy_recovery_nominal_stiffness(0, 0) = 1500.0;
+  config.energy_recovery_nominal_damping(0, 0) = 20.0;
+  config.nullspace_stiffness = 10.0;
+  config.current_nullspace_stiffness = 0.1;
+  config.nullspace_reference(6) = 0.1;
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.p.x() = 0.2;
+  plan.anchor.K(0, 0) = 1.0;
+  config.current_energy_reference = plan.anchor;
+  config.current_energy_reference_valid = true;
+  auto command = plan.anchor;
+  command.t = 0.001;
+  plan.intended.push_back(command);
+  Vector7d dq = Vector7d::Zero();
+  dq(0) = 0.1;
+  for (const auto phase : {EnergyControlPhase::kNormal,
+                          EnergyControlPhase::kLimited,
+                          EnergyControlPhase::kRecovering}) {
+    config.energy_recovery_state = {phase, 0.001, false};
+    std::vector<JointPredictionSample> trace;
+    const auto result = verifyReachablePlanJointSpace(
+        plan, Vector7d::Zero(), dq, dynamics, config, &trace);
+    ASSERT_EQ(trace.size(), 2U);
+    EXPECT_NEAR(trace.front().cartesian_potential_energy, 30.0, 1e-12);
+    EXPECT_NEAR(result.current_cartesian_potential_energy, 30.0, 1e-12);
+    EXPECT_NEAR(result.current_nullspace_potential_energy, 0.05, 1e-12);
+    EXPECT_NEAR(trace.back().dq(0), 0.398, 1e-12);  // 300 N - 20 * 0.1 N.
+    EXPECT_DOUBLE_EQ(trace.back().applied_nullspace_stiffness, 10.0);
+    EXPECT_EQ(result.predicted_trigger, phase != EnergyControlPhase::kNormal);
+  }
+}
+
+TEST(ReachableSafetyMonitor, RecoveryGatesIntendedAndFailsafeWithClearSaraGeometry) {
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  config.energy_budget_joule = 0.12;
+  config.enable_runtime_energy_scaling = true;
+  config.energy_recovery_state = {EnergyControlPhase::kRecovering, 1.0};
+  config.robot_reachability_provider =
+      std::make_shared<RecordingRobotReachabilityProvider>();
+  VerifiedPlan plan;
+  plan.valid = true;
+  auto command = plan.anchor;
+  command.K(0, 0) = 1500.0;
+  command.p.x() = 0.001;
+  command.energy_recovery_exit_allowed = true;
+  command.t = 0.001;
+  plan.intended.push_back(command);
+  command.t = 0.002;
+  command.p.x() = 0.2;
+  command.failsafe = true;
+  plan.failsafe.push_back(command);
+  for (const bool assume_clear : {false, true}) {
+    config.assume_human_workspace_clear = assume_clear;
+    const auto unsafe = verifyReachablePlanJointSpace(
+        plan, Vector7d::Zero(), Vector7d::Zero(), dynamics, config);
+    EXPECT_FALSE(unsafe.monitored_contact_possible);
+    EXPECT_TRUE(unsafe.recovery_energy_check_active);
+    EXPECT_TRUE(unsafe.predicted_trigger);
+    EXPECT_EQ(unsafe.first_contact_interval_index, -1);
+    EXPECT_EQ(unsafe.first_energy_unsafe_contact_interval_index, 1);
+    EXPECT_GE(unsafe.worst_case_total_control_energy_ub, 30.0);
+    // A hypothetical exit in intended must not un-gate the failsafe tail.
+    auto safe_plan = plan;
+    safe_plan.failsafe[0].p.x() = 0.001;
+    const auto safe = verifyReachablePlanJointSpace(
+        safe_plan, Vector7d::Zero(), Vector7d::Zero(), dynamics, config);
+    EXPECT_TRUE(safe.recovery_energy_check_active);
+    EXPECT_FALSE(safe.predicted_trigger);
+    EXPECT_FALSE(safe.joint_limit_unsafe);
+  }
+}
+
+TEST(ReachableSafetyMonitor, RecoveryExitIsPredictedAfterCommittedPrefix) {
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  config.energy_budget_joule = 0.12;
+  config.enable_runtime_energy_scaling = true;
+  config.energy_recovery_state = {EnergyControlPhase::kRecovering, 1.0};
+  config.energy_recovery_epoch = 7;
+  config.assume_human_workspace_clear = true;
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.K(0, 0) = 1500.0;
+  sample.p.x() = 0.01;
+  sample.energy_recovery_exit_allowed = true;
+  sample.energy_recovery_epoch = 6;  // Previously committed command.
+  sample.t = 0.001;
+  plan.intended.push_back(sample);
+  sample.energy_recovery_epoch = 7;
+  sample.t = 0.002;
+  plan.intended.push_back(sample);
+  std::vector<JointPredictionSample> trace;
+  verifyReachablePlanJointSpace(
+      plan, Vector7d::Zero(), Vector7d::Zero(), dynamics, config, &trace);
+  ASSERT_EQ(trace.size(), 3U);
+  EXPECT_EQ(trace[1].energy_control_phase, EnergyControlPhase::kRecovering);
+  EXPECT_FALSE(trace[1].energy_recovery_exited);
+  EXPECT_EQ(trace[2].energy_control_phase, EnergyControlPhase::kNormal);
+  EXPECT_TRUE(trace[2].energy_recovery_exited);
+  EXPECT_DOUBLE_EQ(trace[1].energy_stiffness_scale, 1.0);
+  EXPECT_DOUBLE_EQ(trace[2].energy_stiffness_scale, 1.0);
+
+  // Freezing the exit event must preserve the rollout that was verified,
+  // including the committed prefix's existing permission and epoch.
+  const auto original_trace = trace;
+  restrictEnergyRecoveryExitPermissions(&plan, trace, 1);
+  verifyReachablePlanJointSpace(
+      plan, Vector7d::Zero(), Vector7d::Zero(), dynamics, config, &trace);
+  ASSERT_EQ(trace.size(), original_trace.size());
+  for (std::size_t i = 0; i < trace.size(); ++i) {
+    EXPECT_EQ(trace[i].energy_control_phase, original_trace[i].energy_control_phase);
+    EXPECT_EQ(trace[i].energy_recovery_exited, original_trace[i].energy_recovery_exited);
+    EXPECT_DOUBLE_EQ(trace[i].energy_stiffness_scale, original_trace[i].energy_stiffness_scale);
+    EXPECT_TRUE(trace[i].q.isApprox(original_trace[i].q, 1e-12));
+    EXPECT_TRUE(trace[i].dq.isApprox(original_trace[i].dq, 1e-12));
+  }
+}
+
+TEST(ReachableSafetyMonitor, RecoveryDoesNotExitDuringScheduledGainRestoration) {
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  config.enable_runtime_energy_scaling = true;
+  config.energy_recovery_state = {EnergyControlPhase::kRecovering, 1.0, false};
+  config.assume_human_workspace_clear = true;
+  config.energy_recovery_nominal_gains_valid = true;
+  config.energy_recovery_nominal_stiffness(0, 0) = 1500.0;
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.energy_recovery_exit_allowed = true;
+  sample.K(0, 0) = 100.0;
+  sample.t = 0.001;
+  plan.intended.push_back(sample);
+  sample.K = config.energy_recovery_nominal_stiffness;
+  sample.t = 0.002;
+  plan.intended.push_back(sample);
+  sample.t = 0.003;
+  plan.intended.push_back(sample);
+  std::vector<JointPredictionSample> trace;
+  verifyReachablePlanJointSpace(
+      plan, Vector7d::Zero(), Vector7d::Zero(), dynamics, config, &trace);
+  ASSERT_EQ(trace.size(), 4U);
+  EXPECT_EQ(trace[1].energy_control_phase, EnergyControlPhase::kRecovering);
+  EXPECT_EQ(trace[2].energy_control_phase, EnergyControlPhase::kRecovering);
+  EXPECT_EQ(trace[3].energy_control_phase, EnergyControlPhase::kNormal);
+  EXPECT_FALSE(trace[1].energy_nominal_gains_restored);
+  EXPECT_TRUE(trace[2].energy_nominal_gains_restored);
+}
+
+TEST(ReachableSafetyMonitor, LeavingOverlapWithinRolloutStartsRecovery) {
+  IdentityJointDynamicsProvider dynamics;
+  dynamics.control_position_from_q0_ = true;
+  SafetyMonitorConfig config;
+  config.enable_runtime_energy_scaling = true;
+  config.energy_budget_joule = 0.012;
+  config.ee_collision_radius = 0.0;
+  config.tracking_acc_error_bound = 0.0;
+  cps_human_workspace::HumanWorkspace::Parameters human;
+  human.sphere_center.setZero();
+  human.motion_radius = 1e-6;
+  human.hand_max_velocity = 0.0;
+  // ReachLib requires positive acceleration. Zero maximum velocity keeps the
+  // hand stationary without creating 0/0 in the reachable-set calculation.
+  human.hand_max_acceleration = 1.0;
+  config.human_workspace.setParameters(human);
+  ASSERT_TRUE(config.human_workspace.handReachableSetAtTime(0.0).center.allFinite());
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.p.x() = 0.2;
+  sample.K(0, 0) = 1000.0;
+  sample.energy_recovery_exit_allowed = true;
+  sample.t = 0.001;
+  plan.intended.push_back(sample);
+  sample.t = 0.002;
+  sample.failsafe = true;
+  plan.failsafe.push_back(sample);
+  Vector7d dq = Vector7d::Zero();
+  dq(0) = 0.1;
+  std::vector<JointPredictionSample> trace;
+  verifyReachablePlanJointSpace(plan, Vector7d::Zero(), dq, dynamics, config, &trace);
+  ASSERT_EQ(trace.size(), 3U);
+  EXPECT_EQ(trace[1].energy_control_phase, EnergyControlPhase::kLimited);
+  EXPECT_EQ(trace[2].energy_control_phase, EnergyControlPhase::kRecovering);
+  EXPECT_LT(trace[2].energy_recovery_runtime_scale, 0.001);
+}
+
+TEST(ReachableSafetyMonitor, InvalidWorkspaceGeometryCannotVerifyRecoveryExit) {
+  IdentityJointDynamicsProvider dynamics;
+  SafetyMonitorConfig config;
+  config.enable_runtime_energy_scaling = true;
+  config.energy_recovery_state = {EnergyControlPhase::kRecovering, 1.0};
+  cps_human_workspace::HumanWorkspace::Parameters human;
+  human.sphere_center.x() = std::numeric_limits<double>::quiet_NaN();
+  config.human_workspace.setParameters(human);
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample sample = plan.anchor;
+  sample.t = 0.001;
+  sample.energy_recovery_exit_allowed = true;
+  plan.intended.push_back(sample);
+  std::vector<JointPredictionSample> trace;
+  const auto result = verifyReachablePlanJointSpace(
+      plan, Vector7d::Zero(), Vector7d::Zero(), dynamics, config, &trace);
+  EXPECT_TRUE(result.monitored_unsafe);
+  EXPECT_TRUE(result.predicted_trigger);
+  EXPECT_TRUE(trace.empty());
+}
+
+TEST(ReachableSafetyMonitor, RolloutUsesNominalGainsDespiteRuntimeScalingInsideCollisionArea) {
   IdentityJointDynamicsProvider dynamics;
   SafetyMonitorConfig config;
   config.energy_budget_joule = 0.1;
@@ -189,13 +649,15 @@ TEST(ReachableSafetyMonitor, RolloutAppliesEnergyScalingInsideCollisionArea) {
       &prediction_trace);
 
   ASSERT_EQ(prediction_trace.size(), 2U);
-  EXPECT_TRUE(prediction_trace.front().energy_scaling_active);
-  EXPECT_TRUE(prediction_trace.back().energy_scaling_active);
+  EXPECT_FALSE(prediction_trace.front().energy_scaling_active);
+  EXPECT_FALSE(prediction_trace.back().energy_scaling_active);
+  EXPECT_DOUBLE_EQ(prediction_trace.back().energy_stiffness_scale, 1.0);
+  EXPECT_NEAR(prediction_trace.back().dq(0), 0.1, 1e-12);
   EXPECT_NEAR(
-      prediction_trace.back().energy_stiffness_scale, 0.2, 1.0e-12);
+      prediction_trace.back().energy_recovery_runtime_scale, 0.2, 1.0e-12);
   EXPECT_NEAR(
       prediction_trace.back().cartesian_potential_energy,
-      0.1,
+      0.5,
       1.0e-9);
 }
 
@@ -239,7 +701,7 @@ TEST(ReachableSafetyMonitor, RolloutKeepsNominalGainsOutsideCollisionArea) {
       1.0e-9);
 }
 
-TEST(ReachableSafetyMonitor, RolloutActivatesScalingAfterEnteringCollisionArea) {
+TEST(ReachableSafetyMonitor, RolloutKeepsNominalGainsAfterEnteringCollisionArea) {
   IdentityJointDynamicsProvider dynamics;
   dynamics.control_position_from_q0_ = true;
   SafetyMonitorConfig config;
@@ -276,98 +738,10 @@ TEST(ReachableSafetyMonitor, RolloutActivatesScalingAfterEnteringCollisionArea) 
   EXPECT_FALSE(prediction_trace[0].energy_scaling_active);
   EXPECT_FALSE(prediction_trace[1].energy_scaling_active);
   EXPECT_NEAR(prediction_trace[1].energy_stiffness_scale, 1.0, 1.0e-12);
-  EXPECT_TRUE(prediction_trace[2].energy_scaling_active);
-  EXPECT_GT(prediction_trace[2].energy_stiffness_scale, 0.0);
-  EXPECT_LT(prediction_trace[2].energy_stiffness_scale, 1.0);
-}
-
-TEST(ReachableSafetyMonitor, RolloutTracksOverbudgetJointStabilization) {
-  IdentityJointDynamicsProvider dynamics;
-  SafetyMonitorConfig config;
-  config.energy_budget_joule = 0.1;
-  config.enable_overbudget_joint_stabilization = true;
-  config.overbudget_joint_stiffness = 1.0;
-  config.overbudget_joint_scale_omega = 40.0;
-  config.joint_rollout_max_dt = 0.01;
-  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
-  workspace_parameters.sphere_center = Vector3d::Zero();
-  workspace_parameters.motion_radius = 0.10;
-  config.human_workspace.setParameters(workspace_parameters);
-
-  VerifiedPlan plan;
-  plan.valid = true;
-  plan.anchor.q = Quaterniond::Identity();
-  ImpedanceSample first = plan.anchor;
-  first.t = 0.01;
-  plan.intended.push_back(first);
-  ImpedanceSample second = first;
-  second.t = 0.02;
-  plan.intended.push_back(second);
-
-  Vector7d dq = Vector7d::Zero();
-  dq(0) = 1.0;
-  std::vector<JointPredictionSample> prediction_trace;
-  verifyReachablePlanJointSpace(
-      plan,
-      Vector7d::Zero(),
-      dq,
-      dynamics,
-      config,
-      &prediction_trace);
-
-  ASSERT_EQ(prediction_trace.size(), 3U);
-  EXPECT_TRUE(
-      prediction_trace.front().overbudget_joint_stabilization_active);
-  EXPECT_TRUE(
-      prediction_trace.back().overbudget_joint_stabilization_active);
-  EXPECT_GT(
-      prediction_trace.back().overbudget_joint_potential_energy, 0.0);
-  EXPECT_GT(prediction_trace.back().overbudget_joint_torque_norm, 0.0);
-}
-
-TEST(ReachableSafetyMonitor,
-     RolloutDisablesOverbudgetJointStabilizationOutsideCollisionArea) {
-  IdentityJointDynamicsProvider dynamics;
-  SafetyMonitorConfig config;
-  config.energy_budget_joule = 0.1;
-  config.enable_overbudget_joint_stabilization = true;
-  config.overbudget_joint_stiffness = 1.0;
-  config.overbudget_joint_scale_omega = 40.0;
-  config.joint_rollout_max_dt = 0.01;
-  cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
-  workspace_parameters.sphere_center = Vector3d(10.0, 0.0, 0.0);
-  workspace_parameters.motion_radius = 0.10;
-  config.human_workspace.setParameters(workspace_parameters);
-  config.overbudget_joint_state.active = true;
-  config.overbudget_joint_state.reference = Vector7d::Ones();
-
-  VerifiedPlan plan;
-  plan.valid = true;
-  plan.anchor.q = Quaterniond::Identity();
-  ImpedanceSample first = plan.anchor;
-  first.t = 0.01;
-  plan.intended.push_back(first);
-  ImpedanceSample second = first;
-  second.t = 0.02;
-  plan.intended.push_back(second);
-
-  Vector7d dq = Vector7d::Zero();
-  dq(0) = 1.0;
-  std::vector<JointPredictionSample> prediction_trace;
-  verifyReachablePlanJointSpace(
-      plan,
-      Vector7d::Zero(),
-      dq,
-      dynamics,
-      config,
-      &prediction_trace);
-
-  ASSERT_EQ(prediction_trace.size(), 3U);
-  for (const auto& sample : prediction_trace) {
-    EXPECT_FALSE(sample.overbudget_joint_stabilization_active);
-    EXPECT_NEAR(sample.overbudget_joint_potential_energy, 0.0, 1.0e-12);
-    EXPECT_NEAR(sample.overbudget_joint_torque_norm, 0.0, 1.0e-12);
-  }
+  EXPECT_FALSE(prediction_trace[2].energy_scaling_active);
+  EXPECT_DOUBLE_EQ(prediction_trace[2].energy_stiffness_scale, 1.0);
+  EXPECT_GT(prediction_trace[2].energy_recovery_runtime_scale, 0.0);
+  EXPECT_LT(prediction_trace[2].energy_recovery_runtime_scale, 1.0);
 }
 
 TEST(ReachableSafetyMonitor, RejectsTangentialAndRotationalCartesianEnergy) {

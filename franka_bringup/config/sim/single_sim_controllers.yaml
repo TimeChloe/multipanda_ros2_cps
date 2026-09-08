@@ -248,21 +248,22 @@ reachable_cartesian_impedance_controller:
     # measured-minus-predicted impedance potential-energy residual. They do
     # not inflate collision geometry and must be recalibrated on real Panda.
     kinetic_energy_error_bound_joule: 0.0
-    potential_energy_error_bound_joule: 0.000
+    potential_energy_error_bound_joule: 0.027
     # One-sided residual bound for Lachner's joint/nullspace potential
     # U_n = 0.5 * n_stiffness * ||nullspace_home_pose - q||^2. Calibrate
     # independently from the Cartesian potential residual above.
     nullspace_potential_energy_error_bound_joule: 0.0
     # T + U_x + U_n is measured throughout execution. Lachner Eq. (14) scales
-    # Cartesian and nullspace gains only while the current robot occupancy
-    # overlaps the human workspace. Disable this for calibration experiments.
+    # Cartesian and nullspace gains during overlap and the recovery phase
+    # after overlap/data loss. Disable this for calibration experiments.
+    # The monitor always predicts nominal gains. During recovery it retains
+    # the contact energy check over the whole intended + failsafe horizon,
+    # even after the live human workspace is clear.
     enable_runtime_energy_scaling: true
-    # Lachner Eqs. (16)-(17): only while the current robot occupancy overlaps
-    # the human workspace, capture q* when measured joint kinetic energy first
-    # exceeds L_max and apply rho*K_q^*(q*-q) until T <= L_max or overlap ends.
-    enable_overbudget_joint_stabilization: true
-    overbudget_joint_stiffness: 1.0
-    overbudget_joint_scale_omega: 40.0
+    # Exit recovery only with nominal energy <= this fraction of the budget,
+    # fully restored gains, valid clear geometry, valid joint state and a
+    # verified command from the current environment episode. Range: (0, 1].
+    energy_recovery_exit_energy_fraction: 0.95
     # Dense prediction/provenance logging used by the separate calibration
     # action. The ordinary follow_cartesian_via_points action is unchanged.
     enable_calibration_logging: false
