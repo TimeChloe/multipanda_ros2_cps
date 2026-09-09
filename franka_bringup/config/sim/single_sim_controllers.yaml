@@ -213,7 +213,7 @@ reachable_cartesian_impedance_controller:
     # normally until this time, then captures exactly the next monitor input.
     # May be changed with `ros2 param set` before each calibration goal.
     calibration_capture_path_time_sec: 0.0
-    # cartesian_via_points: [0.306957, 0.000000, 0.099912, 0.923956, -0.382499, 0.000000, 0.000000]
+    # cartesian_via_points: [0.400000, 0.000000, 0.099912, 0.923956, -0.382499, 0.000000, 0.000000]
     # Leave cartesian_via_points unset in action mode. ROS2 cannot infer the
     # type of an empty YAML sequence here.
     # cartesian_via_points: []

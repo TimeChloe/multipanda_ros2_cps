@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
+import math
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -30,6 +32,62 @@ from franka_bringup.tool_model import (
 WORKSPACE = Path(__file__).resolve().parents[2]
 BRINGUP = WORKSPACE / 'franka_bringup'
 DESCRIPTION = WORKSPACE / 'franka_description'
+
+
+def test_default_forward_pose_and_contact_fixture_alignment():
+    launch = ast.parse((BRINGUP / 'launch/sim/franka_sim.launch.py').read_text())
+    declaration = next(
+        node for node in ast.walk(launch)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == 'DeclareLaunchArgument' and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == 'initial_positions'
+    )
+    default = next(kw.value for kw in declaration.keywords if kw.arg == 'default_value')
+    new_q = [float(value) for value in ast.literal_eval(default).strip('"').split()]
+    old_q = [0.0, -0.578, 0.0, -1.753, 0.0, 1.175, 0.785]
+    urdf = ET.parse(WORKSPACE / 'model_urdf/panda_ng.urdf').getroot()
+    tool = load_tool_description(str(BRINGUP / 'config/tools/metal_ball.yaml'))
+
+    def multiply(a, b):
+        return [[sum(a[i][k] * b[k][j] for k in range(4))
+                 for j in range(4)] for i in range(4)]
+
+    def fk(q):
+        transform = [[float(i == j) for j in range(4)] for i in range(4)]
+        for index in range(8):
+            joint = urdf.find(f"joint[@name='panda_joint{index + 1}']")
+            origin = joint.find('origin')
+            xyz = [float(v) for v in origin.attrib.get('xyz', '0 0 0').split()]
+            rpy = [float(v) for v in origin.attrib.get('rpy', '0 0 0').split()]
+            rotation = _rotation_from_rpy(rpy)
+            transform = multiply(transform, [rotation[i] + [xyz[i]] for i in range(3)]
+                                 + [[0.0, 0.0, 0.0, 1.0]])
+            if index < 7:
+                limits = joint.find('limit')
+                assert float(limits.attrib['lower']) < q[index] < float(limits.attrib['upper'])
+                assert joint.find('axis').attrib['xyz'] == '0 0 1'
+                c, s = math.cos(q[index]), math.sin(q[index])
+                transform = multiply(transform, [[c, -s, 0, 0], [s, c, 0, 0],
+                                                 [0, 0, 1, 0], [0, 0, 0, 1]])
+        tcp = [transform[i][3] + sum(transform[i][k] * tool.tcp['xyz'][k]
+                                    for k in range(3)) for i in range(3)]
+        return tcp, [transform[i][j] for i in range(3) for j in range(3)]
+
+    old_tcp, old_rotation = fk(old_q)
+    new_tcp, new_rotation = fk(new_q)
+    assert new_tcp == pytest.approx([0.4, old_tcp[1], old_tcp[2]], abs=1e-10)
+    assert new_rotation == pytest.approx(old_rotation, abs=1e-10)
+
+    model = ET.parse(DESCRIPTION / 'mujoco/franka/panda_ng.xml').getroot()
+    base = model.find(".//body[@name='panda_link0']")
+    assert base.attrib['quat'] == '0 0 0 1'  # World Rz(pi): base +X = world -X.
+    fixture = ET.parse(DESCRIPTION / 'mujoco/franka/table.xml').getroot()
+    assembly = fixture.find("worldbody/body[@name='table_assembly']")
+    assert assembly.attrib['pos'] == '0 0 0'  # Height actions keep this origin.
+    for name in ['human_hand_surface', 'hand_surface_spring_visual']:
+        xy = [float(v) for v in assembly.find(f"body[@name='{name}']").attrib['pos'].split()][:2]
+        assert xy == pytest.approx([-new_tcp[0], -new_tcp[1]], abs=1e-9)
 
 
 def test_metal_ball_derived_parameters_match_existing_controller_geometry():

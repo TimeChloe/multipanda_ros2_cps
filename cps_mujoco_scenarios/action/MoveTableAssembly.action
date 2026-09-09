@@ -1,5 +1,5 @@
 # Absolute target height of the complete table/spring/surface assembly relative
-# to its loaded pose. The configured default range is [-0.5, 0.5] m; 0.0 always
+# to its loaded pose. The configured default range is [-1.0, 1.0] m; 0.0 always
 # restores the loaded pose.
 float64 target_z_offset
 

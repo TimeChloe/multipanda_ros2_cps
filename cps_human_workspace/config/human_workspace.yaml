@@ -1,4 +1,5 @@
-sphere_center: [0.3, 0.0, 0.25]
+# Translated +0.10 m along panda_link0 X with the robot/task setup.
+sphere_center: [0.4, 0.0, 0.25]
 # Known-stationary hand: the center is fixed and the motion/velocity-error
 # bounds are zero, so the SaRA BodyPartCombined sphere stays at physical size
 # for every prediction horizon.

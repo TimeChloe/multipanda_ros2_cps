@@ -8,9 +8,11 @@ reachable ball over the same time intervals, then checks their intersections.
 The synthetic sinusoid only provides repeatable current hand measurements; it
 is not used as known future motion by the safety monitor.
 
-The monitor follows the SaRA-Shield Panda interval rule: five 1 ms controller
-samples form one 5 ms robot/human reachable-set interval over the complete
-intended + failsafe trajectory. In RViz, the controller publishes the selected
+The joint monitor follows the dense candidate command timestamps, normally
+one 1 ms robot/human reachable-set interval per sample over the complete
+intended + failsafe trajectory. Monitor requests are scheduled about every
+5 ms; ordinary prediction CSV logging uses a separate sparse view. In RViz,
+the controller publishes the selected
 robot occupancy and the exact blue human ball used for its intersection check.
 Both displays therefore represent the same selected interval; there is no
 separate fixed-duration hand preview.

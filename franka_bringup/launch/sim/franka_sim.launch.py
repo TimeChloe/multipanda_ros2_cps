@@ -199,8 +199,12 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'initial_positions',
-            default_value='"0.0 -0.578 0.0 -1.753 0.0 1.175 0.785"',
-            description='Initial joint positions.',
+            default_value='"0.0 -0.320210883515 0.0 -1.544505894256 0.0 1.224295010741 0.785"',
+            description=(
+                'Seven initial joint angles q1..q7 in radians. With the default '
+                'metal-ball tool, these default angles place the TCP at '
+                'approximately [0.400000, 0.000000, 0.729912] m in panda_link0.'
+            ),
         ),
         DeclareLaunchArgument(
             'scene',

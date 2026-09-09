@@ -10,7 +10,7 @@ All examples are `geometry_msgs/msg/PoseArray` payloads and use:
 - one pose per via point, with position and quaternion orientation
 - the default sim activation orientation
   `[0.923956, -0.382499, 0.000000, 0.000000]`
-- a final approach point near `[0.306957, 0.000000, 0.279912]`
+- a final approach point near `[0.400000, 0.000000, 0.279912]`
 
 Start MuJoCo with the table, visual spring, and compliant hand-surface pad:
 

@@ -4,7 +4,8 @@
 kinematic assembly. The table, visual spring, and compliant surface retain
 their relative transforms and the surface keeps its local spring joint.
 The pose loaded from the MuJoCo model is the zero-offset pose. By default, the
-accepted absolute Z-offset range is `[-0.5, 0.5]` m.
+accepted absolute Z-offset range is `[-1.0, 1.0]` m, including both endpoints.
+The `minimum_z_offset` and `maximum_z_offset` node parameters can override it.
 
 Start the table scene; the action server starts automatically:
 

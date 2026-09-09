@@ -4,7 +4,9 @@
          body keeps the table, visual spring, and compliant pad together while
          preserving the pad's local spring joint. -->
     <body name="table_assembly" mocap="true" pos="0 0 0">
-      <body name="table" pos="-0.50 0 0.13">
+      <!-- Panda base +X is world -X (base yaw = pi). Translate the table
+           0.10 m forward; keep the mocap origin at zero for height actions. -->
+      <body name="table" pos="-0.60 0 0.13">
       <!-- table top -->
       <geom
         name="table_top"
@@ -46,7 +48,8 @@
       </body>
 
       <!-- visual helical spring, display only, no collision -->
-      <body name="hand_surface_spring_visual" pos="-0.30 0 0.160">
+      <!-- Center the spring/pad under the TCP at base x=0.40 m. -->
+      <body name="hand_surface_spring_visual" pos="-0.40 0 0.160">
       <geom
         name="spring_seg_01"
         type="capsule"
@@ -140,7 +143,7 @@
 
       <!-- spring-supported compliant pad simulating human hand surface -->
       <!-- table top upper surface: z = 0.13 + 0.025 = 0.155 m -->
-      <body name="human_hand_surface" pos="-0.30 0 0.23">
+      <body name="human_hand_surface" pos="-0.40 0 0.23">
       <joint
         name="hand_surface_spring_z"
         type="slide"

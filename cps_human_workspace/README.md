@@ -17,7 +17,7 @@ reachability logic is kept apart from human, robot, and scenario config files.
 ## Config Format
 
 ```yaml
-sphere_center: [0.3, 0.0, 0.25]
+sphere_center: [0.4, 0.0, 0.25]
 motion_radius: 0.103
 
 hand_reachability:

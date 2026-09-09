@@ -57,9 +57,9 @@ public:
     origin_z_ = assembly_origin[2];
 
     minimum_z_offset_ = declare_parameter<double>(
-      "minimum_z_offset", -0.5);
+      "minimum_z_offset", -1.0);
     maximum_z_offset_ = declare_parameter<double>(
-      "maximum_z_offset", 0.5);
+      "maximum_z_offset", 1.0);
     const double update_rate_hz = declare_parameter<double>(
       "update_rate_hz", 50.0);
     service_wait_timeout_sec_ = declare_parameter<double>(
@@ -320,8 +320,8 @@ private:
   double origin_x_{0.0};
   double origin_y_{0.0};
   double origin_z_{0.0};
-  double minimum_z_offset_{-0.5};
-  double maximum_z_offset_{0.5};
+  double minimum_z_offset_{-1.0};
+  double maximum_z_offset_{1.0};
   double service_wait_timeout_sec_{5.0};
 
   rclcpp_action::Server<MoveTableAssembly>::SharedPtr action_server_;

@@ -1,6 +1,6 @@
-# Shift the complete y-axis crossing 5 cm along +x, away from the robot base
-# at panda_link0, while preserving the original crossing amplitude and speed.
-sphere_center: [0.356957, -0.16, 0.30]
+# Keep a 5 cm +X offset from the TCP path at panda_link0 X=0.40 m.
+# The crossing amplitude and speed are unchanged.
+sphere_center: [0.45, -0.16, 0.30]
 # SaRA-Shield TUM configuration uses 0.206 m hand thickness. A single-point
 # BodyPartCombined occupancy adds half the thickness as physical radius.
 motion_radius: 0.103

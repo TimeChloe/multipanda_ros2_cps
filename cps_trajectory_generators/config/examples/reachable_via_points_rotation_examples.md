@@ -3,9 +3,9 @@
 These examples are `geometry_msgs/msg/PoseArray` payloads. They use robot base
 frame (`panda_link0`) poses with one pose per via point.
 
-They are based on the default sim activation TCP pose:
+They use a reference point 0.03 m below the default ball-center TCP height:
 
-- position: `[0.306957, 0.000000, 0.699912]`
+- position: `[0.400000, 0.000000, 0.699912]`
 - orientation: `[0.923956, -0.382499, 0.000000, 0.000000]`
 
 ## Examples
