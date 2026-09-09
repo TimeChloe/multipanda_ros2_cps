@@ -25,8 +25,15 @@ class SaraRobotReachabilityProvider final
  public:
   SaraRobotReachabilityProvider(
       const std::string& robot_config_path,
-      double secure_radius)
-      : secure_radius_(secure_radius) {
+      double secure_radius,
+      const Vector3d& tcp_offset,
+      double tcp_radius)
+      : secure_radius_(secure_radius), tcp_radius_(tcp_radius),
+        tcp_in_joint7_(tcp_offset + Vector3d(0.0, 0.0, 0.107)) {
+    // Panda joint8 is a fixed translation of 0.107 m, with no rotation.
+    if (!tcp_offset.allFinite() || !std::isfinite(tcp_radius_) || tcp_radius_ < 0.0) {
+      throw std::invalid_argument("TCP offset must be finite and radius nonnegative");
+    }
     if (robot_config_path.empty()) {
       throw std::invalid_argument(
           "SaRA robot configuration path must not be empty");
@@ -123,7 +130,7 @@ class SaraRobotReachabilityProvider final
               interval_duration_sec,
               alpha_i);
       capsules->clear();
-      capsules->reserve(sara_capsules.size());
+      capsules->reserve(sara_capsules.size() + (tcp_radius_ > 0.0 ? 1 : 0));
       for (const auto& capsule : sara_capsules) {
         RobotReachCapsule converted;
         converted.p1 = Vector3d(
@@ -137,6 +144,22 @@ class SaraRobotReachabilityProvider final
           return false;
         }
         capsules->push_back(converted);
+      }
+      if (tcp_radius_ > 0.0) {
+        const Vector3d start_tcp = tcpPosition(start_q);
+        const Vector3d end_tcp = tcpPosition(goal_q);
+        RobotReachCapsule tool;
+        // Exact sphere specialization of RobotArmReach::reach: midpoint ball,
+        // endpoint displacement, dynamic alpha inflation and secure radius.
+        tool.p1 = tool.p2 = 0.5 * (start_tcp + end_tcp);
+        tool.radius = tcp_radius_ + secure_radius_ +
+            0.5 * (end_tcp - start_tcp).norm() +
+            alpha_i[6] * interval_duration_sec * interval_duration_sec / 8.0;
+        if (!tool.p1.allFinite() || !std::isfinite(tool.radius)) {
+          capsules->clear();
+          return false;
+        }
+        capsules->push_back(tool);
       }
       return !capsules->empty();
     } catch (const std::exception&) {
@@ -160,6 +183,8 @@ class SaraRobotReachabilityProvider final
     std::vector<std::vector<safety_shield::RobotArmReach::CapsuleVelocity>>
         capsule_velocities;
     capsule_velocities.reserve(trajectory.size());
+    std::vector<double> tcp_speeds;
+    tcp_speeds.reserve(trajectory.size());
     try {
       for (const auto& sample : trajectory) {
         if (!std::isfinite(sample.t) || !sample.q.allFinite() ||
@@ -178,6 +203,15 @@ class SaraRobotReachabilityProvider final
         if (capsule_velocities.back().size() != 7) {
           alpha_i->clear();
           return false;
+        }
+        if (tcp_radius_ > 0.0) {
+          Eigen::Matrix<double, 3, 7> jacobian;
+          tcpPosition(sample.q, &jacobian);
+          const double speed = (jacobian * sample.dq).norm();
+          if (!std::isfinite(speed)) {
+            return false;
+          }
+          tcp_speeds.push_back(speed);
         }
       }
     } catch (const std::exception&) {
@@ -214,6 +248,17 @@ class SaraRobotReachabilityProvider final
         }
         (*alpha_i)[capsule_index] =
             std::max((*alpha_i)[capsule_index], value);
+      }
+      if (tcp_radius_ > 0.0) {
+        // Share the last joint's inflation bound with the appended tool,
+        // without weakening the original last-link capsule bound.
+        const double tcp_alpha = std::abs(
+            tcp_speeds[sample_index] - tcp_speeds[sample_index - 1]) / dt;
+        if (!std::isfinite(tcp_alpha)) {
+          alpha_i->clear();
+          return false;
+        }
+        (*alpha_i)[6] = std::max((*alpha_i)[6], tcp_alpha);
       }
     }
     return true;
@@ -273,7 +318,31 @@ class SaraRobotReachabilityProvider final
   }
 
  private:
+  Vector3d tcpPosition(
+      const Vector7d& q,
+      Eigen::Matrix<double, 3, 7>* jacobian = nullptr) const {
+    Eigen::Matrix4d transform = Eigen::Matrix4d::Identity();
+    Eigen::Matrix<double, 3, 7> origins, axes;
+    for (int i = 0; i < 7; ++i) {
+      robot_reach_->forwardKinematic(q(i), i, transform);
+      if (jacobian != nullptr) {
+        origins.col(i) = transform.block<3, 1>(0, 3);
+        axes.col(i) = transform.block<3, 1>(0, 2);
+      }
+    }
+    const Vector3d tcp = transform.block<3, 1>(0, 3) +
+        transform.block<3, 3>(0, 0) * tcp_in_joint7_;
+    if (jacobian != nullptr) {
+      for (int i = 0; i < 7; ++i) {
+        jacobian->col(i) = axes.col(i).cross(tcp - origins.col(i));
+      }
+    }
+    return tcp;
+  }
+
   double secure_radius_{0.0};
+  double tcp_radius_{0.0};
+  Vector3d tcp_in_joint7_{Vector3d::Zero()};
   mutable std::mutex velocity_calculation_mutex_;
   std::unique_ptr<safety_shield::RobotArmReach> robot_reach_;
 };
@@ -283,9 +352,11 @@ class SaraRobotReachabilityProvider final
 std::shared_ptr<const RobotReachabilityProvider>
 makeSaraRobotReachabilityProvider(
     const std::string& robot_config_path,
-    double secure_radius) {
+    double secure_radius,
+    const Vector3d& tcp_offset,
+    double tcp_radius) {
   return std::make_shared<SaraRobotReachabilityProvider>(
-      robot_config_path, secure_radius);
+      robot_config_path, secure_radius, tcp_offset, tcp_radius);
 }
 
 std::string defaultSaraPandaRobotConfigPath() {

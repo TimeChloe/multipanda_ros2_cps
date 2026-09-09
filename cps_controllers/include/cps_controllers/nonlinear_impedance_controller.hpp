@@ -50,11 +50,6 @@ class NonlinearImpedanceController
   Eigen::Matrix<double, 6, 7> computeAnalyticJacobian(
       const Eigen::Matrix<double, 6, 7>& J_geo,
       const Eigen::Vector3d& rpy) const;
-  Eigen::Matrix<double, 6, 7> computeAnalyticJacobianDotNumerical(
-      const Vector7d& q,
-      const Vector7d& dq,
-      const Eigen::Vector3d& rpy,
-      double dt);
 
   // --------------------------------------------------------------------------
   // logging

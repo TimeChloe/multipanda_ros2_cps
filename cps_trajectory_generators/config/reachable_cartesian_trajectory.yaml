@@ -5,10 +5,10 @@
 # fallbacks. A candidate without valid scalar path progress or a continuous
 # scalar braking continuation is rejected.
 
-# SaRA-Shield Panda uses reachability_set_interval_size=5. With the current
-# 1 ms controller sample, both human and robot reachable sets therefore use
-# 5 ms intervals over the complete intended + failsafe braking trajectory.
-# Dense intended and failsafe commands still use local_replan_dt.
+# Sparse interval for ordinary prediction logs and Cartesian-only fallback.
+# The joint monitor uses the dense intended/failsafe command timestamps
+# (currently local_replan_dt = 1 ms), without additional resampling.
+# Monitor request frequency is configured separately below.
 shield_plan_dt: 0.005
 monitor_frequency_hz: 200.0
 

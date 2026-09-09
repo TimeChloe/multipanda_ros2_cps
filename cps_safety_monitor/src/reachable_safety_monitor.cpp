@@ -217,23 +217,6 @@ double nullspacePotentialEnergy(const Vector7d& q,
   return 0.5 * std::max(0.0, stiffness) * error.squaredNorm();
 }
 
-double orientationInducedPositionError(double offset_norm,
-                                       double orientation_error_bound) {
-  constexpr double kPi = 3.14159265358979323846;
-  const double angle = std::clamp(
-      std::max(0.0, orientation_error_bound), 0.0, kPi);
-  return 2.0 * std::max(0.0, offset_norm) * std::sin(0.5 * angle);
-}
-
-double trackingGeometryInflation(double position_error_bound,
-                                 double orientation_error_bound,
-                                 double collision_center_offset_norm) {
-  return std::max(0.0, position_error_bound) +
-         orientationInducedPositionError(
-             collision_center_offset_norm,
-             orientation_error_bound);
-}
-
 struct EnergyUpperBound {
   double kinetic{0.0};
   double cartesian_potential{0.0};
@@ -433,7 +416,6 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
       previous_edge_T_ub + previous_edge_V_ub;
   double previous_edge_time = plan.anchor.t;
   double previous_position_error_radius = 0.0;
-  double previous_orientation_error_radius = 0.0;
   int monitored_interval_index = 0;
 
   auto eval_sample = [&](const ImpedanceSample& s, double dtp) {
@@ -492,13 +474,8 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     const double segment_position_error_radius =
         std::max(previous_position_error_radius,
                  next_position_error_radius);
-    const double segment_orientation_error_radius =
-        std::max(previous_orientation_error_radius,
-                 next_orientation_error_radius);
-    const double rho_p_segment = trackingGeometryInflation(
-        segment_position_error_radius,
-        segment_orientation_error_radius,
-        config.collision_center_offset.norm());
+    // A sphere centered at TCP needs only TCP position uncertainty inflation.
+    const double rho_p_segment = segment_position_error_radius;
     double d_segment = std::numeric_limits<double>::infinity();
     if (!config.assume_human_workspace_clear) {
       const double inflated_contact_radius_segment =
@@ -584,7 +561,6 @@ MonitorResult verifyReachablePlan(const VerifiedPlan& plan,
     previous_edge_energy_ub = next_edge_energy_ub;
     previous_edge_time = s.t;
     previous_position_error_radius = next_position_error_radius;
-    previous_orientation_error_radius = next_orientation_error_radius;
     out.worst_case_pos_error_radius =
         std::max(out.worst_case_pos_error_radius,
                  next_position_error_radius);
@@ -696,11 +672,6 @@ MonitorResult verifyReachablePlanJointSpace(
     }
     return lambda->allFinite() && computed_inertia_inv.allFinite();
   };
-  auto collisionPosition = [&](const JointDynamicsSample& state) -> Vector3d {
-    return state.control_position +
-           state.control_orientation.normalized() *
-               config.collision_center_offset;
-  };
   auto poseError = [](const JointDynamicsSample& state,
                       const ImpedanceSample& desired) {
     Vector6d error = Vector6d::Zero();
@@ -801,7 +772,7 @@ MonitorResult verifyReachablePlanJointSpace(
   out.robot_secure_radius = use_sara_robot_reach
       ? config.robot_reachability_provider->secureRadius()
       : 0.0;
-  const Vector3d collision_position_now = collisionPosition(state);
+  const Vector3d collision_position_now = state.control_position;
   const auto human_reach_now =
       config.human_workspace.handReachableSetAtTime(config.wall_time_sec);
   if (config.assume_human_workspace_clear) {
@@ -911,7 +882,6 @@ MonitorResult verifyReachablePlanJointSpace(
       previous_edge_nullspace_potential;
   double previous_edge_time = plan.anchor.t;
   double previous_position_error_radius = 0.0;
-  double previous_orientation_error_radius = 0.0;
   EnergyRecoveryState energy_recovery_state = config.energy_recovery_state;
   // A candidate that starts protected stays energy-gated for its complete
   // intended + failsafe horizon, even if the human has gone or a hypothetical
@@ -1038,7 +1008,7 @@ MonitorResult verifyReachablePlanJointSpace(
 
     // Track possible recovery exits along the nominal trajectory. The shared
     // gain law supplies authorization metadata only, not rollout gains.
-    const Vector3d collision_start = collisionPosition(state);
+    const Vector3d collision_start = state.control_position;
     double start_distance = std::numeric_limits<double>::infinity();
     if (!config.assume_human_workspace_clear && use_sara_robot_reach) {
       std::vector<RobotReachCapsule> start_capsules;
@@ -1209,13 +1179,9 @@ MonitorResult verifyReachablePlanJointSpace(
           config.tracking_acc_error_bound);
       next_position_error_radius = maxBlockRadius(tracking_tube_next, 0);
       next_orientation_error_radius = 0.0;
-      const double rho_p = trackingGeometryInflation(
-          std::max(previous_position_error_radius,
-                   next_position_error_radius),
-          std::max(previous_orientation_error_radius,
-                   next_orientation_error_radius),
-          config.collision_center_offset.norm());
-      const Vector3d collision_end = collisionPosition(next_state);
+      const double rho_p = std::max(previous_position_error_radius,
+                                    next_position_error_radius);
+      const Vector3d collision_end = next_state.control_position;
       segment_distance =
           config.human_workspace.signedDistanceSegmentToInflatedSphere(
               collision_start,
@@ -1369,7 +1335,6 @@ MonitorResult verifyReachablePlanJointSpace(
     previous_edge_time = desired.t;
     if (!use_sara_robot_reach) {
       previous_position_error_radius = next_position_error_radius;
-      previous_orientation_error_radius = next_orientation_error_radius;
       out.worst_case_pos_error_radius = std::max(
           out.worst_case_pos_error_radius,
           next_position_error_radius);
@@ -1383,73 +1348,21 @@ MonitorResult verifyReachablePlanJointSpace(
     return true;
   };
 
-  auto interpolateSample = [](const ImpedanceSample& start,
-                              const ImpedanceSample& end,
-                              double alpha) {
-    const double u = std::clamp(alpha, 0.0, 1.0);
-    ImpedanceSample sample;
-    sample.t = (1.0 - u) * start.t + u * end.t;
-    sample.nominal_path_time =
-        (1.0 - u) * start.nominal_path_time +
-        u * end.nominal_path_time;
-    sample.nominal_path_time_valid =
-        start.nominal_path_time_valid && end.nominal_path_time_valid;
-    sample.nominal_path_kinematics_valid =
-        start.nominal_path_kinematics_valid &&
-        end.nominal_path_kinematics_valid;
-    if (sample.nominal_path_kinematics_valid) {
-      sample.nominal_path_rate =
-          (1.0 - u) * start.nominal_path_rate +
-          u * end.nominal_path_rate;
-      sample.nominal_path_acceleration =
-          (1.0 - u) * start.nominal_path_acceleration +
-          u * end.nominal_path_acceleration;
-    }
-    sample.p = (1.0 - u) * start.p + u * end.p;
-    sample.dp = (1.0 - u) * start.dp + u * end.dp;
-    sample.ddp = (1.0 - u) * start.ddp + u * end.ddp;
-    Quaterniond q_start = start.q.normalized();
-    Quaterniond q_end = end.q.normalized();
-    if (q_start.coeffs().dot(q_end.coeffs()) < 0.0) {
-      q_end.coeffs() *= -1.0;
-    }
-    sample.q = q_start.slerp(u, q_end).normalized();
-    sample.w = (1.0 - u) * start.w + u * end.w;
-    sample.dw = (1.0 - u) * start.dw + u * end.dw;
-    sample.K = (1.0 - u) * start.K + u * end.K;
-    sample.D = (1.0 - u) * start.D + u * end.D;
-    sample.failsafe = end.failsafe;
-    sample.energy_recovery_exit_allowed = end.energy_recovery_exit_allowed;
-    sample.energy_recovery_epoch = end.energy_recovery_epoch;
-    return sample;
-  };
-
-  ImpedanceSample previous_desired = plan.anchor;
+  // The candidate command timestamps are the joint rollout grid. Each
+  // command defines one integration/reachability interval, including the
+  // intended-to-failsafe boundary; no extra samples are interpolated here.
   auto evaluateStage = [&](const std::vector<ImpedanceSample>& stage) {
     for (const auto& desired : stage) {
-      const double segment_dt = desired.t - previous_desired.t;
-      if (!std::isfinite(segment_dt) || segment_dt <= 0.0) {
+      const double dt = desired.t - t_prev;
+      if (!std::isfinite(dt) || dt <= 0.0) {
         markIntervalUnsafe(monitored_interval_index);
         out.joint_limit_unsafe = true;
         return false;
       }
-      const double max_step =
-          std::max(config.joint_rollout_max_dt, kMinDt);
-      const int substeps = std::max(
-          1, static_cast<int>(std::ceil(segment_dt / max_step)));
-      for (int substep = 1; substep <= substeps; ++substep) {
-        const double alpha =
-            static_cast<double>(substep) /
-            static_cast<double>(substeps);
-        const ImpedanceSample interpolated =
-            interpolateSample(previous_desired, desired, alpha);
-        const double dt = std::max(interpolated.t - t_prev, kMinDt);
-        if (!evalSample(interpolated, dt)) {
-          return false;
-        }
-        t_prev = interpolated.t;
+      if (!evalSample(desired, dt)) {
+        return false;
       }
-      previous_desired = desired;
+      t_prev = desired.t;
     }
     return true;
   };

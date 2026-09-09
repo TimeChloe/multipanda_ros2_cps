@@ -194,11 +194,6 @@ class ToolDescription:
         return _add(self.mount["xyz"], _mat_vec(self.mount_rotation, self.safety_center_tool))
 
     @property
-    def collision_center_from_tcp(self) -> Tuple[float, ...]:
-        center = self.safety_center_parent
-        return tuple(center[index] - self.tcp["xyz"][index] for index in range(3))
-
-    @property
     def com_parent(self) -> Tuple[float, ...]:
         return _add(self.mount["xyz"], _mat_vec(self.mount_rotation, self.com))
 
@@ -250,12 +245,22 @@ def load_tool_description(path: str) -> ToolDescription:
             "translation-only TCP offset"
         )
 
+    config_directory = config_path.parent
+    visual = _geometry(data.get("visual", {}), "visual", config_directory)
+    collision = _geometry(data.get("collision", {}), "collision", config_directory)
     inertial = data.get("inertial")
     if not isinstance(inertial, dict):
         raise ToolModelError("inertial is required and must be a mapping")
     mass = _number(inertial.get("mass"), "inertial.mass", positive=True)
     com = _finite_vector(inertial.get("com", [0.0, 0.0, 0.0]), 3, "inertial.com")
     inertia_value = inertial.get("inertia")
+    if inertia_value == "solid_sphere":
+        if collision["type"] != "sphere" or any(
+            abs(com[i] - collision["xyz"][i]) > 1.0e-12 for i in range(3)
+        ):
+            raise ToolModelError("solid_sphere inertia requires a sphere centered at inertial.com")
+        moment = 0.4 * mass * collision["radius"] ** 2
+        inertia_value = dict(ixx=moment, iyy=moment, izz=moment, ixy=0.0, ixz=0.0, iyz=0.0)
     if not isinstance(inertia_value, dict):
         raise ToolModelError("inertial.inertia is required and must be a mapping")
     inertia = {
@@ -264,9 +269,6 @@ def load_tool_description(path: str) -> ToolDescription:
     }
     _validate_inertia(inertia)
 
-    config_directory = config_path.parent
-    visual = _geometry(data.get("visual", {}), "visual", config_directory)
-    collision = _geometry(data.get("collision", {}), "collision", config_directory)
     rgba = _finite_vector(
         data.get("visual", {}).get("rgba", [0.72, 0.74, 0.76, 1.0]),
         4,
@@ -285,6 +287,19 @@ def load_tool_description(path: str) -> ToolDescription:
     safety_radius = _number(
         safety_sphere.get("radius"), "safety.bounding_sphere.radius", positive=True
     )
+    center_parent = _add(mount["xyz"], _mat_vec(_rotation_from_rpy(mount["rpy"]), safety_center))
+    if "tcp" not in data:
+        tcp = {"xyz": center_parent, "rpy": (0.0, 0.0, 0.0)}
+    elif any(abs(tcp["xyz"][i] - center_parent[i]) > 1.0e-12 for i in range(3)):
+        raise ToolModelError("TCP must coincide with safety.bounding_sphere center; remove the separate tcp offset")
+    if collision["type"] == "sphere":
+        center_distance = math.sqrt(sum(
+            (collision["xyz"][i] - safety_center[i]) ** 2 for i in range(3)
+        ))
+        if center_distance > 1.0e-12:
+            raise ToolModelError("a spherical tool must use its physical ball center as TCP")
+        if center_distance + collision["radius"] > safety_radius + 1.0e-12:
+            raise ToolModelError("safety.bounding_sphere must enclose the physical sphere")
 
     mujoco = data.get("mujoco", {})
     if not isinstance(mujoco, dict):
@@ -670,7 +685,7 @@ def _controller_config(
     reachable["monitor_urdf_model_path"] = monitor_urdf_path
     if tool is not None:
         reachable["tcp_offset"] = list(tool.tcp["xyz"])
-        reachable["ee_collision_center_offset"] = list(tool.collision_center_from_tcp)
+        reachable.pop("ee_collision_center_offset", None)
         reachable["ee_collision_radius"] = tool.safety_radius
         reachable["enable_mujoco_contact_logging"] = tool.touch_sensor
         reachable["mujoco_contact_sensor_topic"] = f"/panda_{tool.name}_touch"

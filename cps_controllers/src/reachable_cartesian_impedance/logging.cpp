@@ -64,12 +64,9 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
   const Vector7d & current_q,
   const Vector7d & current_dq,
   const Vector3d & current_position,
-  const Quaterniond & current_orientation,
   const Vector6d & ee_twist,
   const Matrix7d & inertia,
   const Matrix37d & Jv,
-  const Matrix6d & K_runtime,
-  const Matrix6d & D_runtime,
   const cps_human_workspace::HumanWorkspace & human_workspace,
   bool human_workspace_active,
   bool human_workspace_assumed_clear,
@@ -101,12 +98,9 @@ void ReachableCartesianImpedanceController::logShieldPredictionTrajectory(
       record.current_q = current_q;
       record.current_dq = current_dq;
       record.current_position = current_position;
-      record.current_orientation = current_orientation;
       record.ee_twist = ee_twist;
       record.inertia = inertia;
       record.Jv = Jv;
-      record.K_runtime = K_runtime;
-      record.D_runtime = D_runtime;
       record.human_workspace = human_workspace;
       record.human_workspace_active = human_workspace_active;
       record.human_workspace_assumed_clear =
@@ -135,12 +129,9 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   const Vector7d & current_q,
   const Vector7d & current_dq,
   const Vector3d & current_position,
-  const Quaterniond & current_orientation,
   const Vector6d & ee_twist,
   const Matrix7d & inertia,
   const Matrix37d & Jv,
-  const Matrix6d & K_runtime,
-  const Matrix6d & D_runtime,
   const cps_human_workspace::HumanWorkspace & human_workspace,
   bool human_workspace_active,
   bool human_workspace_assumed_clear,
@@ -169,7 +160,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     bool failsafe{false};
     double sample_t{0.0};
     double dt{0.0};
-    Vector3d collision_target_p{Vector3d::Zero()};
+    Vector3d target_p{Vector3d::Zero()};
     Vector3d x_pred{Vector3d::Zero()};
     Vector3d v_pred{Vector3d::Zero()};
     Vector3d x_next{Vector3d::Zero()};
@@ -219,28 +210,20 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     enable_calibration_logging_ ?
     planForExecutionLogging(evaluated_plan) :
     makeSparsePlanForMonitor(evaluated_plan);
-  const VerifiedPlan collision_plan =
-    makeCollisionCenterPlanForMonitor(monitor_plan);
-  const Vector3d collision_center =
-    current_position + collisionCenterOffsetWorld(current_orientation);
-  const Vector6d collision_twist =
-    twistAtCollisionCenter(current_orientation, ee_twist);
 
   Matrix3d task_inertia_inv = Jv * inertia.inverse() * Jv.transpose();
   task_inertia_inv.diagonal().array() += kSmallPositive;
   // Runtime gains may be reduced. All prediction plots must report the
   // nominal gains actually used by the monitor, including the anchor.
-  (void)K_runtime;
-  (void)D_runtime;
   const Matrix6d K_exec = K_base_;
   const Matrix6d D_exec = D_base_;
 
-  Vector3d x_pred = collision_center;
-  Vector3d v_pred = collision_twist.head<3>();
+  Vector3d x_pred = current_position;
+  Vector3d v_pred = ee_twist.head<3>();
   Vector7d previous_joint_q = current_q;
-  double t_prev = collision_plan.anchor.t;
+  double t_prev = monitor_plan.anchor.t;
   std::vector<PredictionRow> rows;
-  rows.reserve(1 + collision_plan.intended.size() + collision_plan.failsafe.size());
+  rows.reserve(1 + monitor_plan.intended.size() + monitor_plan.failsafe.size());
   std::size_t joint_trace_index = 0;
   std::vector<double> dynamic_robot_alpha;
   const bool dynamic_robot_alpha_valid =
@@ -250,18 +233,18 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
 
   auto append_row = [&](const char * stage,
       int index,
-      const ImpedanceSample & collision_sample,
+      const ImpedanceSample & sample,
       double dtp) {
-      const double segment_end_time_sec = wall_time + collision_sample.t;
+      const double segment_end_time_sec = wall_time + sample.t;
 
       const Matrix3d Kp_raw = K_exec.topLeftCorner<3, 3>();
       const Matrix3d Dp_raw = D_exec.topLeftCorner<3, 3>();
       const Vector3d force_pred =
-        Kp_raw * (collision_sample.p - x_pred) -
-        Dp_raw * (v_pred - collision_sample.dp);
+        Kp_raw * (sample.p - x_pred) -
+        Dp_raw * (v_pred - sample.dp);
       Vector3d a_pred = Vector3d::Zero();
       if (use_dynamic_consistent_impedance_) {
-        a_pred = collision_sample.ddp + task_inertia_inv * force_pred;
+        a_pred = sample.ddp + task_inertia_inv * force_pred;
       } else {
         a_pred = task_inertia_inv * force_pred;
       }
@@ -273,10 +256,10 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       PredictionRow row;
       row.stage = stage;
       row.index = index;
-      row.failsafe = collision_sample.failsafe;
-      row.sample_t = collision_sample.t;
+      row.failsafe = sample.failsafe;
+      row.sample_t = sample.t;
       row.dt = dtp;
-      row.collision_target_p = collision_sample.p;
+      row.target_p = sample.p;
       row.x_pred = x_pred;
       row.v_pred = v_pred;
       row.x_next = x_next;
@@ -285,17 +268,17 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       while (joint_trace_index + 1 < joint_prediction_trace.size() &&
         std::abs(
           joint_prediction_trace[joint_trace_index + 1].t -
-          collision_sample.t) <=
+          sample.t) <=
         std::abs(
           joint_prediction_trace[joint_trace_index].t -
-          collision_sample.t))
+          sample.t))
       {
         ++joint_trace_index;
       }
       if (joint_trace_index < joint_prediction_trace.size()) {
         const JointPredictionSample & joint_sample =
           joint_prediction_trace[joint_trace_index];
-        if (std::abs(joint_sample.t - collision_sample.t) <= 1.0e-8 &&
+        if (std::abs(joint_sample.t - sample.t) <= 1.0e-8 &&
           joint_sample.q.allFinite() && joint_sample.dq.allFinite())
         {
           row.joint_state_valid = true;
@@ -391,20 +374,20 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
     };
 
   auto append_samples = [&](const char * stage,
-      const std::vector<ImpedanceSample> & collision_samples) {
-      for (std::size_t i = 0; i < collision_samples.size(); ++i) {
-        const double dtp = std::max(collision_samples[i].t - t_prev, kMinDt);
+      const std::vector<ImpedanceSample> & samples) {
+      for (std::size_t i = 0; i < samples.size(); ++i) {
+        const double dtp = std::max(samples[i].t - t_prev, kMinDt);
         append_row(
           stage,
           static_cast<int>(i),
-          collision_samples[i],
+          samples[i],
           dtp);
-        t_prev = collision_samples[i].t;
+        t_prev = samples[i].t;
       }
     };
 
-  append_samples("intended", collision_plan.intended);
-  append_samples("failsafe", collision_plan.failsafe);
+  append_samples("intended", monitor_plan.intended);
+  append_samples("failsafe", monitor_plan.failsafe);
 
   const auto actual_hand_reach =
     human_workspace.handReachableSetAtTime(wall_time);
@@ -431,7 +414,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
   } else if (human_workspace_active) {
     actual_collision_distance =
       human_workspace.signedDistanceToInflatedSphere(
-      collision_center,
+      current_position,
       human_workspace.inflatedCollisionRadius(
         ee_collision_radius_, 0.0),
       wall_time);
@@ -476,7 +459,7 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << row.stage << "," << row.index << ","
       << static_cast<int>(row.failsafe) << ","
       << row.sample_t << "," << row.dt << ","
-      << collision_center(0) << "," << collision_center(1) << "," << collision_center(2) << ","
+      << current_position(0) << "," << current_position(1) << "," << current_position(2) << ","
       << actual_human_center(0) << "," << actual_human_center(1) << "," << actual_human_center(2) <<
       "," << actual_hand_reach.radius << ","
       << actual_collision_distance << ","
@@ -487,8 +470,8 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << current_dq(0) << "," << current_dq(1) << "," << current_dq(2) << ","
       << current_dq(3) << "," << current_dq(4) << "," << current_dq(5) << ","
       << current_dq(6) << ","
-      << row.collision_target_p(0) << "," << row.collision_target_p(1) << "," <<
-      row.collision_target_p(2) << ","
+      << row.target_p(0) << "," << row.target_p(1) << "," <<
+      row.target_p(2) << ","
       << row.x_pred(0) << "," << row.x_pred(1) << "," << row.x_pred(2) << ","
       << row.v_pred(0) << "," << row.v_pred(1) << "," << row.v_pred(2) << ","
       << row.x_next(0) << "," << row.x_next(1) << "," << row.x_next(2) << ","
@@ -599,9 +582,7 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "measured_dq4,measured_dq5,measured_dq6,measured_dq7,"
     "des_px,des_py,des_pz,cur_px,cur_py,cur_pz,"
     "cur_vx,cur_vy,cur_vz,cur_wx,cur_wy,cur_wz,"
-    "collision_center_px,collision_center_py,collision_center_pz,"
     "human_center_px,human_center_py,human_center_pz,"
-    "collision_center_vx,collision_center_vy,collision_center_vz,"
     "des_vx,des_vy,des_vz,err_px,err_py,err_pz,err_rx,err_ry,err_rz,"
     "tau_cmd_norm,tau_task_norm,tau_nullspace_raw_norm,"
     "tau_nullspace_projected_norm,coriolis_norm,"
@@ -740,14 +721,14 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "executing_last_verified_monitored,predicted_trigger,"
       "collision_interval_index,monitored_contact_possible,"
       "plan_intended_steps,plan_failsafe_steps,"
-      "stage,index,is_failsafe_sample,sample_t,dt,actual_collision_px,actual_collision_py,"
-      "actual_collision_pz,actual_human_center_px,actual_human_center_py,"
+      "stage,index,is_failsafe_sample,sample_t,dt,actual_tcp_px,actual_tcp_py,"
+      "actual_tcp_pz,actual_human_center_px,actual_human_center_py,"
       "actual_human_center_pz,actual_hand_reach_radius,actual_collision_distance,"
       "actual_closest_robot_link_index,"
       "measured_q1,measured_q2,measured_q3,measured_q4,measured_q5,"
       "measured_q6,measured_q7,measured_dq1,measured_dq2,measured_dq3,"
-      "measured_dq4,measured_dq5,measured_dq6,measured_dq7,collision_target_px,"
-      "collision_target_py,collision_target_pz,pred_start_px,pred_start_py,"
+      "measured_dq4,measured_dq5,measured_dq6,measured_dq7,tcp_target_px,"
+      "tcp_target_py,tcp_target_pz,pred_start_px,pred_start_py,"
       "pred_start_pz,pred_start_vx,pred_start_vy,pred_start_vz,pred_next_px,"
       "pred_next_py,pred_next_pz,pred_next_vx,pred_next_vy,pred_next_vz,"
       "pred_ax,pred_ay,pred_az,pred_joint_state_valid,pred_joint_sample_t,"
@@ -820,12 +801,9 @@ bool ReachableCartesianImpedanceController::startLogWriters()
             record.current_q,
             record.current_dq,
             record.current_position,
-            record.current_orientation,
             record.ee_twist,
             record.inertia,
             record.Jv,
-            record.K_runtime,
-            record.D_runtime,
             record.human_workspace,
             record.human_workspace_active,
             record.human_workspace_assumed_clear,

@@ -102,7 +102,7 @@ install(
 
 install(
   FILES
-    "${SARA_SHIELD_SOURCE_DIR}/config/robot_config/robot_parameters_panda.yaml"
+    "config/robot_parameters_panda.yaml"
   DESTINATION share/${PROJECT_NAME}/config
 )
 
@@ -130,6 +130,7 @@ if(BUILD_TESTING)
     "${SARA_REACHLIB_SOURCE_DIR}/include"
   )
   target_compile_definitions(test_reachable_safety_monitor PRIVATE
+    "WORKSPACE_PANDA_CONFIG_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/config/robot_parameters_panda.yaml\""
     "SARA_PANDA_CONFIG_PATH=\"${SARA_SHIELD_SOURCE_DIR}/config/robot_config/robot_parameters_panda.yaml\"")
 endif()
 

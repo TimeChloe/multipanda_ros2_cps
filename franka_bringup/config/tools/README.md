@@ -34,8 +34,23 @@ values from CAD or an identified payload model.
 
 Schema version 1 supports one rigid tool fixed to `panda_link8`, one safety
 bounding sphere, and a TCP translated from `panda_link8` without a relative
-rotation. Visual and collision geometry may independently be a sphere, box,
+rotation. The TCP coincides with the safety sphere center. Omit `tcp` to derive
+it from `mount` and `safety.bounding_sphere.center`; an explicit different TCP
+is rejected. For a spherical tool this is also the physical ball center.
+Visual and collision geometry may independently be a sphere, box,
 cylinder or mesh.
+
+For `metal_ball.yaml`, edit `ball_radius` once: its YAML anchor supplies the
+visual, physical and safety radii. `inertial.inertia: solid_sphere` derives the
+inertia from the configured mass and radius. Mesh/box/cylinder tools must use
+an explicit inertia mapping instead. The default ball-center TCP is 0.03 m
+along `panda_link8`'s local Z axis. It was a surface point at 0.06 m before v14;
+old contact goals need conversion to ball-center coordinates.
+
+The reachable controller appends the configured TCP sphere to the seven SaRA
+arm occupancies. Radius changes therefore affect tool reachability as well as
+MuJoCo collision geometry. Re-launch to regenerate models after changing the
+YAML. See [TCP behavior and migration](../../../docs/experiments/tcp_ball_center.md).
 
 Validate a file before launching:
 

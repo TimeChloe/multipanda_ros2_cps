@@ -55,7 +55,7 @@ struct PathConsistentTimedPathConfig {
 };
 
 struct TrajectoryGeneratorSettings {
-  // SaRA-Shield Panda: 5 controller samples per reachability interval.
+  // Sparse prediction-log/Cartesian-fallback interval, not joint rollout dt.
   double shield_plan_dt{0.005};
   double monitor_frequency_hz{200.0};
 

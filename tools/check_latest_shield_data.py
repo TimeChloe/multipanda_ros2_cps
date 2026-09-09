@@ -3,7 +3,7 @@
 
 Default behavior:
   - find the newest data_log/<timestamp>/ containing both CSV files
-  - compare measured collision-center pz with shield predicted pz
+  - compare measured reference-point pz with shield predicted pz
   - write plots and a short text summary into the same run directory
 """
 
@@ -172,10 +172,27 @@ def first_execution_stage_time(
     return None
 
 
+def normalize_position_fields(row: dict[str, str]) -> dict[str, str]:
+    """Expose one prediction reference to analysis, across log schemas.
+
+    v15 records measured TCP in cur_pz and predicted targets in tcp_target_pz.
+    In v14 the old collision fields are TCP aliases. Earlier logs can describe
+    a distinct collision point: retain that measurement for prediction errors,
+    and retain cur_pz for comparisons against the executed TCP command.
+    """
+    if "cur_pz" in row:
+        row["measured_pz"] = row.get("collision_center_pz", row["cur_pz"])
+    if "tcp_target_pz" in row:
+        row["target_pz"] = row["tcp_target_pz"]
+    elif "collision_target_pz" in row:
+        row["target_pz"] = row["collision_target_pz"]
+    return row
+
+
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="") as f:
         return [
-            row
+            normalize_position_fields(row)
             for row in csv.DictReader(f)
             if row and any(value not in (None, "") for value in row.values())
         ]
@@ -237,15 +254,15 @@ def build_comparison(
         if measured is None:
             continue
 
-        measured_pz = to_float(measured, "collision_center_pz")
+        measured_pz = to_float(measured, "measured_pz")
         pred_next_pz = to_float(pred, "pred_next_pz")
-        target_pz = to_float(pred, "collision_target_pz")
+        target_pz = to_float(pred, "target_pz")
         comparison.append(
             {
                 "t": t,
-                "measured_collision_pz": measured_pz,
+                "measured_pz": measured_pz,
                 "pred_next_pz": pred_next_pz,
-                "collision_target_pz": target_pz,
+                "target_pz": target_pz,
                 "pred_error_pz": pred_next_pz - measured_pz,
                 "target_error_pz": target_pz - measured_pz,
                 "contact_possible": to_int(pred, "contact_possible"),
@@ -276,7 +293,7 @@ def build_executed_reference_comparison(
     """Build one comparison row per control loop.
 
     execution stage 0:
-      compare measured collision-center pz with the accepted intended prediction
+      compare measured reference-point pz with the accepted intended prediction
       for stage=intended,index=0.
 
     execution stages 1-3:
@@ -306,8 +323,7 @@ def build_executed_reference_comparison(
           "t": t,
           "mode": mode,
           "execution_stage": command_stage,
-          "measured_tcp_pz": to_float(measured, "cur_pz"),
-          "measured_collision_center_pz": to_float(measured, "collision_center_pz"),
+          "measured_pz": to_float(measured, "measured_pz"),
           "command_des_pz": to_float(measured, "des_pz"),
           "predicted_trigger": to_int(measured, "predicted_trigger"),
           "monitored_contact_possible": to_int(measured, "monitored_contact_possible"),
@@ -338,14 +354,15 @@ def build_executed_reference_comparison(
               dt = to_float(pred, "wall_time_sec") - t
               if abs(dt) <= match_tolerance:
                   reference_pz = to_float(pred, "pred_next_pz")
-                  measured_pz = row["measured_collision_center_pz"]
+                  measured_pz = row["measured_pz"]
                   row["reference_pz"] = reference_pz
-                  row["reference_kind"] = "accepted_intended_pred_next_collision_pz"
+                  row["reference_kind"] = "accepted_intended_pred_next_pz"
                   row["reference_time_error_sec"] = dt
                   row["error_mm"] = 1000.0 * (reference_pz - float(measured_pz))
       else:
           reference_pz = to_float(measured, "des_pz")
           measured_pz = to_float(measured, "cur_pz")
+          row["measured_pz"] = measured_pz
           row["reference_pz"] = reference_pz
           row["reference_kind"] = "executed_controller_command_tcp_pz"
           row["reference_time_error_sec"] = 0.0
@@ -402,22 +419,21 @@ def build_mode1_nominal_prediction_comparison(
         if abs(dt) > match_tolerance:
             continue
 
-        measured_collision_pz = to_float(measured, "collision_center_pz")
+        measured_pz = to_float(measured, "measured_pz")
         pred_nominal_pz = to_float(pred, "pred_next_pz")
-        nominal_target_pz = to_float(pred, "collision_target_pz")
+        nominal_target_pz = to_float(pred, "target_pz")
 
         comparison.append(
             {
                 "t": t,
                 "prediction_wall_time_sec": to_float(pred, "wall_time_sec"),
                 "time_error_sec": dt,
-                "measured_tcp_pz": to_float(measured, "cur_pz"),
-                "measured_collision_center_pz": measured_collision_pz,
+                "measured_pz": measured_pz,
                 "executed_failsafe_des_pz": to_float(measured, "des_pz"),
                 "nominal_pred_next_pz": pred_nominal_pz,
-                "nominal_collision_target_pz": nominal_target_pz,
-                "nominal_pred_error_mm": 1000.0 * (pred_nominal_pz - measured_collision_pz),
-                "nominal_target_error_mm": 1000.0 * (nominal_target_pz - measured_collision_pz),
+                "nominal_target_pz": nominal_target_pz,
+                "nominal_pred_error_mm": 1000.0 * (pred_nominal_pz - measured_pz),
+                "nominal_target_error_mm": 1000.0 * (nominal_target_pz - measured_pz),
                 "candidate_verified": to_int(pred, "candidate_verified"),
                 "predicted_trigger": to_int(pred, "predicted_trigger"),
                 "monitored_contact_possible": to_int(pred, "monitored_contact_possible"),
@@ -497,9 +513,9 @@ def build_verification_aligned_comparison(
         time_error = pred_time - t if pred is not None else math.nan
         has_match = pred is not None and abs(time_error) <= match_tolerance
 
-        measured_pz = to_float(measured, "collision_center_pz")
+        measured_pz = to_float(measured, "measured_pz")
         pred_pz = to_float(pred, "pred_next_pz") if has_match else math.nan
-        target_pz = to_float(pred, "collision_target_pz") if has_match else math.nan
+        target_pz = to_float(pred, "target_pz") if has_match else math.nan
 
         comparison.append(
             {
@@ -511,10 +527,9 @@ def build_verification_aligned_comparison(
                 "verification_wall_time_sec": to_float(pred, "wall_time_sec") if has_match else math.nan,
                 "prediction_abs_time_sec": pred_time,
                 "time_error_sec": time_error,
-                "measured_collision_center_pz": measured_pz,
-                "measured_tcp_pz": to_float(measured, "cur_pz"),
+                "measured_pz": measured_pz,
                 "pred_next_pz": pred_pz,
-                "collision_target_pz": target_pz,
+                "target_pz": target_pz,
                 "prediction_error_mm": 1000.0 * (pred_pz - measured_pz) if has_match else math.nan,
                 "target_error_mm": 1000.0 * (target_pz - measured_pz) if has_match else math.nan,
                 "measured_predicted_trigger": to_int(measured, "predicted_trigger"),
@@ -565,6 +580,11 @@ def summarize(
             "orthogonal_execution_v8",
             "orthogonal_execution_v9",
             "orthogonal_execution_v10",
+            "orthogonal_execution_v11",
+            "orthogonal_execution_v12",
+            "orthogonal_execution_v13",
+            "orthogonal_execution_v14",
+            "orthogonal_execution_v15",
         }
         else FALLBACK_REASON_NAMES_LEGACY
     )
@@ -754,20 +774,20 @@ def make_plots(
     out_paths = []
 
     t_meas = [to_float(row, "wall_time_sec") for row in validation_rows]
-    measured_pz = [to_float(row, "collision_center_pz") for row in validation_rows]
+    measured_pz = [to_float(row, "measured_pz") for row in validation_rows]
     mode = [to_int(row, "mode") for row in validation_rows]
     trigger = [to_int(row, "predicted_trigger") for row in validation_rows]
 
     t_pred = [row["t"] for row in comparison]
     pred_next_pz = [row["pred_next_pz"] for row in comparison]
-    target_pz = [row["collision_target_pz"] for row in comparison]
+    target_pz = [row["target_pz"] for row in comparison]
     pred_error_mm = [1000.0 * row["pred_error_pz"] for row in comparison]
 
     first_failsafe = first_execution_stage_time(validation_rows, 2)
     first_trigger = first_time(validation_rows, "predicted_trigger")
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
-    axes[0].plot(t_meas, measured_pz, label="measured collision_center_pz", lw=1.4)
+    axes[0].plot(t_meas, measured_pz, label="measured pz", lw=1.4)
     axes[0].plot(t_pred, pred_next_pz, label="predicted next pz", lw=1.1)
     axes[0].plot(t_pred, target_pz, label="prediction target pz", lw=1.0, alpha=0.8)
     axes[0].set_ylabel("z [m]")
@@ -793,7 +813,7 @@ def make_plots(
         if first_failsafe is not None:
             ax.axvline(first_failsafe, color="purple", linestyle="--", lw=1.0)
 
-    fig.suptitle("Shield prediction vs measured collision-center pz")
+    fig.suptitle("Shield prediction vs measured reference-point pz")
     fig.tight_layout()
     out_path = run_dir / "prediction_vs_measured_pz.png"
     fig.savefig(out_path, dpi=160)
@@ -804,7 +824,7 @@ def make_plots(
         xmin = first_failsafe - window
         xmax = first_failsafe + window
         fig, ax = plt.subplots(figsize=(12, 5))
-        ax.plot(t_meas, measured_pz, label="measured collision_center_pz", lw=1.4)
+        ax.plot(t_meas, measured_pz, label="measured pz", lw=1.4)
         ax.plot(t_pred, pred_next_pz, label="predicted next pz", lw=1.1)
         ax.plot(t_pred, target_pz, label="prediction target pz", lw=1.0, alpha=0.8)
         if first_trigger is not None:
@@ -844,12 +864,7 @@ def make_executed_reference_plot(
 
     t = [float(row["t"]) for row in rows]
     reference_pz = [float(row["reference_pz"]) for row in rows]
-    measured_pz = [
-        float(row["measured_collision_center_pz"])
-        if int(row["execution_stage"]) == 0
-        else float(row["measured_tcp_pz"])
-        for row in rows
-    ]
+    measured_pz = [float(row["measured_pz"]) for row in rows]
     error_mm = [float(row["error_mm"]) for row in rows]
     mode = [int(row["mode"]) for row in rows]
 
@@ -929,9 +944,9 @@ def make_mode1_nominal_plot(
         return []
 
     t = [float(row["t"]) for row in rows]
-    measured = [float(row["measured_collision_center_pz"]) for row in rows]
+    measured = [float(row["measured_pz"]) for row in rows]
     pred = [float(row["nominal_pred_next_pz"]) for row in rows]
-    target = [float(row["nominal_collision_target_pz"]) for row in rows]
+    target = [float(row["nominal_target_pz"]) for row in rows]
     executed_failsafe = [float(row["executed_failsafe_des_pz"]) for row in rows]
     error_mm = [float(row["nominal_pred_error_mm"]) for row in rows]
     trigger = [int(row["predicted_trigger"]) for row in rows]
@@ -939,7 +954,7 @@ def make_mode1_nominal_plot(
 
     out_paths = []
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
-    axes[0].plot(t, measured, label="measured collision_center_pz", lw=1.3)
+    axes[0].plot(t, measured, label="measured pz", lw=1.3)
     axes[0].plot(t, pred, label="monitored nominal pred_next_pz", lw=1.1)
     axes[0].plot(t, target, label="monitored nominal target_pz", lw=1.0, alpha=0.8)
     axes[0].plot(t, executed_failsafe, label="executed failsafe des_pz", lw=1.0, alpha=0.8)
@@ -986,9 +1001,9 @@ def make_verification_aligned_plot(
         return []
 
     t = [float(row["t"]) for row in rows]
-    measured = [float(row["measured_collision_center_pz"]) for row in rows]
+    measured = [float(row["measured_pz"]) for row in rows]
     pred = [float(row["pred_next_pz"]) for row in rows]
-    target = [float(row["collision_target_pz"]) for row in rows]
+    target = [float(row["target_pz"]) for row in rows]
     error_mm = [float(row["prediction_error_mm"]) for row in rows]
     mode = [int(row["mode"]) for row in rows]
     stage_numeric = [0 if row["prediction_stage"] == "intended" else 1 for row in rows]
@@ -998,7 +1013,7 @@ def make_verification_aligned_plot(
 
     out_paths = []
     fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
-    axes[0].plot(t, measured, label="measured collision_center_pz", lw=1.3)
+    axes[0].plot(t, measured, label="measured pz", lw=1.3)
     axes[0].plot(t, pred, label="verified prediction pred_next_pz", lw=1.1)
     axes[0].plot(t, target, label="verified prediction target_pz", lw=1.0, alpha=0.8)
     axes[0].set_ylabel("z [m]")

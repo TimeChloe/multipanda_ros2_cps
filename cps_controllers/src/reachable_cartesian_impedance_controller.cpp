@@ -1360,10 +1360,8 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
   }
 
   const ImpedanceSample freeze_anchor = plan.intended.back();
-  // Match SaRA-Shield's separation between the dense controller trajectory
-  // and the coarser reachability interval edges: braking remains sampled at
-  // the controller period, while makeSparsePlanForMonitor() groups those
-  // samples into shield_plan_dt_ intervals.
+  // Braking and joint rollout share the controller command grid. The sparse
+  // view is used for ordinary prediction logging and Cartesian-only fallback.
   const double failsafe_plan_dt = std::max(local_replan_dt_, kMinDt);
 
   auto fill_failsafe_prefix = [&]() {
@@ -1518,11 +1516,9 @@ VerifiedPlan ReachableCartesianImpedanceController::buildCandidatePlan(
     const double max_angular_acceleration =
         failsafe_limits ? failsafe_brake_max_angular_acceleration_
                         : local_replan_max_angular_acceleration_;
-    // Fail-safe samples are stored at the sparse monitor period but executed
-    // at 1 kHz by interpolation. On a curved path the interpolated chord can
-    // differ from the exact path evaluation by a few micrometres. Accept that
-    // bounded numerical discrepancy while still rejecting any geometrically
-    // different route.
+    // Timed-path interpolation can differ from exact path evaluation by a
+    // few micrometres on a curve. Allow that numerical discrepancy while
+    // still rejecting a geometrically different route.
     constexpr double kPathPoseTolerance = 1.0e-5;
     constexpr double kPathOrientationTolerance = 1.0e-8;
     const bool has_scalar_path_state =
@@ -1696,21 +1692,6 @@ SafetyMonitorConfig ReachableCartesianImpedanceController::makeSafetyMonitorConf
   return config;
 }
 
-Vector3d ReachableCartesianImpedanceController::collisionCenterOffsetWorld(
-    const Quaterniond& orientation) const {
-  return orientation.normalized() * ee_collision_center_offset_;
-}
-
-Vector6d ReachableCartesianImpedanceController::twistAtCollisionCenter(
-    const Quaterniond& orientation,
-    const Vector6d& flange_twist) const {
-  Vector6d collision_twist = flange_twist;
-  const Vector3d offset_world = collisionCenterOffsetWorld(orientation);
-  collision_twist.head<3>() =
-      flange_twist.head<3>() + flange_twist.tail<3>().cross(offset_world);
-  return collision_twist;
-}
-
 double ReachableCartesianImpedanceController::estimatePathRateFromTimedPathSample(
     double path_time,
     const Vector3d& cartesian_velocity) const {
@@ -1799,33 +1780,6 @@ VerifiedPlan ReachableCartesianImpedanceController::makeSparsePlanForMonitor(
   return sparse_plan;
 }
 
-VerifiedPlan ReachableCartesianImpedanceController::makeCollisionCenterPlanForMonitor(
-    const VerifiedPlan& flange_plan) const {
-  VerifiedPlan plan = flange_plan;
-  plan.anchor = makeCollisionCenterSampleForMonitor(plan.anchor);
-  for (auto& sample : plan.intended) {
-    sample = makeCollisionCenterSampleForMonitor(sample);
-  }
-  for (auto& sample : plan.failsafe) {
-    sample = makeCollisionCenterSampleForMonitor(sample);
-  }
-
-  return plan;
-}
-
-ImpedanceSample
-ReachableCartesianImpedanceController::makeCollisionCenterSampleForMonitor(
-    const ImpedanceSample& flange_sample) const {
-  ImpedanceSample sample = flange_sample;
-  const Vector3d offset_world =
-      sample.q.normalized() * ee_collision_center_offset_;
-  sample.p += offset_world;
-  sample.dp += sample.w.cross(offset_world);
-  sample.ddp += sample.dw.cross(offset_world) +
-                sample.w.cross(sample.w.cross(offset_world));
-  return sample;
-}
-
 // ============================================================================
 // evaluateCandidatePlan
 // ============================================================================
@@ -1859,8 +1813,6 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
     return MonitorResult{};
   }
 
-  const VerifiedPlan monitor_plan = makeSparsePlanForMonitor(plan);
-
   SafetyMonitorConfig config = makeSafetyMonitorConfig(
       human_workspace, plan.generated_wall_time);
   config.assume_human_workspace_clear = human_workspace_assumed_clear;
@@ -1874,26 +1826,13 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
       std::max(0.0, current_nullspace_stiffness);
   config.energy_recovery_state = energy_recovery_state;
   config.energy_recovery_epoch = energy_recovery_epoch;
-  config.collision_center_offset = ee_collision_center_offset_;
   config.previous_torque_command = previous_torque_command;
   config.previous_torque_command_valid = true;
   config.torque_rate_limit = panda_limits::kTorqueRateLimit;
-  // SaRA evaluates robot and human occupancies on the same sparse interval
-  // grid. Keep dense command generation at local_replan_dt_, but do not split
-  // each shield interval back into controller-period reachable sets here.
-  config.joint_rollout_max_dt = shield_plan_dt_;
-
-  // Use the snapshot read by the 1 kHz controller for the rollout's initial
-  // state. J_geo is expressed at the collision center here; shift it back to
-  // the controlled TCP because collision_center_offset is applied separately
-  // inside the joint monitor.
+  // Control, energy and geometry all use the same TCP and Jacobian.
   config.current_joint_dynamics.control_position = current_position;
   config.current_joint_dynamics.control_orientation = current_orientation;
   config.current_joint_dynamics.control_jacobian = J_geo;
-  const Vector3d collision_offset_world =
-      current_orientation.normalized() * ee_collision_center_offset_;
-  config.current_joint_dynamics.control_jacobian.topRows<3>() +=
-      skewSymmetric(collision_offset_world) * J_geo.bottomRows<3>();
   config.current_joint_dynamics.control_jdot_dq = control_jdot_dq;
   config.current_joint_dynamics.inertia = inertia;
   config.current_joint_dynamics.coriolis = coriolis;
@@ -1917,18 +1856,14 @@ MonitorResult ReachableCartesianImpedanceController::evaluateCandidatePlan(
         joint_prediction_trace);
   }
 
-  const VerifiedPlan collision_center_plan =
-      makeCollisionCenterPlanForMonitor(monitor_plan);
-  const Vector3d collision_center =
-      current_position + collisionCenterOffsetWorld(current_orientation);
-  const Vector6d collision_twist =
-      twistAtCollisionCenter(current_orientation, ee_twist);
-
+  // Only the Cartesian fallback uses a sparse plan; the joint rollout above
+  // consumes the original command timestamps.
+  const VerifiedPlan monitor_plan = makeSparsePlanForMonitor(plan);
   return cps_safety_monitor::verifyReachablePlan(
-      collision_center_plan,
-      collision_center,
+      monitor_plan,
+      current_position,
       current_orientation,
-      collision_twist,
+      ee_twist,
       inertia,
       J_geo,
       config);
@@ -2665,14 +2600,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   J_geo.topRows<3>() = Jv_flange - skewSymmetric(tcp_offset_world) * Jw;
   const Vector6d ee_twist = J_geo * dq;
   const Matrix37d Jv = J_geo.topRows<3>();
-  const Vector3d collision_center =
-      current_position + collisionCenterOffsetWorld(current_orientation);
-  const Vector6d ee_collision_twist =
-      twistAtCollisionCenter(current_orientation, ee_twist);
-  const Matrix37d Jv_collision =
-      Jv - skewSymmetric(collisionCenterOffsetWorld(current_orientation)) * Jw;
-  Matrix67d J_collision_geo = J_geo;
-  J_collision_geo.topRows<3>() = Jv_collision;
 
   acceptPendingCartesianViaPoints(
       current_position, current_orientation, wall_time);
@@ -2720,7 +2647,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   } else if (human_workspace_active_) {
     current_workspace_distance_now =
         human_workspace_.signedDistanceToInflatedSphere(
-            collision_center,
+            current_position,
             human_workspace_.inflatedCollisionRadius(
                 ee_collision_radius_, 0.0),
             wall_time);
@@ -2729,6 +2656,9 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   // to leave recovery, including permissions in cached backup commands.
   const bool energy_workspace_available = human_workspace_assumed_clear ||
       (human_workspace_active_ && std::isfinite(current_workspace_distance_now));
+  // Episode counter, not a timestamp or human-message sequence: positions may
+  // change within one class without changing the epoch. A clear -> overlap ->
+  // clear round trip advances it twice, so old clear-state permits stay stale.
   const int energy_environment = !energy_workspace_available ? 2 :
       (current_workspace_distance_now <= 0.0 ? 1 : 0);
   if (energy_environment != energy_recovery_environment_) {
@@ -2822,8 +2752,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       // This filtered finite-difference value comes from the live 1 kHz
       // Jacobian stream. Franka does not publish Jdot*dq directly.
       async_input.control_jdot_dq = Jdot_dq_filtered_;
-      async_input.Jv = Jv_collision;
-      async_input.J_geo = J_collision_geo;
+      async_input.Jv = Jv;
+      async_input.J_geo = J_geo;
       async_input.previous_torque_command = tau_cmd_prev_;
       async_input.K_runtime = K_runtime_;
       async_input.D_runtime = D_runtime_;
@@ -3161,12 +3091,9 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             async_output.input.q,
             async_output.input.dq,
             async_output.input.current_position,
-            async_output.input.current_orientation,
             async_output.input.ee_twist,
             async_output.input.inertia,
             async_output.input.Jv,
-            async_output.input.K_runtime,
-            async_output.input.D_runtime,
             async_output.input.human_workspace,
             async_output.input.human_workspace_active,
             async_output.input.human_workspace_assumed_clear,
@@ -3353,7 +3280,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           last_verified_plan_generation_;
       shield_dec = computeShieldDecision(wall_time, q, dq,
                                          current_position, current_orientation,
-                                         ee_twist, inertia, J_collision_geo,
+                                         ee_twist, inertia, J_geo,
                                          coriolis, Jdot_dq_filtered_);
       last_shield_decision_ = shield_dec;
       last_shield_decision_valid_ = true;
@@ -3370,12 +3297,9 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             q,
             dq,
             current_position,
-            current_orientation,
             ee_twist,
             inertia,
-            Jv_collision,
-            K_runtime_,
-            D_runtime_,
+            Jv,
             human_workspace_,
             human_workspace_active_,
             false,
@@ -3636,6 +3560,9 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     recovery_motion_limits.position_upper(i) = panda_limits::kPositionUpper[i];
     recovery_motion_limits.velocity(i) = panda_limits::kVelocity[i];
   }
+  // Require a verified command, that exact sample's predicted exit permission,
+  // and the same observed environment episode. This only grants permission:
+  // applyEnergyBudget also rechecks measured energy, gains, overlap and motion.
   const bool recovery_exit_verified = verified_command_selected_this_cycle_ &&
       cps_safety_monitor::energyRecoveryExitPermitted(
           candidate_budget_command, energy_recovery_epoch_);
@@ -3818,9 +3745,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           for (int i = 0; i < 3; ++i) add(desired_position_cur(i));
           for (int i = 0; i < 3; ++i) add(current_position(i));
           for (int i = 0; i < 6; ++i) add(ee_twist(i));
-          for (int i = 0; i < 3; ++i) add(collision_center(i));
           for (int i = 0; i < 3; ++i) add(human_center(i));
-          for (int i = 0; i < 3; ++i) add(ee_collision_twist(i));
           for (int i = 0; i < 3; ++i) add(desired_linear_velocity_cur(i));
           for (int i = 0; i < 6; ++i) add(error(i));
           add(tau_cmd.norm());
@@ -4132,8 +4057,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<std::string>("reachable_set_visualization_frame_id", "");
     auto_declare<double>("reachable_set_visualization_period_sec", 0.1);
     auto_declare<double>("reachable_set_visualization_alpha", 0.3);
-    auto_declare<std::vector<double>>(
-        "ee_collision_center_offset", std::vector<double>{0.0, 0.0, 0.0});
     auto_declare<bool>("async_safety_monitor", true);
     auto_declare<int>("monitor_worker_cpu_affinity", -1);
     auto_declare<int>("monitor_worker_realtime_priority", 0);
@@ -4338,15 +4261,18 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     cartesian_energy_lambda_update_period_sec_ =
         std::max(0.0, get_node()->get_parameter("cartesian_energy_lambda_update_period_sec").as_double());
     ee_collision_radius_ = get_node()->get_parameter("ee_collision_radius").as_double();
+    if (!std::isfinite(ee_collision_radius_) || ee_collision_radius_ <= 0.0) {
+      RCLCPP_ERROR(get_node()->get_logger(), "ee_collision_radius must be positive and finite");
+      return CallbackReturn::ERROR;
+    }
     const auto tcp_offset =
         get_node()->get_parameter("tcp_offset").as_double_array();
-    if (tcp_offset.size() == 3) {
+    if (tcp_offset.size() == 3 &&
+        std::all_of(tcp_offset.begin(), tcp_offset.end(), [](double x) { return std::isfinite(x); })) {
       tcp_offset_ = Vector3d(tcp_offset[0], tcp_offset[1], tcp_offset[2]);
     } else {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "tcp_offset must contain 3 values. Using [0, 0, 0].");
-      tcp_offset_.setZero();
+      RCLCPP_ERROR(get_node()->get_logger(), "tcp_offset must contain 3 finite values");
+      return CallbackReturn::ERROR;
     }
     monitor_urdf_model_path_ =
         get_node()->get_parameter("monitor_urdf_model_path").as_string();
@@ -4406,7 +4332,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
       robot_reachability_provider_ =
           cps_safety_monitor::makeSaraRobotReachabilityProvider(
               robot_reach_config_path_,
-              robot_secure_radius_);
+              robot_secure_radius_, tcp_offset_, ee_collision_radius_);
     } catch (const std::exception& error) {
       RCLCPP_ERROR(
           get_node()->get_logger(),
@@ -4459,19 +4385,6 @@ CallbackReturn ReachableCartesianImpedanceController::on_configure(
     }
     monitor_joint_dynamics_provider_.reset();
     active_monitor_joint_dynamics_source_.clear();
-    const auto ee_collision_center_offset =
-        get_node()->get_parameter("ee_collision_center_offset").as_double_array();
-    if (ee_collision_center_offset.size() == 3) {
-      ee_collision_center_offset_ = Vector3d(
-          ee_collision_center_offset[0],
-          ee_collision_center_offset[1],
-          ee_collision_center_offset[2]);
-    } else {
-      RCLCPP_WARN(
-          get_node()->get_logger(),
-          "ee_collision_center_offset must contain 3 values. Using [0, 0, 0].");
-      ee_collision_center_offset_.setZero();
-    }
     async_safety_monitor_ = get_node()->get_parameter("async_safety_monitor").as_bool();
     if (enable_reachable_set_visualization_ && !async_safety_monitor_) {
       RCLCPP_WARN(
@@ -5069,7 +4982,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << log_flush_period_sec_ << "\n"
                     << "recording_start: first_valid_via_points_command\n"
                     << "arm_id: " << arm_id_ << "\n"
-                    << "state_log_schema: orthogonal_execution_v13\n"
+                    << "state_log_schema: orthogonal_execution_v15\n"
                     << "monitor_gain_policy: nominal_stiffness_and_damping\n"
                     << "monitor_recovery_energy_policy: retain_contact_energy_gate_full_horizon\n"
                     << "energy_control_phase_legend: 0=normal, 1=limited, 2=recovering\n"
@@ -5174,8 +5087,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << trajectory_generator_config_path_ << "\n"
                     << "shield_plan_dt: " << shield_plan_dt_ << "\n"
                     << "monitor_sparse_dt: " << shield_plan_dt_ << "\n"
-                    << "monitor_joint_rollout_max_dt: "
-                    << shield_plan_dt_ << "\n"
+                    << "monitor_joint_rollout_grid: candidate_command_timestamps\n"
                     << "local_replan_dt: " << local_replan_dt_ << "\n"
                     << "failsafe_plan_dt: "
                     << std::max(local_replan_dt_, kMinDt) << "\n"
@@ -5258,10 +5170,9 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << tcp_offset_.y() << ", "
                     << tcp_offset_.z() << "]\n"
                     << "ee_collision_radius: " << ee_collision_radius_ << "\n"
-                    << "ee_collision_center_offset_from_tcp: ["
-                    << ee_collision_center_offset_.x() << ", "
-                    << ee_collision_center_offset_.y() << ", "
-                    << ee_collision_center_offset_.z() << "]\n"
+                    << "control_reference_point: tcp_ball_center\n"
+                    << "collision_reference_point: tcp\n"
+                    << "robot_reach_capsule_layout: indices_0_to_6_arm_index_7_tcp_sphere\n"
                     << "enable_mujoco_contact_logging: "
                     << static_cast<int>(enable_mujoco_contact_logging_) << "\n"
                     << "mujoco_contact_sensor_topic: "

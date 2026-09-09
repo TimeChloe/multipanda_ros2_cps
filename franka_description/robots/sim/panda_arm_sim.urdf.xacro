@@ -7,7 +7,6 @@
   <xacro:arg name="metal_ball_radius" default="0.03"/>
   <xacro:arg name="metal_ball_mass" default="0.2"/>
   <xacro:arg name="metal_ball_xyz" default="0 0 0.03"/>
-  <xacro:arg name="metal_ball_tcp_xyz" default="0 0 0.06"/>
 
   <xacro:include filename="$(find franka_description)/robots/common/panda_arm.xacro"/>
   <xacro:panda_arm arm_id="$(arg arm_id)" safety_distance="0.03"/>
@@ -23,8 +22,7 @@
       connected_to="$(arg arm_id)_link8"
       radius="$(arg metal_ball_radius)"
       mass="$(arg metal_ball_mass)"
-      xyz="$(arg metal_ball_xyz)"
-      tcp_xyz="$(arg metal_ball_tcp_xyz)"/>
+      xyz="$(arg metal_ball_xyz)"/>
   </xacro:if>
   <xacro:include filename="$(find franka_description)/robots/sim/panda_arm_sim.ros2_control.xacro"/>
   <xacro:panda_arm_sim_ros2_control ns="$(arg arm_id)" hand="$(arg hand)" initial_positions="$(arg initial_positions)"/>

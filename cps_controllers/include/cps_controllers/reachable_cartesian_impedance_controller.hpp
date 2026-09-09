@@ -131,17 +131,7 @@ class ReachableCartesianImpedanceController
                                       std::vector<JointPredictionSample>*
                                           joint_prediction_trace = nullptr) const;
 
-  Vector3d collisionCenterOffsetWorld(const Quaterniond& orientation) const;
-
-  Vector6d twistAtCollisionCenter(const Quaterniond& orientation,
-                                  const Vector6d& flange_twist) const;
-
   VerifiedPlan makeSparsePlanForMonitor(const VerifiedPlan& dense_plan) const;
-
-  VerifiedPlan makeCollisionCenterPlanForMonitor(const VerifiedPlan& flange_plan) const;
-
-  ImpedanceSample makeCollisionCenterSampleForMonitor(
-      const ImpedanceSample& flange_sample) const;
 
   double estimatePathRateFromTimedPathSample(double path_time,
                                              const Vector3d& cartesian_velocity) const;
@@ -307,12 +297,9 @@ class ReachableCartesianImpedanceController
       const Vector7d& current_q,
       const Vector7d& current_dq,
       const Vector3d& current_position,
-      const Quaterniond& current_orientation,
       const Vector6d& ee_twist,
       const Matrix7d& inertia,
       const Matrix37d& Jv,
-      const Matrix6d& K_runtime,
-      const Matrix6d& D_runtime,
       const cps_human_workspace::HumanWorkspace& human_workspace,
       bool human_workspace_active,
       bool human_workspace_assumed_clear,
@@ -336,12 +323,9 @@ class ReachableCartesianImpedanceController
     Vector7d current_q{Vector7d::Zero()};
     Vector7d current_dq{Vector7d::Zero()};
     Vector3d current_position{Vector3d::Zero()};
-    Quaterniond current_orientation{Quaterniond::Identity()};
     Vector6d ee_twist{Vector6d::Zero()};
     Matrix7d inertia{Matrix7d::Zero()};
     Matrix37d Jv{Matrix37d::Zero()};
-    Matrix6d K_runtime{Matrix6d::Zero()};
-    Matrix6d D_runtime{Matrix6d::Zero()};
     cps_human_workspace::HumanWorkspace human_workspace;
     bool human_workspace_active{false};
     bool human_workspace_assumed_clear{false};
@@ -367,12 +351,9 @@ class ReachableCartesianImpedanceController
       const Vector7d& current_q,
       const Vector7d& current_dq,
       const Vector3d& current_position,
-      const Quaterniond& current_orientation,
       const Vector6d& ee_twist,
       const Matrix7d& inertia,
       const Matrix37d& Jv,
-      const Matrix6d& K_runtime,
-      const Matrix6d& D_runtime,
       const cps_human_workspace::HumanWorkspace& human_workspace,
       bool human_workspace_active,
       bool human_workspace_assumed_clear,
@@ -606,7 +587,6 @@ class ReachableCartesianImpedanceController
   std::size_t calibration_activation_failsafe_index_{0};
   double ee_collision_radius_{0.04};
   Vector3d tcp_offset_{Vector3d::Zero()};
-  Vector3d ee_collision_center_offset_{Vector3d::Zero()};
   int monitor_decimation_{1};
   bool async_safety_monitor_{true};
   int monitor_worker_cpu_affinity_{-1};

@@ -268,15 +268,10 @@ reachable_cartesian_impedance_controller:
     # action. The ordinary follow_cartesian_via_points action is unchanged.
     enable_calibration_logging: false
     cartesian_energy_lambda_update_period_sec: 0.001
-    # Collision model for the safety monitor:
-    # center = metal ball center = panda_link8 + [0, 0, 0.03].
-    # tcp_offset keeps Cartesian control at the metal-ball TCP
-    # (panda_link8 + [0, 0, 0.06]); ee_collision_center_offset moves the
-    # safety collision model back to the metal-ball center.
-    # ee_collision_radius expands the monitored sphere around that center.
+    # One reference point: TCP = metal-ball center, relative to panda_link8.
+    # Launch derives these from config/tools/metal_ball.yaml.
     ee_collision_radius: 0.03
-    tcp_offset: [0.0, 0.0, 0.06]
-    ee_collision_center_offset: [0.0, 0.0, -0.03]
+    tcp_offset: [0.0, 0.0, 0.03]
     # Simulation uses the Gaz-parameter URDF plus the same constant joint
     # armature as the MuJoCo Panda model. On the real robot select
     # franka_interface instead; this armature vector is Pinocchio-only.

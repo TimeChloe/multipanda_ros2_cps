@@ -619,12 +619,73 @@ TEST(ReachableSafetyMonitor, InvalidWorkspaceGeometryCannotVerifyRecoveryExit) {
   EXPECT_TRUE(trace.empty());
 }
 
+TEST(ReachableSafetyMonitor, JointRolloutUsesCommandTimestampsAcrossBothStages) {
+  IdentityJointDynamicsProvider dynamics;
+  auto reach = std::make_shared<RecordingRobotReachabilityProvider>();
+  SafetyMonitorConfig config;
+  config.robot_reachability_provider = reach;
+  config.assume_human_workspace_clear = true;
+  config.use_dynamic_consistent_impedance = true;
+
+  VerifiedPlan plan;
+  plan.valid = true;
+  plan.anchor.q = Quaterniond::Identity();
+  ImpedanceSample command = plan.anchor;
+  command.ddp.x() = 2.0;
+  command.t = 0.001;
+  plan.intended.push_back(command);
+  command.t = 0.003;
+  plan.intended.push_back(command);
+  command.t = 0.007;
+  command.failsafe = true;
+  plan.failsafe.push_back(command);
+
+  std::vector<JointPredictionSample> trace;
+  const auto result = verifyReachablePlanJointSpace(
+      plan, Vector7d::Zero(), Vector7d::Zero(), dynamics, config, &trace);
+  EXPECT_FALSE(result.predicted_trigger);
+  ASSERT_EQ(trace.size(), 4U);
+  EXPECT_EQ(reach->dynamic_reach_count_, 3);
+  ASSERT_EQ(reach->alpha_trajectory_.size(), trace.size());
+  // Constant acceleration gives q=t^2 and dq=2t, even for unequal intervals.
+  const std::vector<double> times{0.0, 0.001, 0.003, 0.007};
+  for (std::size_t i = 0; i < times.size(); ++i) {
+    EXPECT_DOUBLE_EQ(trace[i].t, times[i]);
+    EXPECT_NEAR(trace[i].q(0), times[i] * times[i], 1e-10);
+    EXPECT_NEAR(trace[i].dq(0), 2.0 * times[i], 1e-10);
+  }
+}
+
+TEST(ReachableSafetyMonitor, JointRolloutRejectsInvalidFailsafeTimestamps) {
+  for (double invalid_time : {0.001, 0.0,
+       std::numeric_limits<double>::quiet_NaN(),
+       std::numeric_limits<double>::infinity()}) {
+    IdentityJointDynamicsProvider dynamics;
+    SafetyMonitorConfig config;
+    config.assume_human_workspace_clear = true;
+    VerifiedPlan plan;
+    plan.valid = true;
+    ImpedanceSample command;
+    command.t = 0.001;
+    plan.intended.push_back(command);
+    command.t = invalid_time;
+    command.failsafe = true;
+    plan.failsafe.push_back(command);
+    std::vector<JointPredictionSample> trace;
+    const auto result = verifyReachablePlanJointSpace(
+        plan, Vector7d::Zero(), Vector7d::Zero(), dynamics, config, &trace);
+    EXPECT_TRUE(result.joint_limit_unsafe);
+    EXPECT_TRUE(result.predicted_trigger);
+    ASSERT_EQ(trace.size(), 2U);
+    EXPECT_DOUBLE_EQ(trace.back().t, 0.001);
+  }
+}
+
 TEST(ReachableSafetyMonitor, RolloutUsesNominalGainsDespiteRuntimeScalingInsideCollisionArea) {
   IdentityJointDynamicsProvider dynamics;
   SafetyMonitorConfig config;
   config.energy_budget_joule = 0.1;
   config.enable_runtime_energy_scaling = true;
-  config.joint_rollout_max_dt = 0.01;
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d::Zero();
   workspace_parameters.motion_radius = 0.10;
@@ -666,7 +727,6 @@ TEST(ReachableSafetyMonitor, RolloutKeepsNominalGainsOutsideCollisionArea) {
   SafetyMonitorConfig config;
   config.energy_budget_joule = 0.1;
   config.enable_runtime_energy_scaling = true;
-  config.joint_rollout_max_dt = 0.01;
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d(10.0, 0.0, 0.0);
   workspace_parameters.motion_radius = 0.10;
@@ -707,7 +767,6 @@ TEST(ReachableSafetyMonitor, RolloutKeepsNominalGainsAfterEnteringCollisionArea)
   SafetyMonitorConfig config;
   config.energy_budget_joule = 0.1;
   config.enable_runtime_energy_scaling = true;
-  config.joint_rollout_max_dt = 0.01;
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d(0.04025, 0.0, 0.0);
   workspace_parameters.motion_radius = 0.0;
@@ -1075,7 +1134,6 @@ TEST(ReachableSafetyMonitor,
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.05;
   config.tracking_acc_error_bound = 0.0;
-  config.joint_rollout_max_dt = 0.01;
   config.nullspace_reference(6) = 0.1;
   config.nullspace_stiffness = 20.0;
 
@@ -1222,7 +1280,6 @@ TEST(ReachableSafetyMonitor, ContactIntervalUsesMaximumEndpointEnergy) {
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.10;
   config.tracking_acc_error_bound = 0.0;
-  config.joint_rollout_max_dt = 0.001;
 
   VerifiedPlan plan;
   plan.valid = true;
@@ -1260,7 +1317,6 @@ TEST(ReachableSafetyMonitor, ReportsFirstUnsafePredictionTraceInterval) {
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.001;
   config.tracking_acc_error_bound = 0.0;
-  config.joint_rollout_max_dt = 0.001;
 
   VerifiedPlan plan;
   plan.valid = true;
@@ -1298,7 +1354,6 @@ TEST(ReachableSafetyMonitor,
   workspace_parameters.motion_radius = 0.10;
   config.human_workspace.setParameters(workspace_parameters);
   config.ee_collision_radius = 0.04;
-  config.collision_center_offset = Vector3d(0.10, 0.0, 0.0);
   config.energy_budget_joule = 0.05;
   config.tracking_acc_error_bound = 0.0;
 
@@ -1385,7 +1440,6 @@ TEST(ReachableSafetyMonitor,
   config.ee_collision_radius = 0.04;
   config.energy_budget_joule = 0.05;
   config.tracking_acc_error_bound = 0.0;
-  config.joint_rollout_max_dt = 0.01;
   config.nullspace_stiffness = 1.0;
   config.nullspace_potential_energy_error_bound_joule = 0.06;
 
@@ -1573,6 +1627,81 @@ TEST(ReachableSafetyMonitor,
   EXPECT_NEAR(result.worst_case_vel_error_radius, 0.0, 1.0e-12);
 }
 
+TEST(ReachableSafetyMonitor, TcpSphereMatchesPandaFlangeAndKeepsArmOccupancies) {
+  const Vector3d offset(0.0, 0.0, 0.03);
+  const auto arm = makeSaraRobotReachabilityProvider(WORKSPACE_PANDA_CONFIG_PATH, 0.0);
+  const auto tool = makeSaraRobotReachabilityProvider(WORKSPACE_PANDA_CONFIG_PATH, 0.0, offset, 0.03);
+  const auto larger = makeSaraRobotReachabilityProvider(WORKSPACE_PANDA_CONFIG_PATH, 0.0, offset, 0.05);
+  const std::vector<double> alpha(7, 0.0);
+  for (double yaw : {0.0, 1.5707963267948966}) {
+    Vector7d q = Vector7d::Zero();
+    q(0) = yaw;
+    std::vector<RobotReachCapsule> original, with_tool, with_larger_tool;
+    ASSERT_TRUE(arm->reachInterval(q, q, 0.0, alpha, &original));
+    ASSERT_TRUE(tool->reachInterval(q, q, 0.0, alpha, &with_tool));
+    ASSERT_TRUE(larger->reachInterval(q, q, 0.0, alpha, &with_larger_tool));
+    ASSERT_EQ(with_tool.size(), 8U);
+    for (std::size_t i = 0; i < original.size(); ++i) {
+      EXPECT_TRUE(with_tool[i].p1.isApprox(original[i].p1));
+      EXPECT_TRUE(with_tool[i].p2.isApprox(original[i].p2));
+      EXPECT_DOUBLE_EQ(with_tool[i].radius, original[i].radius);
+    }
+    // Independently from the URDF: x=.088, z=.333+.316+.384-.107-.03.
+    const Vector3d expected(0.088 * std::cos(yaw), 0.088 * std::sin(yaw), 0.896);
+    EXPECT_NEAR((with_tool.back().p1 - expected).norm(), 0.0, 1e-10);
+    EXPECT_TRUE(with_tool.back().p1.isApprox(with_tool.back().p2));
+    EXPECT_DOUBLE_EQ(with_tool.back().radius, 0.03);
+    EXPECT_DOUBLE_EQ(with_larger_tool.back().radius, 0.05);
+  }
+}
+
+TEST(ReachableSafetyMonitor, TcpRadiusParticipatesInContactAndIntervalInflation) {
+  // Extended TCP isolates tool contact from the original arm capsules.
+  const auto tool = makeSaraRobotReachabilityProvider(
+      WORKSPACE_PANDA_CONFIG_PATH, 0.01, Vector3d(0.0, 0.0, 0.5), 0.05);
+  Vector7d start = Vector7d::Zero(), end = start;
+  end(0) = 0.1;
+  std::vector<double> alpha(7, 0.0);
+  std::vector<RobotReachCapsule> before, after, interval;
+  ASSERT_TRUE(tool->reachInterval(start, start, 0.0, alpha, &before));
+  ASSERT_TRUE(tool->reachInterval(end, end, 0.0, alpha, &after));
+  const Vector3d human = before.back().p1 + Vector3d(0.055, 0, 0);
+  int closest = -1;
+  EXPECT_LT(tool->minimumSignedDistance(before, human, human, 0.0, &closest), 0.0);
+  EXPECT_EQ(closest, 7);
+  alpha[6] = 2.0;
+  ASSERT_TRUE(tool->reachInterval(start, end, 0.02, alpha, &interval));
+  EXPECT_NEAR((interval.back().p1 - 0.5 * (before.back().p1 + after.back().p1)).norm(), 0.0, 1e-12);
+  EXPECT_NEAR(interval.back().radius,
+      0.05 + 0.01 + 0.5 * (after.back().p1 - before.back().p1).norm() + 2.0 * 0.02 * 0.02 / 8.0,
+      1e-12);
+}
+
+TEST(ReachableSafetyMonitor, TcpMotionContributesToDynamicAlpha) {
+  const auto tool = makeSaraRobotReachabilityProvider(
+      WORKSPACE_PANDA_CONFIG_PATH, 0.0, Vector3d(0.4, 0.1, 0.3), 0.03);
+  JointPredictionSample a, b;
+  a.q << 0.2, -0.6, 0.1, -1.7, 0.3, 1.1, -0.2;
+  a.t = 0.0;
+  a.dq.setZero();
+  b = a;
+  b.t = 0.01;
+  b.dq << 0.2, 0.1, -0.1, 0.2, 0.3, -0.1, 0.4;
+  const double epsilon = 1e-6;
+  std::vector<RobotReachCapsule> plus, minus;
+  const std::vector<double> zero_alpha(7, 0.0);
+  const Vector7d q_plus = a.q + epsilon * b.dq;
+  const Vector7d q_minus = a.q - epsilon * b.dq;
+  ASSERT_TRUE(tool->reachInterval(q_plus, q_plus, 0.0, zero_alpha, &plus));
+  ASSERT_TRUE(tool->reachInterval(q_minus, q_minus, 0.0, zero_alpha, &minus));
+  const double finite_difference_speed =
+      (plus.back().p1 - minus.back().p1).norm() / (2.0 * epsilon);
+  std::vector<double> alpha;
+  ASSERT_TRUE(tool->calculateTrajectoryAlpha({a, b}, &alpha));
+  ASSERT_EQ(alpha.size(), 7U);
+  EXPECT_GE(alpha[6] + 1e-6, finite_difference_speed / b.t);
+}
+
 TEST(ReachableSafetyMonitor,
      UsesSingleHandCombinedReachableBallForEveryRobotInterval) {
   IdentityJointDynamicsProvider dynamics;
@@ -1580,7 +1709,6 @@ TEST(ReachableSafetyMonitor,
       std::make_shared<RecordingRobotReachabilityProvider>();
   SafetyMonitorConfig config;
   config.robot_reachability_provider = robot_reachability;
-  config.joint_rollout_max_dt = 0.1;
 
   cps_human_workspace::HumanWorkspace::Parameters workspace_parameters;
   workspace_parameters.sphere_center = Vector3d::Zero();
@@ -1668,7 +1796,6 @@ TEST(ReachableSafetyMonitor,
       std::make_shared<RecordingRobotReachabilityProvider>();
   SafetyMonitorConfig config;
   config.robot_reachability_provider = robot_reachability;
-  config.joint_rollout_max_dt = 0.001;
 
   VerifiedPlan plan;
   plan.valid = true;

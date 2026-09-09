@@ -32,7 +32,7 @@ def main() -> int:
     print(f"mass: {tool.mass:.9g} kg")
     print(f"flange_com: {list(tool.com_parent)} m")
     print(f"tcp_offset: {list(tool.tcp['xyz'])} m")
-    print(f"safety_center_from_tcp: {list(tool.collision_center_from_tcp)} m")
+    print("control_and_collision_reference: TCP (bounding-sphere center)")
     print(f"safety_radius: {tool.safety_radius:.9g} m")
     return 0
 

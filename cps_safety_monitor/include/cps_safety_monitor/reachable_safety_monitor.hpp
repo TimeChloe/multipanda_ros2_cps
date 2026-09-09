@@ -158,7 +158,8 @@ class RobotReachabilityProvider {
 
   // Match SARA Shield's PFL path: compute one Cartesian-acceleration value
   // per robot capsule from all q/dq samples in the complete monitored
-  // trajectory. The returned vector is reused for every time interval.
+  // trajectory. The returned vector is reused for every time interval. With
+  // a TCP sphere, alpha[6] also bounds its speed variation (seven joint entries).
   virtual bool calculateTrajectoryAlpha(
       const std::vector<JointPredictionSample>& trajectory,
       std::vector<double>* alpha_i) const = 0;
@@ -177,16 +178,17 @@ class RobotReachabilityProvider {
   virtual const char* backendName() const = 0;
 };
 
-// Build a provider from an unmodified SaRA robot-parameter YAML file.  The
-// configured secure_radius is overridden explicitly so it can be calibrated
-// without forking SaRA's robot geometry file.
+// Optional sphere is centered at the TCP, translated from Panda link8.
+// Positive tcp_radius appends occupancy index 7; indices 0..6 retain the arm.
+// A zero radius keeps the original arm-only provider for library callers.
 std::shared_ptr<const RobotReachabilityProvider>
 makeSaraRobotReachabilityProvider(
     const std::string& robot_config_path,
-    double secure_radius);
+    double secure_radius,
+    const Vector3d& tcp_offset = Vector3d::Zero(),
+    double tcp_radius = 0.0);
 
-// Installed copy of SaRA-Shield's unmodified Panda robot parameters. This
-// avoids source-tree-specific paths on both the simulator and the real robot.
+// Installed Panda parameters aligned with this workspace's arm kinematics.
 std::string defaultSaraPandaRobotConfigPath();
 
 struct MonitorResult {
@@ -403,10 +405,10 @@ struct SafetyMonitorConfig {
   Vector7d previous_torque_command{Vector7d::Zero()};
   bool previous_torque_command_valid{false};
   double torque_rate_limit{1000.0};
-  double joint_rollout_max_dt{0.001};
-  Vector3d collision_center_offset{Vector3d::Zero()};
 };
 
+// Uses consecutive candidate command timestamps as integration intervals.
+// Callers supply a sufficiently dense grid; this function does not resample it.
 MonitorResult verifyReachablePlanJointSpace(
     const VerifiedPlan& plan,
     const Vector7d& current_q,

@@ -453,44 +453,6 @@ NonlinearImpedanceController::computeAnalyticJacobian(
   return T * J_geo;
 }
 
-Eigen::Matrix<double, 6, 7>
-NonlinearImpedanceController::computeAnalyticJacobianDotNumerical(
-    const Vector7d& q,
-    const Vector7d& dq,
-    const Eigen::Vector3d& rpy,
-    double dt) {
-  const double safe_dt = std::max(dt, kMinDt);
-  const Vector7d q_next = q + dq * safe_dt;
-
-  pinocchio::Data data_now(pin_model_);
-  pinocchio::Data data_next(pin_model_);
-
-  pinocchio::forwardKinematics(pin_model_, data_now, q);
-  pinocchio::computeJointJacobians(pin_model_, data_now, q);
-  pinocchio::updateFramePlacements(pin_model_, data_now);
-
-  Matrix67d J_geo_now = Matrix67d::Zero();
-  pinocchio::getFrameJacobian(
-      pin_model_, data_now, ee_frame_id_, pinocchio::ReferenceFrame::WORLD, J_geo_now);
-
-  const Matrix67d J_r_now = computeAnalyticJacobian(J_geo_now, rpy);
-
-  pinocchio::forwardKinematics(pin_model_, data_next, q_next);
-  pinocchio::computeJointJacobians(pin_model_, data_next, q_next);
-  pinocchio::updateFramePlacements(pin_model_, data_next);
-
-  const Eigen::Matrix3d R_next = data_next.oMf[ee_frame_id_].rotation();
-  const Eigen::Vector3d rpy_next = rotationMatrixToRpy(R_next);
-
-  Matrix67d J_geo_next = Matrix67d::Zero();
-  pinocchio::getFrameJacobian(
-      pin_model_, data_next, ee_frame_id_, pinocchio::ReferenceFrame::WORLD, J_geo_next);
-
-  const Matrix67d J_r_next = computeAnalyticJacobian(J_geo_next, rpy_next);
-
-  return (J_r_next - J_r_now) / safe_dt;
-}
-
 controller_interface::return_type NonlinearImpedanceController::update(
     const rclcpp::Time& /*time*/,
     const rclcpp::Duration& period) {
@@ -625,9 +587,6 @@ controller_interface::return_type NonlinearImpedanceController::update(
     const Vector6d acc_residual = Vector6d::Zero();
     const double vel_residual_norm = 0.0;
     const double acc_residual_norm = 0.0;
-
-    const Vector7d dq_ref = Vector7d::Zero();
-    const Vector7d ddq_ref = Vector7d::Zero();
 
     Vector7d tau_friction_current = Vector7d::Zero();
 
@@ -921,12 +880,10 @@ controller_interface::return_type NonlinearImpedanceController::update(
   static std::size_t jtv_cycle_counter = 0;
   static Matrix67d cached_J_geo_dot = Matrix67d::Zero();
 
-  bool did_update_jtv = false;
   if ((jtv_cycle_counter % kJtvUpdatePeriod) == 0) {
     pinocchio::computeJointJacobiansTimeVariation(pin_model_, *pin_data_, q, dq);
     pinocchio::getFrameJacobianTimeVariation(
         pin_model_, *pin_data_, ee_frame_id_, pinocchio::ReferenceFrame::WORLD, cached_J_geo_dot);
-    did_update_jtv = true;
   }
   ++jtv_cycle_counter;
 
@@ -1085,9 +1042,6 @@ controller_interface::return_type NonlinearImpedanceController::update(
   const Vector7d tau_null_impedance =
       N_tau * (n_stiffness_ * (desired_qn_ - q) -
                2.0 * std::sqrt(n_stiffness_) * dq);
-
-  const Vector7d tau_impedance_total =
-      tau_impedance + coriolis_current_vec + tau_friction_current + tau_null_impedance;
 
   // A2: approximate C(q,dq) * dq_ref by current coriolis vector
   const Vector7d coriolis_ref_vec = coriolis_current_vec;

@@ -40,17 +40,30 @@ runtime 恢复退出同时要求：
 
 clear / overlap / unknown 变化会增加 `energy_recovery_epoch`。旧 epoch 指令不得批准恢复退出。已提交指令前缀保留原资格，新候选通过 `restrictEnergyRecoveryExitPermissions()` 只保留名义预测明确发生退出的指令资格；运行时还必须满足当周期的测量条件。
 
+`epoch` 是环境分类连续保持期间的编号。代码中 0 表示可用且无重叠，1 表示可用且重叠，2 表示未知/不可用。只有分类变化才递增；它不是时间、预测步数或人体消息编号，也不是每次人体坐标变化都更新。控制器激活时重置该编号。
+
+例如，一条已验证指令携带 `exit_allowed=true, epoch=10`。之后环境经历无重叠 → 重叠 → 无重叠，当前 epoch 变为 12；即使现在又没有重叠，epoch=10 的旧许可仍然失效。新候选需要按 epoch=12 重新预测和验证。epoch 相同本身不证明环境几何没有变化，其他实时检查和监控仍需执行。
+
+本周期的许可判断等价于 `verified_command_selected_this_cycle && command.exit_allowed && command.epoch == current_epoch`。`exit_allowed` 不是整条计划通过就全部为 true：候选预测后，只有匹配时间戳的预测样本满足能量有效、明确发生 Recovering → Normal、标称增益恢复且预测缩放为 1，才保留该位。整条候选还必须通过 monitor 才能作为已验证计划被采用。已提交前缀保留原许可，不会因新预测自动重新授权。
+
+该布尔值传给 `applyEnergyBudget()`，只是“允许退出”的必要条件。真正退出还要求 `updateEnergyRecovery()` 的实测退出条件全部满足；有许可但实际能量偏高，仍留在恢复阶段。反过来，实测能量已经足够低但许可过期，也会保持 Recovering；此时缩放系数可以已经等于 1，恢复状态并不意味着刚度必须小于标称值。异步结果交接时还会检查 epoch，过期结果不会直接接管当前指令。
+
 异步结果仍检查来源计划、时效、参考连续性、人体策略、epoch，以及交接时刻的假设恢复状态。恢复状态比较使用 `energy_recovery_runtime_scale` 是否等于 1，而不是名义预测固定为 1 的实际预测增益系数。名义预测与 runtime 偏差可使该交接检查保守地拒绝结果，不能把其状态一致视为动力学轨迹一致。
 
 备份末端保持超出验证时域后，退出资格失效。新任务、取消任务不清除正在进行的恢复。
 
-## 日志 v13
+## 日志 v15
 
 `run_info.txt`：
 
-- `state_log_schema: orthogonal_execution_v13`
+- `state_log_schema: orthogonal_execution_v15`
 - `monitor_gain_policy: nominal_stiffness_and_damping`
 - `monitor_recovery_energy_policy: retain_contact_energy_gate_full_horizon`
+- `monitor_joint_rollout_grid: candidate_command_timestamps`
+
+关节 monitor 直接按候选轨迹的相邻时间戳推进一个积分步，intended 与 failsafe 共用连续时间轴，不再另设最大积分步长或插值加密。当前控制器传入约 1 ms 的密集轨迹；5 ms monitor 请求调度与普通预测 CSV 稀疏选点仍各自保留。输入时间戳必须有限且严格递增；其他调用方若提供稀疏轨迹，需要在生成端准备足够密的采样。
+
+v14 将控制、能量与工具球几何统一到球心 TCP；v15 删除重复的实测碰撞中心列并将预测位置列改用 TCP 命名，恢复策略与 v13 相同。坐标、半径、日志字段和旧目标迁移见 [球心 TCP 说明](tcp_ball_center.md)。
 
 控制 CSV 包含实际缩放、实际刚度和实际能量，以及恢复状态/退出/epoch/交接字段和 `monitor_recovery_energy_check_active`。当前版本删除了额外关节弹簧的控制与预测实现、状态、参数和记录字段；它不属于本项目的方法或消融项。历史 CSV 和历史诊断图对应采集时的实现，不改写原始实验数据。
 
@@ -72,7 +85,7 @@ colcon build --packages-select \
 source install/setup.bash
 ```
 
-重新加载后核对 run_info 的 v13 和两个 monitor 策略字段。仿真重放此前的大误差接触释放场景，检查：
+重新加载后核对 run_info 的 v15、球心 TCP 标记和两个 monitor 策略字段。仿真重放此前的大误差接触释放场景，检查：
 
 1. 人体离开后 phase=2，真实距离转正，但 monitor_recovery_energy_check_active=1。
 2. 名义预算不通过的候选保持 candidate_verified=0，轨迹按既有备份制动并保持，不因几何清空就继续推进。
