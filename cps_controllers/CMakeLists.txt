@@ -131,6 +131,16 @@ if(BUILD_TESTING)
     test/test_latest_value_mailbox.cpp
   )
   target_include_directories(test_latest_value_mailbox PRIVATE include)
+  ament_add_gtest(test_async_request_gate
+    test/test_async_request_gate.cpp
+  )
+  target_include_directories(test_async_request_gate PRIVATE include)
+  target_link_libraries(test_async_request_gate Threads::Threads)
+  ament_add_gtest(test_worker_timing
+    test/test_worker_timing.cpp
+  )
+  target_include_directories(test_worker_timing PRIVATE src)
+  target_link_libraries(test_worker_timing Threads::Threads)
 endif()
 
 ament_package()

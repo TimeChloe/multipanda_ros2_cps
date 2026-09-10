@@ -15,6 +15,9 @@
   <arg name="valgrind_args"        default=""      description="arguments for valgrind" />
   <arg name="wait_for_xml"         default="false" description="Whether mujoco_ros should wait for an xml in the parameter server." />
   <arg name="realtime"             default="1.0"   description="Fraction of desired realtime (0,1]. -1 to run as fast as possible." />
+  <arg name="physics_wall_pacing" default="true" description="One step per wall deadline; false keeps legacy catch-up stepping." />
+  <arg name="physics_timing_path" default="" description="Optional outer-loop timing CSV path; parent directory must exist." />
+  <arg name="physics_cpu_affinity" default="-1" description="Optional Linux CPU index for physics only; -1 leaves affinity unchanged." />
   <arg name="profile"              default="false" description="Whether mujoco_ros should be profiled." />
   <arg name="num_sim_steps"        default="-1" />
   <arg name="mujoco_plugin_config" default="$(find-pkg-share mujoco_ros)/config/ros2_plugins_dummy.yaml"      description="Optionally provide the path to a yaml with plugin configurations to load." />
@@ -42,6 +45,9 @@
         <param name="modelfile"            value="$(var modelfile)" />
         <param name="wait_for_xml"         value="$(var wait_for_xml)" />
         <param name="realtime"             value="$(var realtime)" />
+        <param name="physics_wall_pacing" value="$(var physics_wall_pacing)" />
+        <param name="physics_timing_path" value="$(var physics_timing_path)" />
+        <param name="physics_cpu_affinity" value="$(var physics_cpu_affinity)" />
         <param from="$(var initial_joint_states)" />
         <param from="$(var mujoco_plugin_config)" />
       </node>
@@ -58,6 +64,9 @@
         <param name="modelfile"            value="$(var modelfile)" />
         <param name="wait_for_xml"         value="$(var wait_for_xml)" />
         <param name="realtime"             value="$(var realtime)" />
+        <param name="physics_wall_pacing" value="$(var physics_wall_pacing)" />
+        <param name="physics_timing_path" value="$(var physics_timing_path)" />
+        <param name="physics_cpu_affinity" value="$(var physics_cpu_affinity)" />
         <param from="$(var initial_joint_states)" />
         <param from="$(var mujoco_plugin_config)" />
       </node>
@@ -77,6 +86,9 @@
         <param name="modelfile"            value="$(var modelfile)" />
         <param name="wait_for_xml"         value="$(var wait_for_xml)" />
         <param name="realtime"             value="$(var realtime)" />
+        <param name="physics_wall_pacing" value="$(var physics_wall_pacing)" />
+        <param name="physics_timing_path" value="$(var physics_timing_path)" />
+        <param name="physics_cpu_affinity" value="$(var physics_cpu_affinity)" />
         <param from="$(var initial_joint_states)" />
         <param from="$(var mujoco_plugin_config)" />
       </node>
@@ -97,6 +109,9 @@
         <param name="modelfile"            value="$(var modelfile)" />
         <param name="wait_for_xml"         value="$(var wait_for_xml)" />
         <param name="realtime"             value="$(var realtime)" />
+        <param name="physics_wall_pacing" value="$(var physics_wall_pacing)" />
+        <param name="physics_timing_path" value="$(var physics_timing_path)" />
+        <param name="physics_cpu_affinity" value="$(var physics_cpu_affinity)" />
         <param from="$(var initial_joint_states)" />
         <param from="$(var mujoco_plugin_config)" />
       </node>

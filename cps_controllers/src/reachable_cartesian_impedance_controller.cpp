@@ -2059,6 +2059,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecision(
     last_verified_plan_.intended_exec_index = 0;
     last_verified_plan_.failsafe_exec_index = 0;
     ++last_verified_plan_generation_;
+    current_source_plan_generation_.store(
+        last_verified_plan_generation_, std::memory_order_release);
 
     mode_ = nominalSafetyModeForMonitor(dec.monitor);
 
@@ -2364,7 +2366,8 @@ ShieldDecision ReachableCartesianImpedanceController::computeShieldDecisionForAs
 
 bool ReachableCartesianImpedanceController::publishAsyncMonitorInput(
     AsyncMonitorInput input) {
-  if (!async_safety_monitor_ || !safety_monitor_worker_running_.load()) {
+  if (!async_safety_monitor_ || !safety_monitor_worker_running_.load() ||
+      !async_request_gate_.canPublish()) {
     return false;
   }
 
@@ -2373,6 +2376,7 @@ bool ReachableCartesianImpedanceController::publishAsyncMonitorInput(
       async_monitor_input_overwrite_count_.fetch_add(
           1, std::memory_order_relaxed);
     }
+    async_request_gate_.published(input.sequence);
     latest_async_input_ = std::move(input);
     async_input_pending_ = true;
     async_input_mutex_.unlock();
@@ -2392,6 +2396,7 @@ bool ReachableCartesianImpedanceController::takeAsyncMonitorOutput(
         result.discarded_older, std::memory_order_relaxed);
   }
   if (result.taken) {
+    async_request_gate_.consumed(output->sequence);
     async_monitor_output_consumed_count_.fetch_add(
         1, std::memory_order_relaxed);
   }
@@ -2561,6 +2566,12 @@ Vector7d ReachableCartesianImpedanceController::computeImpedanceTorque(
 controller_interface::return_type ReachableCartesianImpedanceController::update(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& period) {
   const auto tic_total = SteadyClock::now();
+  const std::int64_t control_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      tic_total.time_since_epoch()).count();
+  const double control_start_interval_ms = previous_control_start_steady_ns_ > 0
+      ? nanosecondsToMilliseconds(control_start_ns - previous_control_start_steady_ns_) : 0.0;
+  previous_control_start_steady_ns_ = control_start_ns;
+  bool async_output_processed_this_cycle = false;
   const std::uint64_t control_loop_sequence = ++control_update_sequence_;
   const bool previous_applied_verified_plan_valid =
       last_commanded_verified_plan_valid_;
@@ -2672,7 +2683,7 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     paused_total += std::max(0.0, wall_time - failsafe_enter_wall_time_sec_);
   const double nominal_guess_time = std::max(0.0, wall_time - paused_total);
 
-  ShieldDecision shield_dec;
+  ShieldExecutionDecision shield_dec;
   FallbackReason async_output_rejection_reason = FallbackReason::kNone;
 
   if (calibration_plan_latched_) {
@@ -2711,14 +2722,279 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           getNextVerifiedTrajectoryCommandFromCache(true);
     }
   } else if (async_safety_monitor_) {
-    // Consume a completed result before constructing and publishing the next
-    // monitor input. The worker can finish a short rollout while this control
-    // cycle is still building its input; taking the previous result first
-    // prevents that new result from superseding an otherwise usable output.
+    // Finish acceptance before publishing another request. Merely taking a
+    // result from the mailbox does not yet update the source-plan generation.
     AsyncMonitorOutput async_output;
-    bool async_output_available =
+    const bool async_output_available =
         takeAsyncMonitorOutput(&async_output);
 
+    if (async_output_available) {
+      async_output_processed_this_cycle = true;
+      const std::int64_t output_take_steady_time_ns =
+          steadyNowNanoseconds();
+      AsyncMonitorTiming async_timing;
+      async_timing.valid = true;
+      async_timing.input_sequence = async_output.input.sequence;
+      async_timing.input_control_loop_sequence =
+          async_output.input.control_loop_sequence;
+      async_timing.source_plan_generation =
+          async_output.input.source_plan_generation;
+      async_timing.committed_prefix_steps =
+          async_output.input.committed_prefix.size();
+      async_timing.scheduled_control_loop_sequence =
+          async_output.input.scheduled_control_loop_sequence;
+      async_timing.publish_lateness_cycles =
+          async_output.input.publish_lateness_cycles;
+      async_timing.worker_queue_wait_ms =
+          async_output.worker_queue_wait_ms;
+      async_timing.worker_compute_ms =
+          async_output.worker_compute_ms;
+      async_timing.worker_thread_cpu_ms = async_output.worker_thread_cpu_ms;
+      async_timing.worker_non_cpu_ms = async_output.worker_non_cpu_ms;
+      async_timing.worker_voluntary_context_switches = async_output.worker_voluntary_context_switches;
+      async_timing.worker_involuntary_context_switches = async_output.worker_involuntary_context_switches;
+      async_timing.worker_rollout_steps = async_output.decision.joint_prediction_trace.empty()
+          ? 0 : async_output.decision.joint_prediction_trace.size() - 1;
+      async_timing.intended_command_count = async_output.decision.evaluated_plan.intended.size();
+      async_timing.failsafe_command_count = async_output.decision.evaluated_plan.failsafe.size();
+      async_timing.output_handoff_ms = nanosecondsToMilliseconds(
+          std::max<std::int64_t>(
+              0,
+              output_take_steady_time_ns -
+                  async_output.worker_finish_steady_time_ns));
+      async_timing.end_to_end_ms = nanosecondsToMilliseconds(
+          std::max<std::int64_t>(
+              0,
+              output_take_steady_time_ns -
+                  async_output.input.publish_steady_time_ns));
+      const std::size_t async_plan_elapsed_steps =
+          control_loop_sequence >= async_output.input.control_loop_sequence
+              ? static_cast<std::size_t>(
+                    control_loop_sequence -
+                    async_output.input.control_loop_sequence)
+              : 0;
+      const bool async_output_matches_source_plan =
+          async_output.input.source_plan_generation ==
+          last_verified_plan_generation_;
+      const bool async_output_before_activation =
+          !async_output.input.committed_prefix.empty() &&
+          async_plan_elapsed_steps <=
+              async_output.input.committed_prefix.size();
+
+      const bool calibration_target_armed =
+          active_cartesian_via_points_calibration_ &&
+          !calibration_plan_latched_ &&
+          !calibration_target_failed_ &&
+          calibration_monitor_input_sequence_ != 0;
+      const bool calibration_target_output =
+          calibration_target_armed &&
+          async_output.input.sequence ==
+              calibration_monitor_input_sequence_;
+      const bool async_output_matches_calibration_target =
+          !calibration_target_armed || calibration_target_output;
+
+      // A scheduling spike can make a fully verified worker result arrive
+      // after its committed prefix while it still contains a fresh intended
+      // tail. Allow such a result to catch up only when its next command is a
+      // valid one-step transition from the command actually sent by the
+      // real-time loop. This preserves path and derivative continuity without
+      // treating a missed activation deadline as an unsafe trajectory.
+      bool async_output_late_catchup_continuous = false;
+      const VerifiedPlan* late_catchup_plan = nullptr;
+      if (async_output.decision.candidate_verified &&
+          async_output.decision.evaluated_plan.valid) {
+        late_catchup_plan = &async_output.decision.evaluated_plan;
+      }
+      if (!async_output_before_activation &&
+          async_output.decision.candidate_verified &&
+          late_catchup_plan != nullptr &&
+          last_commanded_sample_valid_ &&
+          async_plan_elapsed_steps <
+              late_catchup_plan->intended.size()) {
+        const ImpedanceSample& next =
+            late_catchup_plan->intended[async_plan_elapsed_steps];
+        async_output_late_catchup_continuous =
+            isOneStepCommandTransitionContinuous(
+                last_commanded_sample_,
+                next,
+                false);
+      }
+      // Never carry an assume-clear calibration result into normal mode, or
+      // reuse a live-workspace result after the provider has become stale.
+      const bool async_output_workspace_policy_matches =
+          (async_output.input.human_workspace_assumed_clear &&
+           human_workspace_assumed_clear) ||
+          (async_output.input.human_workspace_active &&
+           human_workspace_active_);
+      const bool async_output_recovery_epoch_matches =
+          async_output.input.energy_recovery_epoch == energy_recovery_epoch_;
+      bool async_output_recovery_state_matches = true;
+      if (enable_safety_monitor_ && enable_runtime_energy_scaling_ &&
+          async_output.decision.candidate_verified) {
+        const auto& trace = async_output.decision.joint_prediction_trace;
+        const double handoff_time =
+            async_output.decision.evaluated_plan.anchor.t +
+            static_cast<double>(async_plan_elapsed_steps) * local_replan_dt_;
+        const auto predicted = std::lower_bound(
+            trace.begin(), trace.end(), handoff_time - 1e-9,
+            [](const JointPredictionSample& sample, double t) { return sample.t < t; });
+        async_output_recovery_state_matches = predicted != trace.end() &&
+            std::abs(predicted->t - handoff_time) <= 1e-9 &&
+            cps_safety_monitor::energyRecoveryStateMatchesPrediction(
+                *predicted, energy_recovery_state_);
+      }
+      const bool async_output_usable =
+          async_output_matches_source_plan &&
+          async_output_recovery_epoch_matches &&
+          async_output_recovery_state_matches &&
+          async_output_workspace_policy_matches &&
+          async_output_matches_calibration_target &&
+          (async_output_before_activation ||
+           async_output_late_catchup_continuous);
+      async_timing.source_plan_matches_at_handoff =
+          async_output_matches_source_plan;
+      async_timing.recovery_epoch_matches_at_handoff =
+          async_output_recovery_epoch_matches;
+      async_timing.recovery_state_matches_at_handoff =
+          async_output_recovery_state_matches;
+      async_timing.output_usable = async_output_usable;
+      async_timing.handoff_rejection_mask =
+          (async_output_matches_source_plan ? 0U : 1U) |
+          (async_output_recovery_epoch_matches ? 0U : 2U) |
+          (async_output_recovery_state_matches ? 0U : 4U) |
+          (async_output_workspace_policy_matches ? 0U : 8U) |
+          (async_output_matches_calibration_target ? 0U : 16U) |
+          ((async_output_before_activation || async_output_late_catchup_continuous) ? 0U : 32U);
+      async_timing.candidate_verified_at_handoff = async_output.decision.candidate_verified;
+      if (!async_output_matches_source_plan) {
+        async_output_rejection_reason =
+            FallbackReason::kAsyncOutputUnavailable;
+      } else if (!async_output_workspace_policy_matches ||
+                 !async_output_recovery_epoch_matches ||
+                 !async_output_recovery_state_matches) {
+        async_output_rejection_reason =
+            FallbackReason::kAsyncOutputUnavailable;
+      } else if (!async_output_matches_calibration_target) {
+        async_output_rejection_reason =
+            FallbackReason::kAsyncOutputUnavailable;
+      } else if (!async_output_before_activation &&
+                 !async_output_late_catchup_continuous) {
+        async_output_rejection_reason =
+            FallbackReason::kAsyncOutputUnavailable;
+        ++async_activation_deadline_miss_count_;
+      } else if (async_output_late_catchup_continuous) {
+        ++async_late_activation_accept_count_;
+      }
+      const bool verified_output_acceptable_now =
+          human_workspace_available &&
+          async_output.decision.candidate_verified;
+      const std::uint64_t accepted_plan_generation =
+          async_output_usable &&
+                  verified_output_acceptable_now &&
+                  async_output.decision.evaluated_plan.valid
+              ? last_verified_plan_generation_ + 1
+              : 0;
+      async_timing.plan_accepted = accepted_plan_generation != 0;
+      last_async_monitor_timing_ = async_timing;
+      if (async_output.decision.has_evaluated_plan) {
+        logShieldPredictionTrajectory(
+            async_output.input.wall_time,
+            async_output.input.nominal_guess_time,
+            async_output.input.q,
+            async_output.input.dq,
+            async_output.input.current_position,
+            async_output.input.ee_twist,
+            async_output.input.inertia,
+            async_output.input.Jv,
+            async_output.input.human_workspace,
+            async_output.input.human_workspace_active,
+            async_output.input.human_workspace_assumed_clear,
+            async_output.decision.evaluated_plan,
+            async_output.decision.joint_prediction_trace,
+            async_timing,
+            async_output.decision.monitor,
+            executionModeForLog(
+                async_output.decision.executing_last_verified_monitored ||
+                async_output.decision.command.failsafe),
+            async_output.decision.candidate_verified,
+            accepted_plan_generation,
+            async_output.decision.executing_last_verified_monitored,
+            async_output.decision.monitor_total_ms,
+            async_output.decision.planner_ms,
+            async_output.decision.plan_build_ms,
+            async_output.decision.monitor_eval_ms,
+            "async");
+      }
+      if (async_output_usable) {
+        last_shield_decision_ = async_output.decision;
+        last_shield_decision_valid_ = true;
+        last_async_output_wall_time_ = async_output.input_wall_time;
+        last_async_output_valid_ = true;
+        if (verified_output_acceptable_now &&
+            async_output.decision.evaluated_plan.valid) {
+          last_verified_plan_ = async_output.decision.evaluated_plan;
+          last_verified_plan_.valid = true;
+          alignVerifiedPlanExecutionIndex(
+              &last_verified_plan_,
+              async_plan_elapsed_steps);
+          ++last_verified_plan_generation_;
+          current_source_plan_generation_.store(
+              last_verified_plan_generation_, std::memory_order_release);
+          if (active_cartesian_via_points_calibration_ &&
+              !calibration_plan_latched_ &&
+              async_output.input.sequence ==
+                  calibration_monitor_input_sequence_ &&
+              last_verified_plan_.intended_exec_index <
+                  last_verified_plan_.intended.size() &&
+              !last_verified_plan_.failsafe.empty()) {
+            calibration_plan_latched_ = true;
+            calibration_plan_complete_ = false;
+            calibration_failsafe_command_count_ =
+                failsafeCommandCount(last_verified_plan_);
+            calibration_plan_generation_ =
+                last_verified_plan_generation_;
+            calibration_activation_control_sequence_ =
+                control_loop_sequence;
+            calibration_activation_intended_index_ =
+                last_verified_plan_.intended_exec_index;
+            calibration_activation_failsafe_index_ =
+                last_verified_plan_.failsafe_exec_index;
+            RCLCPP_INFO(
+                get_node()->get_logger(),
+                "Calibration captured next monitored plan generation=%lu "
+                "monitor_input=%lu activation_control=%lu "
+                "intended_index=%zu/%zu failsafe_index=%zu/%zu.",
+                static_cast<unsigned long>(calibration_plan_generation_),
+                static_cast<unsigned long>(
+                    calibration_monitor_input_sequence_),
+                static_cast<unsigned long>(
+                    calibration_activation_control_sequence_),
+                calibration_activation_intended_index_,
+                last_verified_plan_.intended.size(),
+                calibration_activation_failsafe_index_,
+                calibration_failsafe_command_count_);
+          }
+        }
+      }
+      if (calibration_target_output && !calibration_plan_latched_) {
+        calibration_target_failed_ = true;
+        RCLCPP_WARN(
+            get_node()->get_logger(),
+            "Calibration target monitor_input=%lu was not executable "
+            "(output_usable=%d candidate_verified=%d plan_valid=%d); no "
+            "later candidate will be substituted.",
+            static_cast<unsigned long>(
+                calibration_monitor_input_sequence_),
+            static_cast<int>(async_output_usable),
+            static_cast<int>(async_output.decision.candidate_verified),
+            static_cast<int>(
+                async_output.decision.evaluated_plan.valid));
+      }
+    }
+
+    // Apply the previous result before capturing the next source generation
+    // and committed prefix. Publishing first would immediately invalidate a
+    // new request whenever this cycle accepts a completed plan.
     // A calibration action is a one-shot experiment: after arming its first
     // post-action monitor input, do not overwrite that input with newer ones
     // while the worker is still evaluating it.
@@ -2727,9 +3003,18 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
         !calibration_plan_latched_ &&
         !calibration_target_failed_ &&
         calibration_monitor_input_sequence_ != 0;
-    const bool publish_monitor_input =
+    const bool monitor_input_due =
         control_loop_sequence >= next_async_monitor_control_sequence_ &&
+        !calibration_plan_latched_ &&
         !calibration_waiting_for_target_output;
+    const bool request_slot_available = async_request_gate_.canPublish();
+    if (monitor_input_due && !request_slot_available) {
+      ++async_monitor_busy_deferred_cycles_;
+    }
+    // Keep the 200 Hz target phase, but never pipeline a second snapshot
+    // against a plan that the outstanding result may replace. Coalesce missed
+    // slots at the next submission; the servo loop never waits for this gate.
+    const bool publish_monitor_input = monitor_input_due && request_slot_available;
 
     if (publish_monitor_input) {
       AsyncMonitorInput async_input;
@@ -2926,258 +3211,6 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
       }
     }
 
-    // If no result was ready at the beginning of this cycle, make one more
-    // non-blocking read after input publication. This catches a worker result
-    // that completed concurrently while the controller assembled the input,
-    // without ever replacing a result already selected for this cycle.
-    if (!async_output_available) {
-      async_output_available = takeAsyncMonitorOutput(&async_output);
-    }
-
-    if (async_output_available) {
-      const std::int64_t output_take_steady_time_ns =
-          steadyNowNanoseconds();
-      AsyncMonitorTiming async_timing;
-      async_timing.valid = true;
-      async_timing.input_sequence = async_output.input.sequence;
-      async_timing.input_control_loop_sequence =
-          async_output.input.control_loop_sequence;
-      async_timing.source_plan_generation =
-          async_output.input.source_plan_generation;
-      async_timing.committed_prefix_steps =
-          async_output.input.committed_prefix.size();
-      async_timing.scheduled_control_loop_sequence =
-          async_output.input.scheduled_control_loop_sequence;
-      async_timing.publish_lateness_cycles =
-          async_output.input.publish_lateness_cycles;
-      async_timing.worker_queue_wait_ms =
-          async_output.worker_queue_wait_ms;
-      async_timing.worker_compute_ms =
-          async_output.worker_compute_ms;
-      async_timing.output_handoff_ms = nanosecondsToMilliseconds(
-          std::max<std::int64_t>(
-              0,
-              output_take_steady_time_ns -
-                  async_output.worker_finish_steady_time_ns));
-      async_timing.end_to_end_ms = nanosecondsToMilliseconds(
-          std::max<std::int64_t>(
-              0,
-              output_take_steady_time_ns -
-                  async_output.input.publish_steady_time_ns));
-      const std::size_t async_plan_elapsed_steps =
-          control_loop_sequence >= async_output.input.control_loop_sequence
-              ? static_cast<std::size_t>(
-                    control_loop_sequence -
-                    async_output.input.control_loop_sequence)
-              : 0;
-      const bool async_output_matches_source_plan =
-          async_output.input.source_plan_generation ==
-          last_verified_plan_generation_;
-      const bool async_output_before_activation =
-          !async_output.input.committed_prefix.empty() &&
-          async_plan_elapsed_steps <=
-              async_output.input.committed_prefix.size();
-
-      const bool calibration_target_armed =
-          active_cartesian_via_points_calibration_ &&
-          !calibration_plan_latched_ &&
-          !calibration_target_failed_ &&
-          calibration_monitor_input_sequence_ != 0;
-      const bool calibration_target_output =
-          calibration_target_armed &&
-          async_output.input.sequence ==
-              calibration_monitor_input_sequence_;
-      const bool async_output_matches_calibration_target =
-          !calibration_target_armed || calibration_target_output;
-
-      // A scheduling spike can make a fully verified worker result arrive
-      // after its committed prefix while it still contains a fresh intended
-      // tail. Allow such a result to catch up only when its next command is a
-      // valid one-step transition from the command actually sent by the
-      // real-time loop. This preserves path and derivative continuity without
-      // treating a missed activation deadline as an unsafe trajectory.
-      bool async_output_late_catchup_continuous = false;
-      const VerifiedPlan* late_catchup_plan = nullptr;
-      if (async_output.decision.candidate_verified &&
-          async_output.decision.evaluated_plan.valid) {
-        late_catchup_plan = &async_output.decision.evaluated_plan;
-      }
-      if (!async_output_before_activation &&
-          async_output.decision.candidate_verified &&
-          late_catchup_plan != nullptr &&
-          last_commanded_sample_valid_ &&
-          async_plan_elapsed_steps <
-              late_catchup_plan->intended.size()) {
-        const ImpedanceSample& next =
-            late_catchup_plan->intended[async_plan_elapsed_steps];
-        async_output_late_catchup_continuous =
-            isOneStepCommandTransitionContinuous(
-                last_commanded_sample_,
-                next,
-                false);
-      }
-      // Never carry an assume-clear calibration result into normal mode, or
-      // reuse a live-workspace result after the provider has become stale.
-      const bool async_output_workspace_policy_matches =
-          (async_output.input.human_workspace_assumed_clear &&
-           human_workspace_assumed_clear) ||
-          (async_output.input.human_workspace_active &&
-           human_workspace_active_);
-      const bool async_output_recovery_epoch_matches =
-          async_output.input.energy_recovery_epoch == energy_recovery_epoch_;
-      bool async_output_recovery_state_matches = true;
-      if (enable_safety_monitor_ && enable_runtime_energy_scaling_ &&
-          async_output.decision.candidate_verified) {
-        const auto& trace = async_output.decision.joint_prediction_trace;
-        const double handoff_time =
-            async_output.decision.evaluated_plan.anchor.t +
-            static_cast<double>(async_plan_elapsed_steps) * local_replan_dt_;
-        const auto predicted = std::lower_bound(
-            trace.begin(), trace.end(), handoff_time - 1e-9,
-            [](const JointPredictionSample& sample, double t) { return sample.t < t; });
-        async_output_recovery_state_matches = predicted != trace.end() &&
-            std::abs(predicted->t - handoff_time) <= 1e-9 &&
-            cps_safety_monitor::energyRecoveryStateMatchesPrediction(
-                *predicted, energy_recovery_state_);
-      }
-      const bool async_output_usable =
-          async_output_matches_source_plan &&
-          async_output_recovery_epoch_matches &&
-          async_output_recovery_state_matches &&
-          async_output_workspace_policy_matches &&
-          async_output_matches_calibration_target &&
-          (async_output_before_activation ||
-           async_output_late_catchup_continuous);
-      async_timing.source_plan_matches_at_handoff =
-          async_output_matches_source_plan;
-      async_timing.recovery_epoch_matches_at_handoff =
-          async_output_recovery_epoch_matches;
-      async_timing.recovery_state_matches_at_handoff =
-          async_output_recovery_state_matches;
-      async_timing.output_usable = async_output_usable;
-      last_async_monitor_timing_ = async_timing;
-      if (!async_output_matches_source_plan) {
-        async_output_rejection_reason =
-            FallbackReason::kAsyncOutputUnavailable;
-      } else if (!async_output_workspace_policy_matches ||
-                 !async_output_recovery_epoch_matches ||
-                 !async_output_recovery_state_matches) {
-        async_output_rejection_reason =
-            FallbackReason::kAsyncOutputUnavailable;
-      } else if (!async_output_matches_calibration_target) {
-        async_output_rejection_reason =
-            FallbackReason::kAsyncOutputUnavailable;
-      } else if (!async_output_before_activation &&
-                 !async_output_late_catchup_continuous) {
-        async_output_rejection_reason =
-            FallbackReason::kAsyncOutputUnavailable;
-        ++async_activation_deadline_miss_count_;
-      } else if (async_output_late_catchup_continuous) {
-        ++async_late_activation_accept_count_;
-      }
-      const bool verified_output_acceptable_now =
-          human_workspace_available &&
-          async_output.decision.candidate_verified;
-      const std::uint64_t accepted_plan_generation =
-          async_output_usable &&
-                  verified_output_acceptable_now &&
-                  async_output.decision.evaluated_plan.valid
-              ? last_verified_plan_generation_ + 1
-              : 0;
-      if (async_output.decision.has_evaluated_plan) {
-        logShieldPredictionTrajectory(
-            async_output.input.wall_time,
-            async_output.input.nominal_guess_time,
-            async_output.input.q,
-            async_output.input.dq,
-            async_output.input.current_position,
-            async_output.input.ee_twist,
-            async_output.input.inertia,
-            async_output.input.Jv,
-            async_output.input.human_workspace,
-            async_output.input.human_workspace_active,
-            async_output.input.human_workspace_assumed_clear,
-            async_output.decision.evaluated_plan,
-            async_output.decision.joint_prediction_trace,
-            async_timing,
-            async_output.decision.monitor,
-            executionModeForLog(
-                async_output.decision.executing_last_verified_monitored ||
-                async_output.decision.command.failsafe),
-            async_output.decision.candidate_verified,
-            accepted_plan_generation,
-            async_output.decision.executing_last_verified_monitored,
-            async_output.decision.monitor_total_ms,
-            async_output.decision.planner_ms,
-            async_output.decision.plan_build_ms,
-            async_output.decision.monitor_eval_ms,
-            "async");
-      }
-      if (async_output_usable) {
-        last_shield_decision_ = async_output.decision;
-        last_shield_decision_valid_ = true;
-        last_async_output_wall_time_ = async_output.input_wall_time;
-        last_async_output_valid_ = true;
-        if (verified_output_acceptable_now &&
-            async_output.decision.evaluated_plan.valid) {
-          last_verified_plan_ = async_output.decision.evaluated_plan;
-          last_verified_plan_.valid = true;
-          alignVerifiedPlanExecutionIndex(
-              &last_verified_plan_,
-              async_plan_elapsed_steps);
-          ++last_verified_plan_generation_;
-          if (active_cartesian_via_points_calibration_ &&
-              !calibration_plan_latched_ &&
-              async_output.input.sequence ==
-                  calibration_monitor_input_sequence_ &&
-              last_verified_plan_.intended_exec_index <
-                  last_verified_plan_.intended.size() &&
-              !last_verified_plan_.failsafe.empty()) {
-            calibration_plan_latched_ = true;
-            calibration_plan_complete_ = false;
-            calibration_failsafe_command_count_ =
-                failsafeCommandCount(last_verified_plan_);
-            calibration_plan_generation_ =
-                last_verified_plan_generation_;
-            calibration_activation_control_sequence_ =
-                control_loop_sequence;
-            calibration_activation_intended_index_ =
-                last_verified_plan_.intended_exec_index;
-            calibration_activation_failsafe_index_ =
-                last_verified_plan_.failsafe_exec_index;
-            RCLCPP_INFO(
-                get_node()->get_logger(),
-                "Calibration captured next monitored plan generation=%lu "
-                "monitor_input=%lu activation_control=%lu "
-                "intended_index=%zu/%zu failsafe_index=%zu/%zu.",
-                static_cast<unsigned long>(calibration_plan_generation_),
-                static_cast<unsigned long>(
-                    calibration_monitor_input_sequence_),
-                static_cast<unsigned long>(
-                    calibration_activation_control_sequence_),
-                calibration_activation_intended_index_,
-                last_verified_plan_.intended.size(),
-                calibration_activation_failsafe_index_,
-                calibration_failsafe_command_count_);
-          }
-        }
-      }
-      if (calibration_target_output && !calibration_plan_latched_) {
-        calibration_target_failed_ = true;
-        RCLCPP_WARN(
-            get_node()->get_logger(),
-            "Calibration target monitor_input=%lu was not executable "
-            "(output_usable=%d candidate_verified=%d plan_valid=%d); no "
-            "later candidate will be substituted.",
-            static_cast<unsigned long>(
-                calibration_monitor_input_sequence_),
-            static_cast<int>(async_output_usable),
-            static_cast<int>(async_output.decision.candidate_verified),
-            static_cast<int>(
-                async_output.decision.evaluated_plan.valid));
-      }
-    }
-
     const bool output_is_fresh =
         last_async_output_valid_ &&
         last_shield_decision_valid_ &&
@@ -3278,11 +3311,11 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     if (do_monitor) {
       const std::uint64_t generation_before_monitor =
           last_verified_plan_generation_;
-      shield_dec = computeShieldDecision(wall_time, q, dq,
+      last_shield_decision_ = computeShieldDecision(wall_time, q, dq,
                                          current_position, current_orientation,
                                          ee_twist, inertia, J_geo,
                                          coriolis, Jdot_dq_filtered_);
-      last_shield_decision_ = shield_dec;
+      shield_dec = last_shield_decision_;
       last_shield_decision_valid_ = true;
       const std::uint64_t accepted_plan_generation =
           shield_dec.candidate_verified &&
@@ -3303,8 +3336,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
             human_workspace_,
             human_workspace_active_,
             false,
-            shield_dec.evaluated_plan,
-            shield_dec.joint_prediction_trace,
+            last_shield_decision_.evaluated_plan,
+            last_shield_decision_.joint_prediction_trace,
             sync_timing,
             shield_dec.monitor,
             executionModeForLog(
@@ -3385,17 +3418,17 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   }
 
   const std::size_t monitored_intended_steps =
-      (shield_dec.has_evaluated_plan && shield_dec.evaluated_plan.valid)
-          ? shield_dec.evaluated_plan.intended.size()
+      (shield_dec.has_evaluated_plan && last_shield_decision_.evaluated_plan.valid)
+          ? last_shield_decision_.evaluated_plan.intended.size()
           : 0;
   const std::size_t monitored_failsafe_steps =
-      (shield_dec.has_evaluated_plan && shield_dec.evaluated_plan.valid)
-          ? shield_dec.evaluated_plan.failsafe.size()
+      (shield_dec.has_evaluated_plan && last_shield_decision_.evaluated_plan.valid)
+          ? last_shield_decision_.evaluated_plan.failsafe.size()
           : 0;
   const std::size_t monitored_steps =
       monitored_intended_steps + monitored_failsafe_steps;
   const bool monitor_prediction_valid =
-      shield_dec.has_evaluated_plan && shield_dec.evaluated_plan.valid &&
+      shield_dec.has_evaluated_plan && last_shield_decision_.evaluated_plan.valid &&
       monitored_steps > 0;
   // A failed or delayed rollout is not evidence that the previously predicted
   // collision possibility disappeared. Keep the last prediction classification
@@ -3883,6 +3916,21 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
           add(static_cast<double>(
               last_async_monitor_timing_.recovery_state_matches_at_handoff));
           add(static_cast<double>(monitor.recovery_energy_check_active));
+          add(last_async_monitor_timing_.worker_thread_cpu_ms);
+          add(last_async_monitor_timing_.worker_non_cpu_ms);
+          add(static_cast<double>(last_async_monitor_timing_.worker_voluntary_context_switches));
+          add(static_cast<double>(last_async_monitor_timing_.worker_involuntary_context_switches));
+          add(static_cast<double>(last_async_monitor_timing_.worker_rollout_steps));
+          add(static_cast<double>(last_async_monitor_timing_.intended_command_count));
+          add(static_cast<double>(last_async_monitor_timing_.failsafe_command_count));
+          add(static_cast<double>(last_async_monitor_timing_.handoff_rejection_mask));
+          add(static_cast<double>(last_async_monitor_timing_.candidate_verified_at_handoff));
+          add(static_cast<double>(last_async_monitor_timing_.plan_accepted));
+          add(static_cast<double>(async_output_processed_this_cycle));
+          add(control_start_interval_ms);
+          add(previous_control_execution_ms_);
+          add(static_cast<double>(async_monitor_busy_deferred_cycles_));
+          add(static_cast<double>(async_request_gate_.pendingSequence()));
           record.value_count = index;
         });
   }
@@ -3910,49 +3958,40 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
   ++loop_counter_;
   if (loop_counter_ >= static_cast<std::size_t>(profiling_stats_print_period_)) {
     const double n = static_cast<double>(loop_counter_);
-    RCLCPP_INFO(get_node()->get_logger(),
-                "[reachable_impedance] mode=%d stage=%d avg=%.3f ms min=%.3f ms max=%.3f ms overruns>1ms=%zu >2ms=%zu "
-                "model_avg/max=%.3f/%.3f shield_avg/max=%.3f/%.3f torque_avg/max=%.3f/%.3f io_avg/max=%.3f/%.3f "
-                "plan_valid=%d late_accept=%zu deadline_miss=%zu "
-                "monitor_pub/proc/cons=%lu/%lu/%lu overwrite_in/out=%lu/%lu "
-                "monitor_wait/compute/handoff/e2e=%.3f/%.3f/%.3f/%.3f ms "
-                "log_q=%zu pred_q=%zu log_drop=%zu pred_drop=%zu log_schema_mismatch=%zu",
-                executionModeForLog(execution_stage_),
-                static_cast<int>(execution_stage_),
-                exec_sum_ms_ / n, exec_min_ms_, exec_max_ms_,
-                exec_overrun_1ms_count_, exec_overrun_2ms_count_,
-                prof_model_sum_ms_ / n, prof_model_max_ms_,
-                prof_shield_sum_ms_ / n, prof_shield_max_ms_,
-                prof_torque_sum_ms_ / n, prof_torque_max_ms_,
-                prof_io_sum_ms_ / n, prof_io_max_ms_,
-                static_cast<int>(last_verified_plan_.valid),
-                async_late_activation_accept_count_,
-                async_activation_deadline_miss_count_,
-                static_cast<unsigned long>(
-                    async_monitor_input_publish_count_.load(
-                        std::memory_order_relaxed)),
-                static_cast<unsigned long>(
-                    async_monitor_worker_processed_count_.load(
-                        std::memory_order_relaxed)),
-                static_cast<unsigned long>(
-                    async_monitor_output_consumed_count_.load(
-                        std::memory_order_relaxed)),
-                static_cast<unsigned long>(
-                    async_monitor_input_overwrite_count_.load(
-                        std::memory_order_relaxed)),
-                static_cast<unsigned long>(
-                    async_monitor_output_overwrite_count_.load(
-                        std::memory_order_relaxed)),
-                last_async_monitor_timing_.worker_queue_wait_ms,
-                last_async_monitor_timing_.worker_compute_ms,
-                last_async_monitor_timing_.output_handoff_ms,
-                last_async_monitor_timing_.end_to_end_ms,
-                control_log_writer_.queueDepth(),
-                prediction_log_writer_.queueDepth(),
-                control_log_writer_.droppedCount(),
-                prediction_log_writer_.droppedCount(),
-                control_log_column_mismatch_count_.load(
-                    std::memory_order_relaxed));
+    ProfilingSnapshot profile;
+    profile.mode = executionModeForLog(execution_stage_);
+    profile.stage = static_cast<int>(execution_stage_);
+    profile.average_ms = exec_sum_ms_ / n;
+    profile.minimum_ms = exec_min_ms_;
+    profile.maximum_ms = exec_max_ms_;
+    profile.overruns_1ms = exec_overrun_1ms_count_;
+    profile.overruns_2ms = exec_overrun_2ms_count_;
+    profile.model_average_ms = prof_model_sum_ms_ / n;
+    profile.model_maximum_ms = prof_model_max_ms_;
+    profile.shield_average_ms = prof_shield_sum_ms_ / n;
+    profile.shield_maximum_ms = prof_shield_max_ms_;
+    profile.torque_average_ms = prof_torque_sum_ms_ / n;
+    profile.torque_maximum_ms = prof_torque_max_ms_;
+    profile.io_average_ms = prof_io_sum_ms_ / n;
+    profile.io_maximum_ms = prof_io_max_ms_;
+    profile.plan_valid = static_cast<int>(last_verified_plan_.valid);
+    profile.late_accept = async_late_activation_accept_count_;
+    profile.deadline_miss = async_activation_deadline_miss_count_;
+    profile.log_queue = control_log_writer_.queueDepth();
+    profile.prediction_queue = prediction_log_writer_.queueDepth();
+    profile.log_drop = control_log_writer_.droppedCount();
+    profile.prediction_drop = prediction_log_writer_.droppedCount();
+    profile.schema_mismatch = control_log_column_mismatch_count_.load(std::memory_order_relaxed);
+    profile.published = static_cast<unsigned long>(async_monitor_input_publish_count_.load(std::memory_order_relaxed));
+    profile.processed = static_cast<unsigned long>(async_monitor_worker_processed_count_.load(std::memory_order_relaxed));
+    profile.consumed = static_cast<unsigned long>(async_monitor_output_consumed_count_.load(std::memory_order_relaxed));
+    profile.input_overwrite = static_cast<unsigned long>(async_monitor_input_overwrite_count_.load(std::memory_order_relaxed));
+    profile.output_overwrite = static_cast<unsigned long>(async_monitor_output_overwrite_count_.load(std::memory_order_relaxed));
+    profile.monitor_timing.worker_queue_wait_ms = last_async_monitor_timing_.worker_queue_wait_ms;
+    profile.monitor_timing.worker_compute_ms = last_async_monitor_timing_.worker_compute_ms;
+    profile.monitor_timing.output_handoff_ms = last_async_monitor_timing_.output_handoff_ms;
+    profile.monitor_timing.end_to_end_ms = last_async_monitor_timing_.end_to_end_ms;
+    profiling_mailbox_.publish(std::move(profile));
     loop_counter_ = 0;
     exec_sum_ms_ = 0.0;
     exec_min_ms_ = 1e9;
@@ -3971,6 +4010,8 @@ controller_interface::return_type ReachableCartesianImpedanceController::update(
     async_activation_deadline_miss_count_ = 0;
   }
 
+  previous_control_execution_ms_ =
+      std::chrono::duration<double, std::milli>(SteadyClock::now() - tic_total).count();
   return controller_interface::return_type::OK;
 }
 
@@ -4850,6 +4891,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   command_recording_active_ = false;
   control_log_column_mismatch_count_.store(0, std::memory_order_relaxed);
   control_update_sequence_ = 0;
+  previous_control_start_steady_ns_ = 0;
+  previous_control_execution_ms_ = 0.0;
   next_async_monitor_control_sequence_ = 1;
   last_async_input_publish_control_sequence_ = 0;
   async_monitor_schedule_late_cycles_ = 0;
@@ -4889,6 +4932,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   cartesian_energy_task_inertia_cache_wall_time_ = -1.0;
   last_verified_plan_ = VerifiedPlan{};
   last_verified_plan_generation_ = 0;
+  current_source_plan_generation_.store(
+      last_verified_plan_generation_, std::memory_order_release);
   last_verified_command_stage_ = 0;
   last_verified_command_index_ = 0;
   verified_command_selected_this_cycle_ = false;
@@ -4913,6 +4958,8 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
   tau_cmd_prev_.setZero();
   last_shield_decision_valid_ = false;
   async_input_sequence_.store(0);
+  async_request_gate_.resetStopped();
+  async_monitor_busy_deferred_cycles_ = 0;
   async_input_pending_ = false;
   async_output_mailbox_.resetStopped();
   last_async_output_wall_time_ = -1.0;
@@ -4982,7 +5029,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << log_flush_period_sec_ << "\n"
                     << "recording_start: first_valid_via_points_command\n"
                     << "arm_id: " << arm_id_ << "\n"
-                    << "state_log_schema: orthogonal_execution_v15\n"
+                    << "state_log_schema: orthogonal_execution_v21\n"
                     << "monitor_gain_policy: nominal_stiffness_and_damping\n"
                     << "monitor_recovery_energy_policy: retain_contact_energy_gate_full_horizon\n"
                     << "energy_control_phase_legend: 0=normal, 1=limited, 2=recovering\n"
@@ -5028,6 +5075,16 @@ CallbackReturn ReachableCartesianImpedanceController::on_activate(
                     << "enable_safety_monitor: " << static_cast<int>(enable_safety_monitor_) << "\n"
                     << "async_safety_monitor: " << static_cast<int>(async_safety_monitor_) << "\n"
                     << "monitor_schedule_source: control_loop_sequence\n"
+                    << "async_pipeline_policy: single_outstanding_until_consumed_or_discarded_accept_before_publish\n"
+                    << "async_handoff_rejection_mask_legend: 1=source_generation, 2=recovery_epoch, 4=recovery_state, 8=workspace_policy, 16=calibration_target, 32=activation_window_or_continuity\n"
+                    << "monitor_cpu_time_source: CLOCK_THREAD_CPUTIME_ID\n"
+                    << "monitor_non_cpu_ms_semantics: elapsed_minus_thread_cpu_includes_preemption_and_blocking_and_small_sampling_overhead\n"
+                    << "monitor_context_switch_source: getrusage_RUSAGE_THREAD_delta\n"
+                    << "monitor_rollout_steps_semantics: actual_joint_prediction_trace_size_minus_one_zero_if_trace_unavailable\n"
+                    << "monitor_command_count_semantics: dense_candidate_counts_not_sparse_csv_rows\n"
+                    << "async_busy_deferred_cycles_semantics: due_control_cycles_without_free_request_slot_not_number_of_worker_requests\n"
+                    << "profiling_output_execution: independent_diagnostics_worker\n"
+                    << "monitor_visualization_execution: independent_diagnostics_worker_reuses_monitor_alpha\n"
                     << "monitor_period_control_cycles: "
                     << monitor_period_control_cycles_ << "\n"
                     << "monitor_worker_cpu_affinity: "

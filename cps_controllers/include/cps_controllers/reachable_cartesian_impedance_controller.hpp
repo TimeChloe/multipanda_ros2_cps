@@ -28,6 +28,7 @@
 #include "cps_human_workspace/msg/human_reachable_set.hpp"
 #include "cps_human_workspace/msg/human_workspace.hpp"
 #include "cps_controllers/bounded_async_file_writer.hpp"
+#include "cps_controllers/async_request_gate.hpp"
 #include "cps_controllers/latest_value_mailbox.hpp"
 #include "cps_controllers/reachable_cartesian_impedance/types.hpp"
 #include "cps_safety_monitor/reachable_safety_monitor.hpp"
@@ -207,6 +208,16 @@ class ReachableCartesianImpedanceController
     double worker_compute_ms{0.0};
     double output_handoff_ms{0.0};
     double end_to_end_ms{0.0};
+    double worker_thread_cpu_ms{-1.0};
+    double worker_non_cpu_ms{-1.0};
+    std::int64_t worker_voluntary_context_switches{-1};
+    std::int64_t worker_involuntary_context_switches{-1};
+    std::size_t worker_rollout_steps{0};
+    std::size_t intended_command_count{0};
+    std::size_t failsafe_command_count{0};
+    std::uint32_t handoff_rejection_mask{0};
+    bool candidate_verified_at_handoff{false};
+    bool plan_accepted{false};
   };
 
   struct AsyncMonitorOutput {
@@ -219,6 +230,10 @@ class ReachableCartesianImpedanceController
     std::int64_t worker_finish_steady_time_ns{0};
     double worker_queue_wait_ms{0.0};
     double worker_compute_ms{0.0};
+    double worker_thread_cpu_ms{-1.0};
+    double worker_non_cpu_ms{-1.0};
+    std::int64_t worker_voluntary_context_switches{-1};
+    std::int64_t worker_involuntary_context_switches{-1};
   };
 
   ShieldDecision computeShieldDecisionForAsyncInput(
@@ -280,10 +295,37 @@ class ReachableCartesianImpedanceController
     bool current_contact_energy_unsafe{false};
     int first_contact_interval_index{-1};
     int first_energy_unsafe_contact_interval_index{-1};
+    bool robot_reach_alpha_valid{false};
+    Vector7d robot_reach_alpha{Vector7d::Zero()};
     std::vector<JointPredictionSample> joint_prediction_trace;
   };
 
   void publishReachableSetOutputs(const ReachableSetOutputSnapshot& snapshot);
+  // The control thread publishes only fixed-size profiling values. Formatting
+  // and visualization run on an ordinary-priority diagnostics thread.
+  struct ProfilingSnapshot {
+    int mode{0};
+    int stage{0};
+    double average_ms{0.0}, minimum_ms{0.0}, maximum_ms{0.0};
+    std::size_t overruns_1ms{0}, overruns_2ms{0};
+    double model_average_ms{0.0}, model_maximum_ms{0.0};
+    double shield_average_ms{0.0}, shield_maximum_ms{0.0};
+    double torque_average_ms{0.0}, torque_maximum_ms{0.0};
+    double io_average_ms{0.0}, io_maximum_ms{0.0};
+    bool plan_valid{false};
+    std::size_t late_accept{0}, deadline_miss{0};
+    std::uint64_t published{0}, processed{0}, consumed{0};
+    std::uint64_t input_overwrite{0}, output_overwrite{0};
+    AsyncMonitorTiming monitor_timing;
+    std::size_t log_queue{0}, prediction_queue{0};
+    std::size_t log_drop{0}, prediction_drop{0}, schema_mismatch{0};
+  };
+  void diagnosticsWorkerLoop();
+  void printProfilingSnapshot(const ProfilingSnapshot& snapshot);
+  std::thread diagnostics_worker_thread_;
+  std::atomic<bool> diagnostics_worker_running_{false};
+  LatestValueMailbox<ProfilingSnapshot, 3> profiling_mailbox_;
+  LatestValueMailbox<ReachableSetOutputSnapshot, 3> visualization_mailbox_;
   void clearReachableSetOutputs();
   void startSafetyMonitorWorker();
   void stopSafetyMonitorWorker();
@@ -660,6 +702,8 @@ class ReachableCartesianImpedanceController
   std::atomic<bool> safety_monitor_worker_running_{false};
   std::atomic<std::uint64_t> async_input_sequence_{0};
   std::uint64_t control_update_sequence_{0};
+  std::int64_t previous_control_start_steady_ns_{0};
+  double previous_control_execution_ms_{0.0};
   std::uint64_t monitor_period_control_cycles_{1};
   std::uint64_t next_async_monitor_control_sequence_{1};
   std::uint64_t last_async_input_publish_control_sequence_{0};
@@ -673,6 +717,13 @@ class ReachableCartesianImpedanceController
   std::atomic<std::uint64_t> async_monitor_input_publish_count_{0};
   std::atomic<std::uint64_t> async_monitor_input_overwrite_count_{0};
   std::atomic<std::uint64_t> async_monitor_worker_processed_count_{0};
+  AsyncRequestGate async_request_gate_;
+  std::uint64_t async_monitor_busy_deferred_cycles_{0};
+  // Updated only by the control thread; workers use it only to discard
+  // obsolete work. The full acceptance checks still run in update().
+  std::atomic<std::uint64_t> current_source_plan_generation_{0};
+  std::atomic<std::uint64_t> async_stale_before_compute_count_{0};
+  std::atomic<std::uint64_t> async_stale_after_compute_count_{0};
 
   // The worker publishes into fixed lock-free slots. The real-time loop takes
   // the newest completed result without contending on a mutex.

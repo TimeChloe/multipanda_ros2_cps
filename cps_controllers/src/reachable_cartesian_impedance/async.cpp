@@ -292,6 +292,8 @@ void ReachableCartesianImpedanceController::resetViaPointExecutionState(
 
   last_verified_plan_ = VerifiedPlan{};
   ++last_verified_plan_generation_;
+  current_source_plan_generation_.store(
+      last_verified_plan_generation_, std::memory_order_release);
   last_verified_command_stage_ = 0;
   last_verified_command_index_ = 0;
   last_shield_decision_valid_ = false;
@@ -305,6 +307,7 @@ void ReachableCartesianImpedanceController::resetViaPointExecutionState(
     async_input_pending_ = false;
   }
   async_output_mailbox_.discardReady();
+  async_request_gate_.resetControlPath();
 
   last_commanded_sample_ = ImpedanceSample{};
   last_commanded_sample_.t = 0.0;
@@ -749,6 +752,7 @@ void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop()
   }
 
   VerifiedPlan last_verified_plan;
+  double last_visualization_request_wall_time = -1.0;
 
   while (safety_monitor_worker_running_.load()) {
     AsyncMonitorInput input;
@@ -768,7 +772,15 @@ void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop()
       async_input_pending_ = false;
     }
 
+    if (input.source_plan_generation !=
+      current_source_plan_generation_.load(std::memory_order_acquire))
+    {
+      async_stale_before_compute_count_.fetch_add(1, std::memory_order_relaxed);
+      async_request_gate_.discardedByWorker(input.sequence);
+      continue;
+    }
     const std::int64_t worker_start_ns = steadyNowNanoseconds();
+    const auto cpu_start = detail::workerCpuSample();
     AsyncMonitorOutput output;
     output.sequence = input.sequence;
     output.input_wall_time = input.wall_time;
@@ -779,14 +791,22 @@ void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop()
         0, worker_start_ns - input.publish_steady_time_ns));
     output.decision =
       computeShieldDecisionForAsyncInput(input, last_verified_plan);
+    async_monitor_worker_processed_count_.fetch_add(1, std::memory_order_relaxed);
+    if (input.source_plan_generation !=
+      current_source_plan_generation_.load(std::memory_order_acquire))
+    {
+      async_stale_after_compute_count_.fetch_add(1, std::memory_order_relaxed);
+      async_request_gate_.discardedByWorker(input.sequence);
+      continue;
+    }
 
     const bool reachable_set_output_due =
       enable_reachable_set_visualization_ &&
       reachable_set_visualization_pub_ &&
       human_reachable_set_pub_ &&
-      (last_reachable_set_visualization_wall_time_ < 0.0 ||
-      input.wall_time < last_reachable_set_visualization_wall_time_ ||
-      input.wall_time - last_reachable_set_visualization_wall_time_ >=
+      (last_visualization_request_wall_time < 0.0 ||
+      input.wall_time < last_visualization_request_wall_time ||
+      input.wall_time - last_visualization_request_wall_time >=
       reachable_set_visualization_period_sec_);
     ReachableSetOutputSnapshot reachable_set_snapshot;
     if (reachable_set_output_due) {
@@ -806,22 +826,37 @@ void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop()
         output.decision.monitor.first_contact_interval_index;
       reachable_set_snapshot.first_energy_unsafe_contact_interval_index =
         output.decision.monitor.first_energy_unsafe_contact_interval_index;
+      reachable_set_snapshot.robot_reach_alpha_valid =
+        output.decision.monitor.robot_reach_alpha_valid;
+      reachable_set_snapshot.robot_reach_alpha = output.decision.monitor.robot_reach_alpha;
       reachable_set_snapshot.joint_prediction_trace =
         output.decision.joint_prediction_trace;
     }
 
     output.input = std::move(input);
+    const auto cpu_finish = detail::workerCpuSample();
     output.worker_finish_steady_time_ns = steadyNowNanoseconds();
     output.worker_compute_ms = nanosecondsToMilliseconds(
       std::max<std::int64_t>(
         0,
         output.worker_finish_steady_time_ns -
         output.worker_start_steady_time_ns));
-    async_monitor_worker_processed_count_.fetch_add(
-      1, std::memory_order_relaxed);
-
+    if (cpu_start.cpu_ns >= 0 && cpu_finish.cpu_ns >= cpu_start.cpu_ns) {
+      output.worker_thread_cpu_ms = nanosecondsToMilliseconds(cpu_finish.cpu_ns - cpu_start.cpu_ns);
+      output.worker_non_cpu_ms = std::max(0.0, output.worker_compute_ms - output.worker_thread_cpu_ms);
+    }
+    if (cpu_start.voluntary_switches >= 0 && cpu_finish.voluntary_switches >= 0) {
+      output.worker_voluntary_context_switches =
+        cpu_finish.voluntary_switches - cpu_start.voluntary_switches;
+      output.worker_involuntary_context_switches =
+        cpu_finish.involuntary_switches - cpu_start.involuntary_switches;
+    }
+    const std::uint64_t completed_input_sequence = output.sequence;
     const auto publish_result =
       async_output_mailbox_.publish(std::move(output));
+    if (!publish_result.published) {
+      async_request_gate_.discardedByWorker(completed_input_sequence);
+    }
     const std::size_t discarded_outputs =
       publish_result.overwritten_ready +
       static_cast<std::size_t>(!publish_result.published);
@@ -829,21 +864,29 @@ void ReachableCartesianImpedanceController::safetyMonitorWorkerLoop()
       async_monitor_output_overwrite_count_.fetch_add(
         discarded_outputs, std::memory_order_relaxed);
     }
-    // The safety result is handed off before reachable-set output generation.
-    // This keeps visualization-related latency out of the acceptance path.
+    // Rendering and ROS publication must not delay the next monitor request.
     if (reachable_set_output_due) {
-      publishReachableSetOutputs(reachable_set_snapshot);
+      last_visualization_request_wall_time = reachable_set_snapshot.wall_time;
+      visualization_mailbox_.publish(std::move(reachable_set_snapshot));
     }
   }
 }
 
 void ReachableCartesianImpedanceController::startSafetyMonitorWorker()
 {
+  if (!diagnostics_worker_running_.exchange(true)) {
+    profiling_mailbox_.resetStopped();
+    visualization_mailbox_.resetStopped();
+    diagnostics_worker_thread_ =
+      std::thread(&ReachableCartesianImpedanceController::diagnosticsWorkerLoop, this);
+  }
   if (!async_safety_monitor_ || safety_monitor_worker_running_.load()) {
     return;
   }
 
   async_output_mailbox_.resetStopped();
+  async_stale_before_compute_count_.store(0, std::memory_order_relaxed);
+  async_stale_after_compute_count_.store(0, std::memory_order_relaxed);
   safety_monitor_worker_running_.store(true);
   async_input_pending_ = false;
   last_async_output_wall_time_ = -1.0;
@@ -855,14 +898,30 @@ void ReachableCartesianImpedanceController::startSafetyMonitorWorker()
 
 void ReachableCartesianImpedanceController::stopSafetyMonitorWorker()
 {
-  if (!safety_monitor_worker_running_.exchange(false)) {
-    return;
-  }
-
+  safety_monitor_worker_running_.store(false);
   async_input_cv_.notify_all();
 
   if (safety_monitor_worker_thread_.joinable()) {
     safety_monitor_worker_thread_.join();
+  }
+  diagnostics_worker_running_.store(false);
+  if (diagnostics_worker_thread_.joinable()) {
+    diagnostics_worker_thread_.join();
+  }
+}
+
+void ReachableCartesianImpedanceController::diagnosticsWorkerLoop()
+{
+  ProfilingSnapshot profile;
+  ReachableSetOutputSnapshot visualization;
+  while (diagnostics_worker_running_.load()) {
+    if (profiling_mailbox_.takeLatest(&profile).taken) {
+      printProfilingSnapshot(profile);
+    }
+    if (visualization_mailbox_.takeLatest(&visualization).taken) {
+      publishReachableSetOutputs(visualization);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
 }
 

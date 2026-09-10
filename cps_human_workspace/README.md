@@ -94,7 +94,16 @@ ros2 launch cps_human_workspace human_workspace_visualizer.launch.py \
 ```
 
 This launch starts two separate nodes. `human_workspace_publisher` publishes
-only timestamped hand observations. The reachable controller evaluates
+only timestamped hand observations. Its default observation period is 30 ms
+(`publish_rate = 1000 / 30`, approximately 33.3333 Hz). Override it by appending
+`publish_rate:=33.333333333333336` to the launch command. The parameter is read
+when the node creates its wall timer, so restart the publisher after changing
+the rate; changing the parameter on a running node does not rebuild the timer.
+This controls observation refresh, not the monitor frequency or a fixed reset
+timer for the reachable sphere. Actual message arrival can still be delayed
+by scheduling, and the reach bound grows with observation age.
+
+The reachable controller evaluates
 successive 5 ms robot/human intervals over the complete intended + failsafe
 trajectory, publishes its robot markers, and publishes the selected human
 occupancy as `cps_human_workspace/msg/HumanReachableSet`. The independent

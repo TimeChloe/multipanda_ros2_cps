@@ -295,19 +295,20 @@ reachable_cartesian_impedance_controller:
     reachable_set_visualization_period_sec: 0.02
     reachable_set_visualization_alpha: 0.3
     async_safety_monitor: true
-    # Pin the 200 Hz worker away from the main ROS/MuJoCo scheduling traffic on
+    # Pin the monitor worker away from the main ROS/MuJoCo scheduling traffic on
     # this 24-core workstation. Affinity failure is non-fatal on other hosts.
     monitor_worker_cpu_affinity: 22
     # This is applied only after the dedicated CPU affinity succeeds; otherwise
     # the worker automatically stays on the default scheduler.
     monitor_worker_realtime_priority: 20
     async_plan_max_age_sec: 0.02
-    # The 200 Hz monitor period consumes five dense 1 ms commands. Keep an
-    # eight-step committed prefix for handoff/scheduling margin and four monitor
-    # periods (twenty steps) of fresh intended motion after activation. This
-    # covers the measured 12-19 ms worker delays without a long 50 ms reserve.
-    async_planning_lead_steps: 8
-    async_verified_horizon_steps: 20
+    # One 100 Hz monitor period spans ten dense 1 ms control commands.
+    # Commit up to one period of existing commands, then verify one period of
+    # fresh intended commands plus the complete braking continuation. This
+    # assumes timely handoff for uninterrupted intended motion; missed/rejected
+    # updates consume the shorter reserve and can enter verified braking sooner.
+    async_planning_lead_steps: 10
+    async_verified_horizon_steps: 10
     enable_mujoco_contact_logging: true
     mujoco_contact_sensor_topic: /panda_metal_ball_touch
     mujoco_contact_threshold: 1.0e-6

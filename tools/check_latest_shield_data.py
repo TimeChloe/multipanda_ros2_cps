@@ -585,6 +585,8 @@ def summarize(
             "orthogonal_execution_v13",
             "orthogonal_execution_v14",
             "orthogonal_execution_v15",
+            "orthogonal_execution_v20",
+            "orthogonal_execution_v21",
         }
         else FALLBACK_REASON_NAMES_LEGACY
     )

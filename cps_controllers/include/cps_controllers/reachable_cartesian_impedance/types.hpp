@@ -101,7 +101,9 @@ using VerifiedPlan = cps_safety_monitor::VerifiedPlan;
 using SafetyMonitorConfig = cps_safety_monitor::SafetyMonitorConfig;
 using JointPredictionSample = cps_safety_monitor::JointPredictionSample;
 
-struct ShieldDecision
+// Fixed-size fields used by the servo loop. Copying a cached decision into
+// this base does not allocate or traverse its plan and prediction vectors.
+struct ShieldExecutionDecision
 {
   bool candidate_verified{false};
   bool executing_last_verified_monitored{false};
@@ -111,14 +113,17 @@ struct ShieldDecision
 
   ImpedanceSample command;
   MonitorResult monitor;
-  VerifiedPlan evaluated_plan;
-  // Filled when prediction logging or reachable-set visualization is enabled.
-  // It is produced by the same joint rollout that made the monitor decision.
-  std::vector<JointPredictionSample> joint_prediction_trace;
   double monitor_total_ms{0.0};
   double planner_ms{0.0};
   double plan_build_ms{0.0};
   double monitor_eval_ms{0.0};
+};
+
+struct ShieldDecision : ShieldExecutionDecision
+{
+  VerifiedPlan evaluated_plan;
+  // Filled by the same joint rollout that made the monitor decision.
+  std::vector<JointPredictionSample> joint_prediction_trace;
 };
 
 }  // namespace cps_controllers

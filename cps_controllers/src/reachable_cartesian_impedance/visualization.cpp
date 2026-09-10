@@ -86,13 +86,14 @@ void ReachableCartesianImpedanceController::publishReachableSetOutputs(
   int marker_id = 0;
   const auto & trace = snapshot.joint_prediction_trace;
   const std::vector<double> zero_alpha(7, 0.0);
-  std::vector<double> dynamic_alpha;
+  const std::vector<double> dynamic_alpha(
+    snapshot.robot_reach_alpha.data(), snapshot.robot_reach_alpha.data() + 7);
   cps_human_workspace::HumanWorkspace::ReachableSphere selected_human_reach;
   bool selected_human_reach_valid = false;
   bool selected_interval_valid = false;
-  const bool dynamic_alpha_valid = trace.size() >= 2 &&
-    robot_reachability_provider_->calculateTrajectoryAlpha(
-    trace, &dynamic_alpha);
+  // Reuse the monitor's bound for this exact trace. Recomputing it here would
+  // contend with the monitor's mutable SaRA velocity calculator.
+  const bool dynamic_alpha_valid = trace.size() >= 2 && snapshot.robot_reach_alpha_valid;
 
   auto make_marker = [&](int type, const std_msgs::msg::ColorRGBA & color) {
       visualization_msgs::msg::Marker marker;

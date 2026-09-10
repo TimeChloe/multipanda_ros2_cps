@@ -10,7 +10,7 @@
 # (currently local_replan_dt = 1 ms), without additional resampling.
 # Monitor request frequency is configured separately below.
 shield_plan_dt: 0.005
-monitor_frequency_hz: 200.0
+monitor_frequency_hz: 100.0
 
 local_replan_horizon_steps: 64
 local_replan_dt: 0.001

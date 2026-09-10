@@ -558,7 +558,17 @@ void ReachableCartesianImpedanceController::writeShieldPredictionTrajectory(
       << monitor.joint_velocity_violation << ","
       << monitor.joint_acceleration_violation << ","
       << monitor.joint_torque_violation << ","
-      << static_cast<int>(monitor.recovery_energy_check_active) << "\n";
+      << static_cast<int>(monitor.recovery_energy_check_active) << ","
+      << async_timing.worker_thread_cpu_ms << ","
+      << async_timing.worker_non_cpu_ms << ","
+      << async_timing.worker_voluntary_context_switches << ","
+      << async_timing.worker_involuntary_context_switches << ","
+      << async_timing.worker_rollout_steps << ","
+      << async_timing.intended_command_count << ","
+      << async_timing.failsafe_command_count << ","
+      << async_timing.handoff_rejection_mask << ","
+      << static_cast<int>(async_timing.candidate_verified_at_handoff) << ","
+      << static_cast<int>(async_timing.plan_accepted) << "\n";
   }
 }
 
@@ -658,7 +668,13 @@ bool ReachableCartesianImpedanceController::startLogWriters()
     "energy_control_phase,energy_recovery_exit_ready,energy_recovery_exited,"
     "energy_recovery_exit_verified,energy_recovery_epoch,energy_recovery_environment,"
     "async_recovery_epoch_matches_at_handoff,async_recovery_state_matches_at_handoff,"
-    "monitor_recovery_energy_check_active";
+    "monitor_recovery_energy_check_active,"
+    "worker_thread_cpu_ms,worker_non_cpu_ms,"
+    "worker_voluntary_context_switches,worker_involuntary_context_switches,"
+    "worker_rollout_steps,intended_command_count,failsafe_command_count,"
+    "async_handoff_rejection_mask,async_candidate_verified_at_handoff,async_plan_accepted,"
+    "async_output_processed_this_cycle,control_start_interval_ms,control_previous_execution_ms,"
+    "async_monitor_busy_deferred_cycles,async_pending_input_sequence";
 
   const std::size_t expected_control_columns =
     1 + static_cast<std::size_t>(
@@ -780,7 +796,11 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "joint_limit_unsafe,"
       "joint_limit_index,joint_position_violation,joint_velocity_violation,"
       "joint_acceleration_violation,joint_torque_violation,"
-      "monitor_recovery_energy_check_active";
+      "monitor_recovery_energy_check_active,"
+      "worker_thread_cpu_ms,worker_non_cpu_ms,"
+      "worker_voluntary_context_switches,worker_involuntary_context_switches,"
+      "worker_rollout_steps,intended_command_count,failsafe_command_count,"
+      "async_handoff_rejection_mask,async_candidate_verified_at_handoff,async_plan_accepted";
     const std::size_t reserved_plan_steps = std::max<std::size_t>(
       128,
       std::max<std::size_t>(
@@ -907,6 +927,11 @@ void ReachableCartesianImpedanceController::stopLogWriters()
         << monitor_inputs_overwritten << "\n"
         << "async_monitor_worker_processed: "
         << monitor_worker_processed << "\n"
+        << "async_monitor_stale_before_compute_dropped: "
+        << async_stale_before_compute_count_.load(std::memory_order_relaxed) << "\n"
+        << "async_monitor_stale_after_compute_dropped: "
+        << async_stale_after_compute_count_.load(std::memory_order_relaxed) << "\n"
+        << "async_monitor_busy_deferred_cycles: " << async_monitor_busy_deferred_cycles_ << "\n"
         << "async_monitor_outputs_overwritten: "
         << monitor_outputs_overwritten << "\n"
         << "async_monitor_outputs_consumed: "
@@ -921,5 +946,42 @@ void ReachableCartesianImpedanceController::stopLogWriters()
 
 // ============================================================================
 // computeImpedanceTorque -- corrected dynamic-consistent true branch
+
+void ReachableCartesianImpedanceController::printProfilingSnapshot(
+  const ProfilingSnapshot & profile)
+{
+    RCLCPP_INFO(get_node()->get_logger(),
+                "[reachable_impedance] mode=%d stage=%d avg=%.3f ms min=%.3f ms max=%.3f ms overruns>1ms=%zu >2ms=%zu "
+                "model_avg/max=%.3f/%.3f shield_avg/max=%.3f/%.3f torque_avg/max=%.3f/%.3f io_avg/max=%.3f/%.3f "
+                "plan_valid=%d late_accept=%zu deadline_miss=%zu "
+                "monitor_pub/proc/cons=%lu/%lu/%lu overwrite_in/out=%lu/%lu "
+                "monitor_wait/compute/handoff/e2e=%.3f/%.3f/%.3f/%.3f ms "
+                "log_q=%zu pred_q=%zu log_drop=%zu pred_drop=%zu log_schema_mismatch=%zu",
+                profile.mode,
+                profile.stage,
+                profile.average_ms, profile.minimum_ms, profile.maximum_ms,
+                profile.overruns_1ms, profile.overruns_2ms,
+                profile.model_average_ms, profile.model_maximum_ms,
+                profile.shield_average_ms, profile.shield_maximum_ms,
+                profile.torque_average_ms, profile.torque_maximum_ms,
+                profile.io_average_ms, profile.io_maximum_ms,
+                static_cast<int>(profile.plan_valid),
+                profile.late_accept,
+                profile.deadline_miss,
+                static_cast<unsigned long>(profile.published),
+                static_cast<unsigned long>(profile.processed),
+                static_cast<unsigned long>(profile.consumed),
+                static_cast<unsigned long>(profile.input_overwrite),
+                static_cast<unsigned long>(profile.output_overwrite),
+                profile.monitor_timing.worker_queue_wait_ms,
+                profile.monitor_timing.worker_compute_ms,
+                profile.monitor_timing.output_handoff_ms,
+                profile.monitor_timing.end_to_end_ms,
+                profile.log_queue,
+                profile.prediction_queue,
+                profile.log_drop,
+                profile.prediction_drop,
+                profile.schema_mismatch);
+}
 
 }  // namespace cps_controllers

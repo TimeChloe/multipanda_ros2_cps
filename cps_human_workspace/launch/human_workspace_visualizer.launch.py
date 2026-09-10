@@ -45,8 +45,8 @@ def generate_launch_description():
             description='HumanWorkspace state topic consumed by controllers.'),
         DeclareLaunchArgument(
             'publish_rate',
-            default_value='10.0',
-            description='Hand-observation publication rate in Hz.'),
+            default_value=str(50.0),
+            description='Hand-observation publication rate in Hz (default: 30 ms period).'),
         DeclareLaunchArgument(
             'reachable_set_topic',
             default_value='/human_workspace/reachable_set',

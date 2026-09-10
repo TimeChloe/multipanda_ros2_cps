@@ -38,7 +38,7 @@ public:
     const std::string state_topic_name =
       declare_parameter<std::string>("state_topic", "human_workspace/state");
     const double publish_rate_hz =
-      declare_parameter<double>("publish_rate", 10.0);
+      declare_parameter<double>("publish_rate", 50.0);
 
     if (frame_id_.empty() || state_topic_name.empty()) {
       throw std::invalid_argument("frame_id and state_topic must not be empty");
