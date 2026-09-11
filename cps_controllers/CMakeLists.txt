@@ -45,7 +45,10 @@ pluginlib_export_plugin_description_file(
 add_library(${PROJECT_NAME} SHARED
   src/joint_impedance_energybudget_controller.cpp
   src/nonlinear_impedance_controller.cpp
-  src/reachable_cartesian_impedance/async.cpp
+  src/reachable_cartesian_impedance/commands.cpp
+  src/reachable_cartesian_impedance/lifecycle.cpp
+  src/reachable_cartesian_impedance/monitor_execution.cpp
+  src/reachable_cartesian_impedance/monitor_worker.cpp
   src/reachable_cartesian_impedance_controller.cpp
   src/reachable_cartesian_impedance/logging.cpp
   src/reachable_cartesian_impedance/visualization.cpp
@@ -141,6 +144,9 @@ if(BUILD_TESTING)
   )
   target_include_directories(test_worker_timing PRIVATE src)
   target_link_libraries(test_worker_timing Threads::Threads)
+  ament_add_gtest(test_monitor_policy test/test_monitor_policy.cpp)
+  target_include_directories(test_monitor_policy PRIVATE include)
+  ament_target_dependencies(test_monitor_policy cps_trajectory_generators)
 endif()
 
 ament_package()

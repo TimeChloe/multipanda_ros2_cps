@@ -10,9 +10,10 @@
 # (currently local_replan_dt = 1 ms), without additional resampling.
 # Monitor request frequency is configured separately below.
 shield_plan_dt: 0.005
+# Each committed/fresh intended segment has N = 1 / (dt * frequency) commands.
+# The ratio must be an integer; the controller validates it at configuration.
 monitor_frequency_hz: 100.0
 
-local_replan_horizon_steps: 64
 local_replan_dt: 0.001
 
 # Merge only redundant intermediate waypoints. The final action target is

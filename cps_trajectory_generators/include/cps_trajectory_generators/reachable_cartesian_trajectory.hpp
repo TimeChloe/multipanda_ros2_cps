@@ -59,7 +59,6 @@ struct TrajectoryGeneratorSettings {
   double shield_plan_dt{0.005};
   double monitor_frequency_hz{200.0};
 
-  int local_replan_horizon_steps{64};
   double local_replan_dt{0.001};
   double waypoint_merge_position_tolerance{0.001};
   double waypoint_merge_orientation_tolerance{0.005};

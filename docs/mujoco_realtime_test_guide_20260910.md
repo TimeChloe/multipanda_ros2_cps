@@ -5,12 +5,14 @@
 - The event thread now sleeps until its 16.6 ms deadline, outside the physics
   mutex. Previously it subtracted the clock epoch duration, producing a negative
   sleep and repeatedly contending for the mutex.
-- `physics_wall_pacing:=true` (default) executes one physical step at each wall
-  deadline, using the model timestep and requested realtime factor. An overrun
-  rebases the deadline; simulation steps are never dropped. The simulation may
-  advance more slowly than wall time under overload. Small wakeup jitter within
-  a period can still produce a shorter following interval; this is not a hard
-  realtime guarantee.
+- `physics_wall_pacing:=true` (default) executes one physical step per outer
+  iteration, using the model timestep and requested realtime factor. Since the
+  2026-09-11 fix, short overruns retain the absolute schedule, with at most four
+  periods of timing debt and a half-period minimum between step starts. This
+  allows bounded recovery without holding the physics mutex across a batch.
+  Pause/resume and speed changes reset the schedule; simulation steps are never
+  dropped. Sustained overload can still slow the simulation. This is not a hard
+  realtime guarantee. See `mujoco_pacing_fix_20260911.md` for measured results.
 - `physics_wall_pacing:=false` retains the legacy catch-up step loop for comparison.
   `realtime:=-1.0` also uses legacy unlimited stepping. Both still receive the
   event-thread, executor and nonblocking-render fixes; this is not a complete

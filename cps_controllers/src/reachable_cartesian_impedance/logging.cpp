@@ -16,11 +16,15 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <cps_controllers/reachable_cartesian_impedance_controller.hpp>
+#include "math.hpp"
+#include "timing.hpp"
 
 namespace cps_controllers
 {
 namespace
 {
+
+using detail::SteadyClock;
 
 constexpr double kMinDt = 1e-6;
 constexpr double kSmallPositive = 1e-9;
@@ -801,11 +805,8 @@ bool ReachableCartesianImpedanceController::startLogWriters()
       "worker_voluntary_context_switches,worker_involuntary_context_switches,"
       "worker_rollout_steps,intended_command_count,failsafe_command_count,"
       "async_handoff_rejection_mask,async_candidate_verified_at_handoff,async_plan_accepted";
-    const std::size_t reserved_plan_steps = std::max<std::size_t>(
-      128,
-      std::max<std::size_t>(
-        static_cast<std::size_t>(std::max(1, local_replan_horizon_steps_)),
-        async_planning_lead_steps_ + async_verified_horizon_steps_));
+    const std::size_t reserved_plan_steps =
+      std::max<std::size_t>(128, 2 * monitor_period_steps_);
     if (!prediction_log_writer_.start(
         prediction_log_file_path_,
         prediction_header,
@@ -953,7 +954,7 @@ void ReachableCartesianImpedanceController::printProfilingSnapshot(
     RCLCPP_INFO(get_node()->get_logger(),
                 "[reachable_impedance] mode=%d stage=%d avg=%.3f ms min=%.3f ms max=%.3f ms overruns>1ms=%zu >2ms=%zu "
                 "model_avg/max=%.3f/%.3f shield_avg/max=%.3f/%.3f torque_avg/max=%.3f/%.3f io_avg/max=%.3f/%.3f "
-                "plan_valid=%d late_accept=%zu deadline_miss=%zu "
+                "plan_valid=%d deadline_miss=%zu "
                 "monitor_pub/proc/cons=%lu/%lu/%lu overwrite_in/out=%lu/%lu "
                 "monitor_wait/compute/handoff/e2e=%.3f/%.3f/%.3f/%.3f ms "
                 "log_q=%zu pred_q=%zu log_drop=%zu pred_drop=%zu log_schema_mismatch=%zu",
@@ -966,7 +967,6 @@ void ReachableCartesianImpedanceController::printProfilingSnapshot(
                 profile.torque_average_ms, profile.torque_maximum_ms,
                 profile.io_average_ms, profile.io_maximum_ms,
                 static_cast<int>(profile.plan_valid),
-                profile.late_accept,
                 profile.deadline_miss,
                 static_cast<unsigned long>(profile.published),
                 static_cast<unsigned long>(profile.processed),
@@ -983,5 +983,331 @@ void ReachableCartesianImpedanceController::printProfilingSnapshot(
                 profile.prediction_drop,
                 profile.schema_mismatch);
 }
+
+
+void ReachableCartesianImpedanceController::logControlCycle(
+    const ControlCycleLogContext& context) {
+  const std::size_t monitored_intended_steps =
+      context.shield_dec.has_evaluated_plan && last_shield_decision_.evaluated_plan.valid
+          ? last_shield_decision_.evaluated_plan.intended.size() : 0;
+  const std::size_t monitored_failsafe_steps =
+      context.shield_dec.has_evaluated_plan && last_shield_decision_.evaluated_plan.valid
+          ? last_shield_decision_.evaluated_plan.failsafe.size() : 0;
+  const std::size_t monitored_steps = monitored_intended_steps + monitored_failsafe_steps;
+  if (enable_error_logging_ && command_recording_active_ &&
+      control_log_writer_.running()) {
+    const Vector3d human_center =
+        human_workspace_.handReachableSetAtTime(context.wall_time).center;
+    const double mujoco_contact_msg_time =
+        latest_mujoco_contact_msg_time_.load(std::memory_order_relaxed);
+    const double mujoco_contact_sample_age =
+        (mujoco_contact_msg_time >= 0.0)
+            ? std::max(0.0, this->get_node()->now().seconds() - mujoco_contact_msg_time)
+            : -1.0;
+    const double verified_plan_age_sec =
+        last_verified_plan_.valid
+            ? std::max(0.0, context.wall_time - last_verified_plan_.generated_wall_time)
+            : -1.0;
+
+    control_log_writer_.tryEmplace(
+        [&](ControlLogRecord& record) {
+          std::size_t index = 0;
+          auto add = [&](double value) {
+            if (index < record.values.size()) {
+              record.values[index] = value;
+            }
+            ++index;
+          };
+
+          add(context.wall_time);
+          add(context.nominal_guess_time);
+          add(paused_nominal_time_sec_);
+          add(commanded_path_time_);
+          add(context.shield_dec.command.nominal_path_time);
+          add(static_cast<double>(context.shield_dec.command.nominal_path_time_valid));
+          add(commanded_path_rate_);
+          add(path_time_rate_target_);
+          add(static_cast<double>(executionModeForLog(execution_stage_)));
+          add(static_cast<double>(execution_stage_));
+          add(static_cast<double>(fallback_reason_));
+          add(static_cast<double>(plan_failure_reason_));
+          add(static_cast<double>(context.shield_dec.candidate_verified));
+          add(static_cast<double>(context.monitor_prediction_valid));
+          add(static_cast<double>(context.monitor.predicted_trigger));
+          add(static_cast<double>(context.monitor.collision_interval_index));
+          add(static_cast<double>(context.predicted_contact_possible));
+          add(static_cast<double>(context.monitor.monitored_contact_possible));
+          add(static_cast<double>(human_workspace_active_));
+          add(static_cast<double>(context.human_workspace_assumed_clear));
+          add(static_cast<double>(context.monitor.contact_relevant_for_energy));
+          add(static_cast<double>(context.monitor.collision_energy_unsafe));
+          add(static_cast<double>(context.monitor.monitored_unsafe));
+          add(static_cast<double>(context.monitor.joint_limit_unsafe));
+          add(static_cast<double>(context.monitor.joint_limit_index));
+          add(context.monitor.joint_position_violation);
+          add(context.monitor.joint_velocity_violation);
+          add(context.monitor.joint_acceleration_violation);
+          add(context.monitor.joint_torque_violation);
+          add(context.monitor.workspace_distance_now);
+          add(context.monitor.workspace_distance_min);
+          add(context.monitor.workspace_distance_margin);
+          for (int i = 0; i < 7; ++i) add(context.q(i));
+          for (int i = 0; i < 7; ++i) add(context.dq(i));
+          for (int i = 0; i < 3; ++i) add(context.shield_dec.command.p(i));
+          for (int i = 0; i < 3; ++i) add(context.current_position(i));
+          for (int i = 0; i < 6; ++i) add(context.ee_twist(i));
+          for (int i = 0; i < 3; ++i) add(human_center(i));
+          for (int i = 0; i < 3; ++i) add(context.shield_dec.command.dp(i));
+          for (int i = 0; i < 6; ++i) add(context.error(i));
+          add(context.tau_cmd.norm());
+          add(last_tau_task_norm_);
+          add(last_tau_nullspace_raw_norm_);
+          add(last_tau_nullspace_projected_norm_);
+          add(last_coriolis_norm_);
+          add(last_tau_desired_before_rate_limit_norm_);
+          add(static_cast<double>(torque_rate_limited_last_));
+          add(torque_rate_max_ratio_last_);
+          for (int i = 0; i < 3; ++i) add(K_runtime_(i, i));
+          for (int i = 0; i < 3; ++i) add(D_runtime_(i, i));
+          add(context.monitor.worst_case_contact_time);
+          add(context.monitor.worst_case_workspace_distance_at_candidate);
+          add(context.monitor.worst_case_cartesian_kinetic_energy_ub);
+          add(context.monitor.worst_case_joint_kinetic_energy_ub);
+          add(context.monitor.worst_case_cartesian_potential_energy_ub);
+          add(context.monitor.worst_case_nullspace_potential_energy_ub);
+          add(context.monitor.worst_case_total_control_energy_ub);
+          add(context.monitor.terminal_energy_ub);
+          add(context.monitor.robot_secure_radius);
+          add(static_cast<double>(context.monitor.robot_reach_alpha_valid));
+          for (int i = 0; i < 7; ++i) add(context.monitor.robot_reach_alpha(i));
+          add(static_cast<double>(context.monitor.current_robot_link_index));
+          add(static_cast<double>(context.monitor.worst_case_robot_link_index));
+          add(static_cast<double>(context.monitor.current_cartesian_energy_valid));
+          add(context.monitor.current_cartesian_kinetic_energy);
+          add(static_cast<double>(context.monitor.current_joint_energy_valid));
+          add(context.monitor.current_joint_kinetic_energy);
+          add(context.monitor.current_cartesian_potential_energy);
+          add(context.monitor.current_nullspace_potential_energy);
+          add(context.monitor.current_total_control_energy);
+          add(static_cast<double>(monitored_steps));
+          add(static_cast<double>(monitored_intended_steps));
+          add(static_cast<double>(monitored_failsafe_steps));
+          add(static_cast<double>(context.control_loop_sequence));
+          add(static_cast<double>(monitor_period_steps_));
+          add(static_cast<double>(next_async_monitor_control_sequence_));
+          add(static_cast<double>(
+              last_async_input_publish_control_sequence_));
+          add(static_cast<double>(last_async_monitor_timing_.valid));
+          add(static_cast<double>(
+              last_async_monitor_timing_.input_sequence));
+          add(static_cast<double>(
+              last_async_monitor_timing_.input_control_loop_sequence));
+          add(static_cast<double>(
+              last_async_monitor_timing_.source_plan_generation));
+          add(static_cast<double>(
+              last_async_monitor_timing_.committed_prefix_steps));
+          add(static_cast<double>(
+              last_async_monitor_timing_.source_plan_matches_at_handoff));
+          add(static_cast<double>(
+              last_async_monitor_timing_.output_usable));
+          add(static_cast<double>(
+              last_async_monitor_timing_.scheduled_control_loop_sequence));
+          add(static_cast<double>(
+              last_async_monitor_timing_.publish_lateness_cycles));
+          add(last_async_monitor_timing_.worker_queue_wait_ms);
+          add(last_async_monitor_timing_.worker_compute_ms);
+          add(last_async_monitor_timing_.output_handoff_ms);
+          add(last_async_monitor_timing_.end_to_end_ms);
+          add(static_cast<double>(async_monitor_input_publish_count_.load(
+              std::memory_order_relaxed)));
+          add(static_cast<double>(async_monitor_input_overwrite_count_.load(
+              std::memory_order_relaxed)));
+          add(static_cast<double>(async_monitor_worker_processed_count_.load(
+              std::memory_order_relaxed)));
+          add(static_cast<double>(async_monitor_output_overwrite_count_.load(
+              std::memory_order_relaxed)));
+          add(static_cast<double>(async_monitor_output_consumed_count_.load(
+              std::memory_order_relaxed)));
+          add(static_cast<double>(async_monitor_schedule_late_cycles_));
+          add(static_cast<double>(async_monitor_schedule_skipped_slots_));
+          add(verified_plan_age_sec);
+          add(static_cast<double>(last_verified_plan_.intended_exec_index));
+          add(static_cast<double>(last_verified_plan_.failsafe_exec_index));
+          add(static_cast<double>(last_verified_command_stage_));
+          add(static_cast<double>(last_verified_command_index_));
+          add(static_cast<double>(verified_command_selected_this_cycle_));
+          add(static_cast<double>(
+              verified_command_selected_this_cycle_
+                  ? last_verified_plan_generation_
+                  : 0));
+          add(static_cast<double>(context.previous_applied_verified_plan_valid));
+          add(static_cast<double>(context.previous_applied_verified_plan_generation));
+          add(static_cast<double>(context.previous_applied_verified_command_stage));
+          add(static_cast<double>(context.previous_applied_verified_command_index));
+          add(static_cast<double>(active_cartesian_via_points_calibration_));
+          add(static_cast<double>(calibration_plan_latched_));
+          add(static_cast<double>(calibration_plan_complete_));
+          add(static_cast<double>(calibration_target_failed_));
+          add(calibration_requested_capture_path_time_sec_);
+          add(calibration_actual_capture_path_time_sec_);
+          add(static_cast<double>(calibration_plan_generation_));
+          add(static_cast<double>(calibration_monitor_input_sequence_));
+          add(static_cast<double>(calibration_activation_control_sequence_));
+          add(static_cast<double>(calibration_activation_intended_index_));
+          add(static_cast<double>(calibration_activation_failsafe_index_));
+          add(static_cast<double>(enable_runtime_energy_scaling_));
+          add(static_cast<double>(last_energy_budget_active_));
+          add(static_cast<double>(last_energy_budget_lambda_valid_));
+          add(last_energy_stiffness_scale_);
+          add(last_joint_kinetic_energy_);
+          add(last_cartesian_potential_energy_before_scaling_);
+          add(last_nullspace_potential_energy_before_scaling_);
+          add(last_total_control_energy_before_scaling_);
+          add(last_cartesian_potential_energy_);
+          add(last_nullspace_potential_energy_);
+          add(static_cast<double>(enable_nullspace_));
+          add(n_stiffness_);
+          add(last_nullspace_stiffness_);
+          add(last_total_control_energy_);
+          add(static_cast<double>(context.previous_applied_energy_terms.valid));
+          add(context.previous_applied_energy_terms.kinetic_energy);
+          add(context.previous_applied_energy_terms.potential_energy);
+          add(context.previous_applied_energy_terms.nullspace_potential_energy);
+          add(static_cast<double>(
+              context.previous_applied_nullspace_stiffness > 0.0));
+          add(context.previous_applied_energy_terms.kinetic_energy +
+              context.previous_applied_energy_terms.potential_energy +
+              context.previous_applied_energy_terms.nullspace_potential_energy);
+          add(energy_budget_joule_);
+          add(latest_mujoco_contact_value_.load(std::memory_order_relaxed));
+          add(static_cast<double>(
+              latest_mujoco_contact_active_.load(std::memory_order_relaxed)));
+          add(mujoco_contact_sample_age);
+          add(static_cast<double>(energy_recovery_state_.phase));
+          add(static_cast<double>(context.energy_info.recovery_exit_ready));
+          add(static_cast<double>(context.energy_info.recovery_exited));
+          add(static_cast<double>(context.recovery_exit_verified));
+          add(static_cast<double>(energy_recovery_epoch_));
+          add(static_cast<double>(energy_recovery_environment_));
+          add(static_cast<double>(
+              last_async_monitor_timing_.recovery_epoch_matches_at_handoff));
+          add(static_cast<double>(
+              last_async_monitor_timing_.recovery_state_matches_at_handoff));
+          add(static_cast<double>(context.monitor.recovery_energy_check_active));
+          add(last_async_monitor_timing_.worker_thread_cpu_ms);
+          add(last_async_monitor_timing_.worker_non_cpu_ms);
+          add(static_cast<double>(last_async_monitor_timing_.worker_voluntary_context_switches));
+          add(static_cast<double>(last_async_monitor_timing_.worker_involuntary_context_switches));
+          add(static_cast<double>(last_async_monitor_timing_.worker_rollout_steps));
+          add(static_cast<double>(last_async_monitor_timing_.intended_command_count));
+          add(static_cast<double>(last_async_monitor_timing_.failsafe_command_count));
+          add(static_cast<double>(last_async_monitor_timing_.handoff_rejection_mask));
+          add(static_cast<double>(last_async_monitor_timing_.candidate_verified_at_handoff));
+          add(static_cast<double>(last_async_monitor_timing_.plan_accepted));
+          add(static_cast<double>(context.async_output_processed_this_cycle));
+          add(context.control_start_interval_ms);
+          add(previous_control_execution_ms_);
+          add(static_cast<double>(async_monitor_busy_deferred_cycles_));
+          add(static_cast<double>(async_request_gate_.pendingSequence()));
+          record.value_count = index;
+        });
+  }
+}
+
+void ReachableCartesianImpedanceController::recordControlTiming(
+    std::chrono::steady_clock::time_point tic_total,
+    std::chrono::steady_clock::time_point toc_model,
+    std::chrono::steady_clock::time_point toc_shield,
+    std::chrono::steady_clock::time_point toc_torque,
+    std::chrono::steady_clock::time_point toc_io) {
+  const auto toc_total = SteadyClock::now();
+  const double model_ms = std::chrono::duration<double, std::milli>(toc_model - tic_total).count();
+  const double shield_ms = std::chrono::duration<double, std::milli>(toc_shield - toc_model).count();
+  const double torque_ms = std::chrono::duration<double, std::milli>(toc_torque - toc_shield).count();
+  const double io_ms = std::chrono::duration<double, std::milli>(toc_io - toc_torque).count();
+  const double exec_ms = std::chrono::duration<double, std::milli>(toc_total - tic_total).count();
+  exec_sum_ms_ += exec_ms;
+  exec_max_ms_ = std::max(exec_max_ms_, exec_ms);
+  exec_min_ms_ = std::min(exec_min_ms_, exec_ms);
+  if (exec_ms > 1.0) ++exec_overrun_1ms_count_;
+  if (exec_ms > 2.0) ++exec_overrun_2ms_count_;
+  prof_model_sum_ms_ += model_ms;
+  prof_model_max_ms_ = std::max(prof_model_max_ms_, model_ms);
+  prof_shield_sum_ms_ += shield_ms;
+  prof_shield_max_ms_ = std::max(prof_shield_max_ms_, shield_ms);
+  prof_torque_sum_ms_ += torque_ms;
+  prof_torque_max_ms_ = std::max(prof_torque_max_ms_, torque_ms);
+  prof_io_sum_ms_ += io_ms;
+  prof_io_max_ms_ = std::max(prof_io_max_ms_, io_ms);
+  ++loop_counter_;
+  if (loop_counter_ >= static_cast<std::size_t>(profiling_stats_print_period_)) {
+    const double n = static_cast<double>(loop_counter_);
+    ProfilingSnapshot profile;
+    profile.mode = executionModeForLog(execution_stage_);
+    profile.stage = static_cast<int>(execution_stage_);
+    profile.average_ms = exec_sum_ms_ / n;
+    profile.minimum_ms = exec_min_ms_;
+    profile.maximum_ms = exec_max_ms_;
+    profile.overruns_1ms = exec_overrun_1ms_count_;
+    profile.overruns_2ms = exec_overrun_2ms_count_;
+    profile.model_average_ms = prof_model_sum_ms_ / n;
+    profile.model_maximum_ms = prof_model_max_ms_;
+    profile.shield_average_ms = prof_shield_sum_ms_ / n;
+    profile.shield_maximum_ms = prof_shield_max_ms_;
+    profile.torque_average_ms = prof_torque_sum_ms_ / n;
+    profile.torque_maximum_ms = prof_torque_max_ms_;
+    profile.io_average_ms = prof_io_sum_ms_ / n;
+    profile.io_maximum_ms = prof_io_max_ms_;
+    profile.plan_valid = static_cast<int>(last_verified_plan_.valid);
+    profile.deadline_miss = async_activation_deadline_miss_count_;
+    profile.log_queue = control_log_writer_.queueDepth();
+    profile.prediction_queue = prediction_log_writer_.queueDepth();
+    profile.log_drop = control_log_writer_.droppedCount();
+    profile.prediction_drop = prediction_log_writer_.droppedCount();
+    profile.schema_mismatch = control_log_column_mismatch_count_.load(std::memory_order_relaxed);
+    profile.published = static_cast<unsigned long>(async_monitor_input_publish_count_.load(std::memory_order_relaxed));
+    profile.processed = static_cast<unsigned long>(async_monitor_worker_processed_count_.load(std::memory_order_relaxed));
+    profile.consumed = static_cast<unsigned long>(async_monitor_output_consumed_count_.load(std::memory_order_relaxed));
+    profile.input_overwrite = static_cast<unsigned long>(async_monitor_input_overwrite_count_.load(std::memory_order_relaxed));
+    profile.output_overwrite = static_cast<unsigned long>(async_monitor_output_overwrite_count_.load(std::memory_order_relaxed));
+    profile.monitor_timing.worker_queue_wait_ms = last_async_monitor_timing_.worker_queue_wait_ms;
+    profile.monitor_timing.worker_compute_ms = last_async_monitor_timing_.worker_compute_ms;
+    profile.monitor_timing.output_handoff_ms = last_async_monitor_timing_.output_handoff_ms;
+    profile.monitor_timing.end_to_end_ms = last_async_monitor_timing_.end_to_end_ms;
+    profiling_mailbox_.publish(std::move(profile));
+    loop_counter_ = 0;
+    exec_sum_ms_ = 0.0;
+    exec_min_ms_ = 1e9;
+    exec_max_ms_ = 0.0;
+    exec_overrun_1ms_count_ = 0;
+    exec_overrun_2ms_count_ = 0;
+    prof_model_sum_ms_ = 0.0;
+    prof_model_max_ms_ = 0.0;
+    prof_shield_sum_ms_ = 0.0;
+    prof_shield_max_ms_ = 0.0;
+    prof_torque_sum_ms_ = 0.0;
+    prof_torque_max_ms_ = 0.0;
+    prof_io_sum_ms_ = 0.0;
+    prof_io_max_ms_ = 0.0;
+    async_activation_deadline_miss_count_ = 0;
+  }
+
+}
+
+void ReachableCartesianImpedanceController::diagnosticsWorkerLoop()
+{
+  ProfilingSnapshot profile;
+  ReachableSetOutputSnapshot visualization;
+  while (diagnostics_worker_running_.load()) {
+    if (profiling_mailbox_.takeLatest(&profile).taken) {
+      printProfilingSnapshot(profile);
+    }
+    if (visualization_mailbox_.takeLatest(&visualization).taken) {
+      publishReachableSetOutputs(visualization);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
 
 }  // namespace cps_controllers

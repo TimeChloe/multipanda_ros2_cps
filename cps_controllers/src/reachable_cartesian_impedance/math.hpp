@@ -6,6 +6,7 @@
 #include <cmath>
 
 #include <Eigen/Dense>
+#include <cps_controllers/reachable_cartesian_impedance/types.hpp>
 
 namespace cps_controllers {
 
@@ -15,6 +16,38 @@ using Matrix67d = Eigen::Matrix<double, 6, 7>;
 using Vector3d = Eigen::Matrix<double, 3, 1>;
 using Vector7d = Eigen::Matrix<double, 7, 1>;
 using Quaterniond = Eigen::Quaterniond;
+
+inline cps_controllers::SafetyMode nominalSafetyModeForMonitor(
+    const cps_safety_monitor::MonitorResult& monitor) {
+  return monitor.monitored_contact_possible
+             ? cps_controllers::SafetyMode::kNominalContactPossible
+             : cps_controllers::SafetyMode::kNominal;
+}
+
+inline cps_controllers::SafetyMode lastVerifiedSafetyModeForMonitor(
+    const cps_safety_monitor::MonitorResult& monitor) {
+  return monitor.monitored_contact_possible
+             ? cps_controllers::SafetyMode::kLastVerifiedContactPossible
+             : cps_controllers::SafetyMode::kLastVerifiedMonitored;
+}
+
+inline int executionModeForLog(bool fallback_execution) {
+  return fallback_execution ? 1 : 0;
+}
+
+inline int executionModeForLog(cps_controllers::ExecutionStage stage) {
+  return executionModeForLog(
+      stage != cps_controllers::ExecutionStage::kCurrentVerified);
+}
+
+inline Matrix3d skewSymmetric(const Vector3d& v) {
+  Matrix3d S;
+  S << 0.0, -v.z(), v.y(),
+       v.z(), 0.0, -v.x(),
+       -v.y(), v.x(), 0.0;
+  return S;
+}
+
 
 inline Eigen::MatrixXd dampedPseudoInverse(const Eigen::MatrixXd& M,
                                            double lambda = 0.2) {

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <array>
 #include <condition_variable>
+#include <chrono>
 #include <cstdint>
 #include <cstddef>
 #include <memory>
@@ -137,20 +138,18 @@ class ReachableCartesianImpedanceController
   double estimatePathRateFromTimedPathSample(double path_time,
                                              const Vector3d& cartesian_velocity) const;
 
-  ShieldDecision computeShieldDecision(double wall_time,
-                                       const Vector7d& q,
-                                       const Vector7d& dq,
-                                       const Vector3d& current_position,
-                                       const Quaterniond& current_orientation,
-                                       const Vector6d& ee_twist,
-                                       const Matrix7d& inertia,
-                                       const Matrix67d& J_geo,
-                                       const Vector7d& coriolis,
-                                       const Vector6d& control_jdot_dq);
-
   SafetyMonitorConfig makeSafetyMonitorConfig(
       const cps_human_workspace::HumanWorkspace& human_workspace,
       double wall_time) const;
+
+  ShieldExecutionDecision updateMonitoredCommand(
+      double wall_time, double nominal_guess_time,
+    const Vector7d& q, const Vector7d& dq,
+    const Vector3d& current_position, const Quaterniond& current_orientation,
+    const Vector6d& ee_twist, const Matrix7d& inertia,
+    const Matrix67d& J_geo, const Vector7d& coriolis,
+    std::uint64_t control_loop_sequence, bool human_workspace_assumed_clear,
+    bool& async_output_processed_this_cycle);
 
   struct AsyncMonitorInput {
     std::uint64_t sequence{0};
@@ -222,7 +221,6 @@ class ReachableCartesianImpedanceController
 
   struct AsyncMonitorOutput {
     std::uint64_t sequence{0};
-    double input_wall_time{0.0};
     bool valid{false};
     AsyncMonitorInput input;
     ShieldDecision decision;
@@ -237,8 +235,7 @@ class ReachableCartesianImpedanceController
   };
 
   ShieldDecision computeShieldDecisionForAsyncInput(
-      const AsyncMonitorInput& input,
-      VerifiedPlan& last_verified_plan) const;
+      const AsyncMonitorInput& input) const;
 
   bool publishAsyncMonitorInput(AsyncMonitorInput input);
   bool takeAsyncMonitorOutput(AsyncMonitorOutput* output);
@@ -313,7 +310,7 @@ class ReachableCartesianImpedanceController
     double torque_average_ms{0.0}, torque_maximum_ms{0.0};
     double io_average_ms{0.0}, io_maximum_ms{0.0};
     bool plan_valid{false};
-    std::size_t late_accept{0}, deadline_miss{0};
+    std::size_t deadline_miss{0};
     std::uint64_t published{0}, processed{0}, consumed{0};
     std::uint64_t input_overwrite{0}, output_overwrite{0};
     AsyncMonitorTiming monitor_timing;
@@ -444,11 +441,6 @@ class ReachableCartesianImpedanceController
       std::size_t offset,
       ImpedanceSample* command) const;
 
-  bool isOneStepCommandTransitionContinuous(
-      const ImpedanceSample& previous,
-      const ImpedanceSample& next,
-      bool allow_measured_derivative_reanchor = false) const;
-
   void alignVerifiedPlanExecutionIndex(
       VerifiedPlan* plan,
       std::size_t elapsed_control_steps) const;
@@ -475,13 +467,54 @@ class ReachableCartesianImpedanceController
     bool recovery_exited{false};
   };
 
-  bool shouldRejectCandidateWithMonitor(const MonitorResult& monitor) const;
   bool shouldRejectCandidateWithMonitor(const MonitorResult& monitor,
                                         bool human_workspace_available) const;
 
   bool computeTaskInertia(const Matrix7d& inertia,
                           const Matrix67d& J_geo,
                           Matrix6d* lambda) const;
+
+  struct ControlEnergyTerms {
+    bool valid{false};
+    double kinetic_energy{0.0};
+    double potential_energy{0.0};
+    double nullspace_potential_energy{0.0};
+  };
+
+  // Borrowed only for synchronous capture into the bounded logging queue.
+  struct ControlCycleLogContext {
+    double wall_time;
+    double nominal_guess_time;
+    const ShieldExecutionDecision& shield_dec;
+    const MonitorResult& monitor;
+    const Vector7d& q;
+    const Vector7d& dq;
+    const Vector3d& current_position;
+    const Vector6d& ee_twist;
+    const Vector6d& error;
+    const Vector7d& tau_cmd;
+    const EnergyBudgetInfo& energy_info;
+    const ControlEnergyTerms& previous_applied_energy_terms;
+    double previous_applied_nullspace_stiffness;
+    bool previous_applied_verified_plan_valid;
+    std::uint64_t previous_applied_verified_plan_generation;
+    int previous_applied_verified_command_stage;
+    std::size_t previous_applied_verified_command_index;
+    bool human_workspace_assumed_clear;
+    bool monitor_prediction_valid;
+    bool predicted_contact_possible;
+    bool recovery_exit_verified;
+    bool async_output_processed_this_cycle;
+    double control_start_interval_ms;
+    std::uint64_t control_loop_sequence;
+  };
+  void logControlCycle(const ControlCycleLogContext& context);
+  void recordControlTiming(
+      std::chrono::steady_clock::time_point tic_total,
+      std::chrono::steady_clock::time_point toc_model,
+      std::chrono::steady_clock::time_point toc_shield,
+      std::chrono::steady_clock::time_point toc_torque,
+      std::chrono::steady_clock::time_point toc_io);
 
   ImpedanceSample applyEnergyBudget(
       const ImpedanceSample& command,
@@ -629,18 +662,10 @@ class ReachableCartesianImpedanceController
   std::size_t calibration_activation_failsafe_index_{0};
   double ee_collision_radius_{0.04};
   Vector3d tcp_offset_{Vector3d::Zero()};
-  int monitor_decimation_{1};
-  bool async_safety_monitor_{true};
   int monitor_worker_cpu_affinity_{-1};
   int monitor_worker_realtime_priority_{0};
-  double async_plan_max_age_sec_{0.02};
-  // The lead is the maximum already-verified command prefix executed while
-  // the worker runs. In every mode it is truncated at the intended/failsafe
-  // boundary while intended commands remain, so a new candidate never
-  // promises to brake just to fill it.
-  // The horizon is the fresh intended tail available after activation.
-  std::size_t async_planning_lead_steps_{8};
-  std::size_t async_verified_horizon_steps_{20};
+  // Both candidate segments and the request schedule use this same period.
+  std::size_t monitor_period_steps_{1};
 
   cps_human_workspace::HumanWorkspace human_workspace_;
   cps_human_workspace::HumanWorkspace configured_human_workspace_source_;
@@ -656,9 +681,7 @@ class ReachableCartesianImpedanceController
   std::atomic<double> latest_human_workspace_msg_time_sec_{-1.0};
 
   double shield_plan_dt_{0.005};
-  int shield_intended_steps_{1};
   double monitor_frequency_hz_{200.0};
-  double monitor_update_period_sec_{0.01};
 
   double path_time_rate_min_{0.0};
   double path_time_rate_max_{1.5};
@@ -668,7 +691,6 @@ class ReachableCartesianImpedanceController
   double failsafe_path_time_acc_limit_{10.0};
   double failsafe_path_time_jerk_limit_{5000.0};
 
-  int local_replan_horizon_steps_{64};
   double local_replan_dt_{0.001};
   double waypoint_merge_position_tolerance_{0.001};
   double waypoint_merge_orientation_tolerance_{0.005};
@@ -693,8 +715,6 @@ class ReachableCartesianImpedanceController
   Vector6d Jdot_dq_filtered_{Vector6d::Zero()};
   bool J_geo_prev_valid_{false};
 
-  std::size_t monitor_counter_{0};
-
   bool last_shield_decision_valid_{false};
   ShieldDecision last_shield_decision_{};
 
@@ -704,7 +724,6 @@ class ReachableCartesianImpedanceController
   std::uint64_t control_update_sequence_{0};
   std::int64_t previous_control_start_steady_ns_{0};
   double previous_control_execution_ms_{0.0};
-  std::uint64_t monitor_period_control_cycles_{1};
   std::uint64_t next_async_monitor_control_sequence_{1};
   std::uint64_t last_async_input_publish_control_sequence_{0};
   std::uint64_t async_monitor_schedule_late_cycles_{0};
@@ -728,12 +747,9 @@ class ReachableCartesianImpedanceController
   // The worker publishes into fixed lock-free slots. The real-time loop takes
   // the newest completed result without contending on a mutex.
   LatestValueMailbox<AsyncMonitorOutput, 3> async_output_mailbox_;
-  double last_async_output_wall_time_{-1.0};
-  bool last_async_output_valid_{false};
   std::atomic<std::uint64_t> async_monitor_output_overwrite_count_{0};
   std::atomic<std::uint64_t> async_monitor_output_consumed_count_{0};
   AsyncMonitorTiming last_async_monitor_timing_{};
-  std::size_t async_late_activation_accept_count_{0};
   std::size_t async_activation_deadline_miss_count_{0};
 
   VerifiedPlan last_verified_plan_{};

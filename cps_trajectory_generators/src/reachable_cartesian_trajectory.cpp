@@ -43,19 +43,6 @@ bool parseDouble(const std::string& text, double* value) {
   return true;
 }
 
-bool parseInt(const std::string& text, int* value) {
-  if (value == nullptr) {
-    return false;
-  }
-  std::istringstream stream(text);
-  int parsed = 0;
-  stream >> parsed;
-  if (!stream) {
-    return false;
-  }
-  *value = parsed;
-  return true;
-}
 
 Eigen::Quaterniond normalizedOrIdentity(const Eigen::Quaterniond& q_in) {
   Eigen::Quaterniond q = q_in;
@@ -305,16 +292,12 @@ TrajectoryGeneratorSettings loadTrajectoryGeneratorSettings(
     }
 
     double double_value = 0.0;
-    int int_value = 0;
 
     if (key == "shield_plan_dt" && parseDouble(value_text, &double_value)) {
       settings.shield_plan_dt = double_value;
     } else if (key == "monitor_frequency_hz" &&
                parseDouble(value_text, &double_value)) {
       settings.monitor_frequency_hz = double_value;
-    } else if (key == "local_replan_horizon_steps" &&
-               parseInt(value_text, &int_value)) {
-      settings.local_replan_horizon_steps = int_value;
     } else if (key == "local_replan_dt" &&
                parseDouble(value_text, &double_value)) {
       settings.local_replan_dt = double_value;

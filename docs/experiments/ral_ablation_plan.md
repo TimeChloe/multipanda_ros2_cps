@@ -81,7 +81,7 @@ Set these values **before configuring the controller** in an experiment configur
 
 ```yaml
 enable_safety_monitor: true
-async_safety_monitor: true
+# Monitoring always runs asynchronously.
 enable_error_logging: true
 enable_prediction_logging: true
 enable_calibration_logging: true
