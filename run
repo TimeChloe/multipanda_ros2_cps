@@ -33,7 +33,7 @@ case "$ARCH" in
     aarch64) TAG_ARCH="arm64" ;;
     *)       TAG_ARCH="$ARCH" ;;
 esac
-IMAGE_TAG="${IMAGE_NAME}:${REPO_NAME}-${TAG_ARCH}"
+IMAGE_TAG="multipanda-gpu-snapshot:local"
 
 # ==============================================================================
 # 2. Hardware Support Checks
@@ -59,7 +59,8 @@ if check_nvidia_gpu && check_gpu_support; then
     WITH_GPU_CONFIG+=(--gpus 'all,"capabilities=compute,utility,graphics,display"')
     echo "GPU support detected."
 else
-    echo "No GPU support. Using CPU rendering."
+    echo "Error: NVIDIA GPU support is required. Check nvidia-smi and the Docker NVIDIA runtime."
+    exit 1
 fi
 
 # ==============================================================================

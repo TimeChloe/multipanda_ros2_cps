@@ -61,6 +61,9 @@ cd multipanda_ros2
 ```
 ./run
 ```
+On this laptop, `./run` starts the GPU-enabled `multipanda-container`, using
+`multipanda-gpu-snapshot:local` when creating it. NVIDIA GPU support is required;
+the script exits if it is unavailable.
 Default config allows for communication in the network, gpu access, display forwarding for GUI applications, hardware devices, etc. By default the script opens a bash shell inside the container as a developer user (password can be modified in Dockerfile) in ros2 workspace under ~/multipanda_ws.
 
 5. Build ROS2 packages with:

@@ -48,7 +48,8 @@ ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian
   "$(cat src/cps_trajectory_generators/config/examples/reachable_via_points_table_corner_back_right_action_goal.yaml)"
   
 
-ros2 action send_goal /reachable_cartesian_impedance_controller/follow_cartesian_via_points \
+ros2 action send_goal \
+  /reachable_cartesian_impedance_controller/follow_cartesian_via_points \
   panda_motion_generator_msgs/action/CartesianViaMotion \
   "$(cat src/cps_trajectory_generators/config/examples/reachable_via_points_table_center_high_action_goal.yaml)"
   
