@@ -639,7 +639,7 @@ class ReachableCartesianImpedanceController
   double potential_energy_error_bound_joule_{0.0};
   double nullspace_potential_energy_error_bound_joule_{0.0};
   bool enable_runtime_energy_scaling_{true};
-  double energy_recovery_exit_energy_fraction_{0.95};
+  double energy_recovery_exit_energy_fraction_{1.0};
   cps_safety_monitor::EnergyRecoveryState energy_recovery_state_;
   std::uint64_t energy_recovery_epoch_{0};
   int energy_recovery_environment_{-1};  // 0=clear, 1=overlap, 2=unknown

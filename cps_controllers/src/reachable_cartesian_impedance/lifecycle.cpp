@@ -500,7 +500,7 @@ CallbackReturn ReachableCartesianImpedanceController::on_init() {
     auto_declare<double>(
         "nullspace_potential_energy_error_bound_joule", 0.0);
     auto_declare<bool>("enable_runtime_energy_scaling", true);
-    auto_declare<double>("energy_recovery_exit_energy_fraction", 0.95);
+    auto_declare<double>("energy_recovery_exit_energy_fraction", 1.0);
     auto_declare<bool>("enable_calibration_logging", false);
     auto_declare<bool>("calibration_assume_no_human", false);
     auto_declare<double>("calibration_capture_path_time_sec", 0.0);

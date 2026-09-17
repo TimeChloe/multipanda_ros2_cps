@@ -51,7 +51,7 @@ struct EnergyRecoveryTerms {
 };
 
 // Recovery retains Eq. (14) after overlap ends or observations become invalid.
-// Exit requires nominal (unscaled) energy below the hysteresis threshold and
+// Exit requires nominal (unscaled) energy at or below the configured threshold and
 // an already fully restored gain on the preceding command. Verification is
 // supplied by the caller; an absent/old plan cannot authorize recovery exit.
 EnergyRecoveryTerms updateEnergyRecovery(
@@ -395,7 +395,7 @@ struct SafetyMonitorConfig {
   bool enable_runtime_energy_scaling{false};
   EnergyRecoveryState energy_recovery_state;
   std::uint64_t energy_recovery_epoch{0};
-  double energy_recovery_exit_energy_fraction{0.95};
+  double energy_recovery_exit_energy_fraction{1.0};
   // Configured nominal gains used for ALL monitor dynamics/energy, including
   // anchors and committed commands with reduced gains. If not supplied, the
   // caller must supply unscaled nominal gains in each command.

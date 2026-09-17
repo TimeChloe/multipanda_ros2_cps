@@ -263,7 +263,7 @@ reachable_cartesian_impedance_controller:
     # Exit recovery only with nominal energy <= this fraction of the budget,
     # fully restored gains, valid clear geometry, valid joint state and a
     # verified command from the current environment episode. Range: (0, 1].
-    energy_recovery_exit_energy_fraction: 0.95
+    energy_recovery_exit_energy_fraction: 1.0
     # Dense prediction/provenance logging used by the separate calibration
     # action. The ordinary follow_cartesian_via_points action is unchanged.
     enable_calibration_logging: false
